@@ -1,0 +1,46 @@
+# Compiled binaries
+/main
+/gocalis
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test and build artifacts
+*.test
+*.out
+/vendor/
+
+# Frontend dependencies and build artifacts
+web/node_modules
+web/dist
+
+# Embedded frontend build is generated from web/dist; do not track it.
+internal/webserver/dist
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Generated WAV and audio files
+*.wav
+
+# Downloaded models and caches
+/models/*
+
+
+# Compressed archives from download scripts
+*.tar.bz2
+*.tar.gz
+*.zip
+

@@ -1,0 +1,34 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-config',{
+        category: 'config',
+        defaults: {
+            host: { value: "localhost", required: true },
+            port: { value: 9090, required: true, validate: RED.validators.number() },
+            ssl: { value: false },
+            apiKey: { value: "demo_password" }
+        },
+        label: function() {
+            return this.host + ":" + this.port;
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-config">
+    <div class="form-row">
+        <label for="node-config-input-host"><i class="fa fa-globe"></i> Host</label>
+        <input type="text" id="node-config-input-host" placeholder="localhost">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-port"><i class="fa fa-plug"></i> Port</label>
+        <input type="text" id="node-config-input-port" placeholder="9090">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-apiKey"><i class="fa fa-key"></i> API Key</label>
+        <input type="password" id="node-config-input-apiKey" placeholder="Optional API Key">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-ssl"><i class="fa fa-lock"></i> SSL/TLS</label>
+        <input type="checkbox" id="node-config-input-ssl" style="display: inline-block; width: auto; vertical-align: top;">
+        <span>Use Secure WebSocket/HTTPS</span>
+    </div>
+</script>

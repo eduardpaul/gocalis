@@ -1,0 +1,59 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-tts',{
+        category: 'Gocalis Voice',
+        color: '#a78bfa',
+        defaults: {
+            name: { value: "" },
+            server: { value: "", type: "gocalis-config", required: true },
+            nodeId: { value: "default" },
+            nodeIdType: { value: "str" },
+            text: { value: "" },
+            textType: { value: "str" },
+            priority: { value: 0 }
+        },
+        inputs: 1,
+        outputs: 1,
+        icon: "font-awesome/fa-file-audio-o",
+        label: function() {
+            return this.name || this.text || "Gocalis TTS";
+        },
+        paletteLabel: "gocalis tts",
+        oneditprepare: function() {
+            $("#node-input-nodeId").typedInput({
+                default: 'str',
+                typeField: $("#node-input-nodeIdType"),
+                types: ['str', 'msg', 'flow', 'global', 'env', 'jsonata']
+            });
+            $("#node-input-text").typedInput({
+                default: 'str',
+                typeField: $("#node-input-textType"),
+                types: ['str', 'msg', 'flow', 'global', 'env', 'jsonata']
+            });
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-tts">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-server"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+    <div class="form-row">
+        <label for="node-input-nodeId"><i class="fa fa-microphone"></i> Node ID</label>
+        <input type="text" id="node-input-nodeId" placeholder="default (or 'all')" style="width: 70%;">
+        <input type="hidden" id="node-input-nodeIdType">
+    </div>
+    <div class="form-row">
+        <label for="node-input-text"><i class="fa fa-comment"></i> TTS Text</label>
+        <input type="text" id="node-input-text" placeholder="Text to synthesize (leave blank to use msg.payload)" style="width: 70%;">
+        <input type="hidden" id="node-input-textType">
+    </div>
+    <div class="form-row">
+        <label for="node-input-priority"><i class="fa fa-sort-numeric-asc"></i> Priority</label>
+        <input type="number" id="node-input-priority" placeholder="0" style="width: 100px;">
+    </div>
+</script>

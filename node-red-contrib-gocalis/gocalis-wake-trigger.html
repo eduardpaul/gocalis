@@ -1,0 +1,34 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-wake-trigger',{
+        category: 'Gocalis Voice',
+        color: '#a78bfa',
+        defaults: {
+            name: { value: "" },
+            server: { value: "", type: "gocalis-config", required: true },
+            nodeId: { value: "all" }
+        },
+        inputs: 0,
+        outputs: 2,
+        outputLabels: ["Wake Event", "Command (Auto-Ask Result)"],
+        icon: "font-awesome/fa-bell",
+        label: function() {
+            return this.name || "Gocalis Wake Trigger";
+        },
+        paletteLabel: "gocalis wake"
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-wake-trigger">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-server"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+    <div class="form-row">
+        <label for="node-input-nodeId"><i class="fa fa-server"></i> Node ID</label>
+        <input type="text" id="node-input-nodeId" placeholder="Node ID (e.g. 'default', 'kitchen') or 'all'">
+    </div>
+</script>
