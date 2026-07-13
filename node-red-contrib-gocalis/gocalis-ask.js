@@ -137,6 +137,13 @@ module.exports = function(RED) {
                 vadTimeout = parseFloat(msg.vadTimeout);
             }
 
+            let postSpeechSilenceSeconds;
+            if (msg.post_speech_silence_seconds !== undefined) {
+                postSpeechSilenceSeconds = parseFloat(msg.post_speech_silence_seconds);
+            } else if (msg.postSpeechSilenceSeconds !== undefined) {
+                postSpeechSilenceSeconds = parseFloat(msg.postSpeechSilenceSeconds);
+            }
+
             const payload = {
                 action: "ask",
                 context_id: contextId,
@@ -146,6 +153,7 @@ module.exports = function(RED) {
                 require_speaker_id: requireSpeakerId,
                 output_format: outputFormat,
                 vad_timeout_seconds: vadTimeout,
+                post_speech_silence_seconds: Number.isFinite(postSpeechSilenceSeconds) ? postSpeechSilenceSeconds : undefined,
                 priority: msg.priority !== undefined ? parseInt(msg.priority) : node.priority
             };
 
@@ -159,6 +167,8 @@ module.exports = function(RED) {
                 msg.status = result.status;
                 msg.transcription = result.text;
                 msg.speaker = result.speaker;
+                msg.audio_wav_base64 = result.audio_wav_base64;
+                msg.recording = result.audio_wav_base64 || result.recording;
                 msg.node_id = result.node_id || resolvedNodeId;
                 msg.payload = result;
 

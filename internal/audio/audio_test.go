@@ -58,6 +58,80 @@ func TestEncodeWAVPCM16Header(t *testing.T) {
 	}
 }
 
+func TestDecodeWAVPCM16RoundTrip(t *testing.T) {
+	samples := []int16{0, 1, -1, 100, -32768, 32767, 12345, -9999}
+	wav := EncodeWAVPCM16(samples, 16000)
+
+	got, rate, err := DecodeWAVPCM16(wav)
+	if err != nil {
+		t.Fatalf("DecodeWAVPCM16: %v", err)
+	}
+	if rate != 16000 {
+		t.Errorf("sample rate: got %d want 16000", rate)
+	}
+	if len(got) != len(samples) {
+		t.Fatalf("length: got %d want %d", len(got), len(samples))
+	}
+	for i := range samples {
+		if got[i] != samples[i] {
+			t.Errorf("sample[%d]: got %d want %d", i, got[i], samples[i])
+		}
+	}
+}
+
+func TestDecodeWAVPCM16Errors(t *testing.T) {
+	if _, _, err := DecodeWAVPCM16([]byte("short")); err == nil {
+		t.Errorf("expected error for too-short input")
+	}
+	bad := make([]byte, 44)
+	copy(bad[0:4], "XXXX")
+	if _, _, err := DecodeWAVPCM16(bad); err == nil {
+		t.Errorf("expected error for non-RIFF input")
+	}
+}
+
+func TestDecodeWAVPCM16DownmixStereo(t *testing.T) {
+	// Build a minimal 2-channel PCM16 WAV: frames (L, R) = (100, 200), (-40, -60).
+	interleaved := []int16{100, 200, -40, -60}
+	pcm := make([]byte, len(interleaved)*2)
+	for i, s := range interleaved {
+		binary.LittleEndian.PutUint16(pcm[2*i:], uint16(s))
+	}
+	buf := new(bytes.Buffer)
+	dataSize := len(pcm)
+	buf.WriteString("RIFF")
+	_ = binary.Write(buf, binary.LittleEndian, uint32(36+dataSize))
+	buf.WriteString("WAVE")
+	buf.WriteString("fmt ")
+	_ = binary.Write(buf, binary.LittleEndian, uint32(16)) // fmt size
+	_ = binary.Write(buf, binary.LittleEndian, uint16(1))  // PCM
+	_ = binary.Write(buf, binary.LittleEndian, uint16(2))  // channels
+	_ = binary.Write(buf, binary.LittleEndian, uint32(8000))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(8000*2*2)) // byte rate
+	_ = binary.Write(buf, binary.LittleEndian, uint16(2*2))      // block align
+	_ = binary.Write(buf, binary.LittleEndian, uint16(16))       // bits
+	buf.WriteString("data")
+	_ = binary.Write(buf, binary.LittleEndian, uint32(dataSize))
+	buf.Write(pcm)
+
+	got, rate, err := DecodeWAVPCM16(buf.Bytes())
+	if err != nil {
+		t.Fatalf("DecodeWAVPCM16: %v", err)
+	}
+	if rate != 8000 {
+		t.Errorf("sample rate: got %d want 8000", rate)
+	}
+	want := []int16{150, -50} // per-frame channel averages
+	if len(got) != len(want) {
+		t.Fatalf("frames: got %d want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("frame[%d]: got %d want %d", i, got[i], want[i])
+		}
+	}
+}
+
 func TestMuLawRoundTripApproximation(t *testing.T) {
 	// mu-law is lossy; encode/decode should stay reasonably close for mid values.
 	for _, v := range []int16{0, 100, -100, 1000, -1000, 10000, -10000} {

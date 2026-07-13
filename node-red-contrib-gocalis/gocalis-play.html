@@ -1,0 +1,73 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-play',{
+        category: 'Gocalis Voice',
+        color: '#a78bfa',
+        defaults: {
+            name: { value: "" },
+            server: { value: "", type: "gocalis-config", required: true },
+            nodeId: { value: "default" },
+            nodeIdType: { value: "str" },
+            priority: { value: 0, validate: RED.validators.number() }
+        },
+        inputs: 1,
+        outputs: 1,
+        icon: "font-awesome/fa-play-circle",
+        label: function() {
+            return this.name || "Gocalis Play";
+        },
+        paletteLabel: "gocalis play",
+        oneditprepare: function() {
+            $("#node-input-nodeId").typedInput({
+                default: 'str',
+                typeField: $("#node-input-nodeIdType"),
+                types: ['str', 'msg', 'flow', 'global', 'env', 'jsonata']
+            });
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-play">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-server"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+    <div class="form-row">
+        <label for="node-input-nodeId"><i class="fa fa-server"></i> Node ID</label>
+        <input type="text" id="node-input-nodeId" placeholder="Physical node ID, or 'all' to broadcast" style="width: 70%;">
+        <input type="hidden" id="node-input-nodeIdType">
+    </div>
+    <div class="form-row">
+        <label for="node-input-priority"><i class="fa fa-sort-amount-desc"></i> Priority</label>
+        <input type="number" id="node-input-priority" placeholder="0" min="0" step="1">
+    </div>
+</script>
+
+<script type="text/html" data-help-name="gocalis-play">
+    <p>Plays a pre-recorded audio clip on one node (or all nodes) through the
+    Gocalis engine. Unlike <b>gocalis say</b> (which synthesizes text), this node
+    plays back raw recorded audio such as the WAV captured by <b>gocalis ask</b>
+    or the wake-trigger AutoAsk output.</p>
+
+    <h3>Inputs</h3>
+    <dl class="message-properties">
+        <dt>audio_wav_base64 <span class="property-type">string</span></dt>
+        <dd>Base64-encoded mono PCM16 WAV recording to play. Also read from
+        <code>msg.audio_base64</code>, <code>msg.recording</code>, or a
+        recording nested in <code>msg.payload</code>.</dd>
+        <dt class="optional">node_id <span class="property-type">string</span></dt>
+        <dd>Overrides the configured Node ID. Use <code>all</code> to broadcast
+        the clip to every registered node.</dd>
+        <dt class="optional">priority <span class="property-type">number</span></dt>
+        <dd>Overrides the configured priority for turn ordering.</dd>
+    </dl>
+
+    <h3>Details</h3>
+    <p>Playback follows the same rules as <b>gocalis say</b>: a
+    <code>node_id</code> of <code>all</code> broadcasts to every node, and
+    <code>priority</code> orders the node's turn queue so higher-priority work
+    (such as an ask) plays first.</p>
+</script>

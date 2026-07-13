@@ -7,6 +7,7 @@
     "nodes": {
       "gocalis-config": "gocalis-config.js",
       "gocalis-say": "gocalis-say.js",
+      "gocalis-play": "gocalis-play.js",
       "gocalis-ask": "gocalis-ask.js",
       "gocalis-wake-trigger": "gocalis-wake-trigger.js",
       "gocalis-stt": "gocalis-stt.js",

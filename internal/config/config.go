@@ -75,8 +75,16 @@ type MQTTConfig struct {
 
 // TTSConfig contains global Text-to-Speech configurations.
 type TTSConfig struct {
-	Engine      string      `yaml:"engine"`
-	ModelDir    string      `yaml:"model_dir"`
+	Engine   string `yaml:"engine"`
+	ModelDir string `yaml:"model_dir"`
+	// Generation parameters applied to every synthesized utterance.
+	// Sid selects the voice/speaker id, NumSteps controls the diffusion steps
+	// (Supertonic), Speed scales the utterance duration (1.0 = normal) and Lang
+	// is forwarded to the engine as the {"lang": ...} extra hint.
+	Sid         int         `yaml:"sid"`
+	NumSteps    int         `yaml:"num_steps"`
+	Speed       float32     `yaml:"speed"`
+	Lang        string      `yaml:"lang"`
 	CacheConfig CacheConfig `yaml:"cache"`
 }
 
@@ -165,6 +173,11 @@ type KWSConfig struct {
 	// 1.5s when unset.
 	AutoAskCaptureDelaySeconds float64 `yaml:"auto_ask_capture_delay_seconds"`
 
+	// PostSpeechSilenceSeconds is the trailing silence required to conclude an
+	// ask turn after speech has started. Lower values reduce the gap between the
+	// user stopping and the stop chime. Defaults to 1.5s when unset.
+	PostSpeechSilenceSeconds float64 `yaml:"post_speech_silence_seconds"`
+
 	// AutoAskRecord, when true, attaches a base64-encoded WAV recording of the
 	// captured user speech to the combined wake event (published to MQTT/WS/etc).
 	AutoAskRecord bool `yaml:"auto_ask_record"`
@@ -229,4 +242,14 @@ func (n *NodeConfig) GetAutoAskCaptureDelaySeconds(defaultVal float64) float64 {
 		return defaultVal
 	}
 	return n.KWS.AutoAskCaptureDelaySeconds
+}
+
+// GetPostSpeechSilenceSeconds returns the node-specific trailing silence needed
+// to close an ask turn after speech has started, falling back to defaultVal
+// when not specified (<=0).
+func (n *NodeConfig) GetPostSpeechSilenceSeconds(defaultVal float64) float64 {
+	if n.KWS.PostSpeechSilenceSeconds > 0 {
+		return n.KWS.PostSpeechSilenceSeconds
+	}
+	return defaultVal
 }

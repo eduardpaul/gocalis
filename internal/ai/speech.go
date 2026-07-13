@@ -3,6 +3,7 @@ package ai
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -533,12 +534,31 @@ func (s *vitsSynthesizer) workerLoop() {
 	}
 }
 
-func (s *vitsSynthesizer) synthesizeToFileSync(text string, outputPath string) error {
-	genConfig := sherpa.GenerationConfig{
-		SilenceScale: 0.2,
-		Speed:        1.0,
-		Sid:          0,
+// genConfig builds the sherpa generation config from the TTS configuration so
+// the same voice/speed/steps/language settings apply to every synthesized
+// utterance (both the file/cache path and the streaming path).
+func (s *vitsSynthesizer) genConfig() sherpa.GenerationConfig {
+	cfg := s.configCopy
+	speed := cfg.Speed
+	if speed <= 0 {
+		speed = 1.0
 	}
+	gc := sherpa.GenerationConfig{
+		SilenceScale: 0.2,
+		Speed:        speed,
+		Sid:          cfg.Sid,
+		NumSteps:     cfg.NumSteps,
+	}
+	if cfg.Lang != "" {
+		if extra, err := json.Marshal(map[string]string{"lang": cfg.Lang}); err == nil {
+			gc.Extra = extra
+		}
+	}
+	return gc
+}
+
+func (s *vitsSynthesizer) synthesizeToFileSync(text string, outputPath string) error {
+	genConfig := s.genConfig()
 
 	s.mutex.Lock()
 	ttsEngine := s.tts
@@ -575,11 +595,7 @@ func (s *vitsSynthesizer) prepareStream(text string) (*streamingAudioStream, fun
 	stream := newStreamingAudioStream(ttsEngine.SampleRate())
 
 	gen := func() {
-		genConfig := sherpa.GenerationConfig{
-			SilenceScale: 0.2,
-			Speed:        1.0,
-			Sid:          0,
-		}
+		genConfig := s.genConfig()
 
 		// The callback runs on the worker goroutine as sherpa produces audio.
 		// It appends to the stream's internal buffer at synthesis (CPU) speed,

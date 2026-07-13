@@ -20,12 +20,12 @@ const (
 
 // Config holds MQTT connection and topic settings.
 type Config struct {
-	Broker       string
-	ClientID     string
-	Username     string
-	Password     string
-	TopicPrefix  string
-	QoS          byte
+	Broker        string
+	ClientID      string
+	Username      string
+	Password      string
+	TopicPrefix   string
+	QoS           byte
 	AutoReconnect bool
 }
 
@@ -85,6 +85,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.cmdTopic("asr"):        c.cfg.QoS,
 		c.cmdTopic("speaker_id"): c.cfg.QoS,
 		c.cmdTopic("ask"):        c.cfg.QoS,
+		c.cmdTopic("play"):       c.cfg.QoS,
 	}
 
 	if token := c.client.SubscribeMultiple(topics, c.onMessage); token.Wait() && token.Error() != nil {

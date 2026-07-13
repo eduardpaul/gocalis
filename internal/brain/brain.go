@@ -139,6 +139,88 @@ func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority 
 	return b.speakToHandle(ctx, handle, text, priority)
 }
 
+// PlaySamples plays a pre-recorded PCM16 clip on a single node, honoring the
+// node's turn queue and priority exactly like Speak. Unlike SpeakSamples it
+// does not reject a busy node: it waits for its turn on the queue.
+func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16, sampleRate int, priority int) error {
+	b.nodesMutex.RLock()
+	handle, ok := b.nodes[nodeID]
+	b.nodesMutex.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("node '%s' not registered", nodeID)
+	}
+
+	// Empty audio is a no-op: never take the node's turn slot for nothing.
+	if len(samples) == 0 {
+		return nil
+	}
+
+	release, err := handle.queue.acquire(ctx, priority)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return b.playSamplesToHandle(ctx, handle, samples, sampleRate)
+}
+
+// PlaySamplesAll plays the same recording on every registered node. Each node is
+// driven independently through its own turn queue at the given priority, exactly
+// like SpeakAll: free nodes play immediately, busy nodes queue behind their
+// current turn, and nodes never block one another.
+func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate int, priority int) error {
+	if len(samples) == 0 {
+		return nil
+	}
+
+	handles := b.snapshotHandles()
+	if len(handles) == 0 {
+		return fmt.Errorf("no nodes registered")
+	}
+
+	var wg sync.WaitGroup
+	for _, h := range handles {
+		wg.Add(1)
+		go func(nodeID string) {
+			defer wg.Done()
+			if err := b.PlaySamples(ctx, nodeID, samples, sampleRate, priority); err != nil {
+				log.Printf("[Brain] Broadcast play to node '%s' failed: %v\n", nodeID, err)
+			}
+		}(h.Node.NodeID)
+	}
+	wg.Wait()
+
+	return nil
+}
+
+// playSamplesToHandle plays pre-recorded samples on a single node with the same
+// state transitions and output-gain handling as speakToHandle. The caller must
+// already hold the node's turn slot (via the queue).
+func (b *Brain) playSamplesToHandle(ctx context.Context, handle *NodeHandle, baseSamples []int16, sampleRate int) error {
+	if len(baseSamples) == 0 {
+		return nil
+	}
+
+	handle.speakMutex.Lock()
+	defer handle.speakMutex.Unlock()
+
+	handle.Node.SetState(node.StateProcessing)
+
+	samples := baseSamples
+	if handle.Config.RTCStream.OutputGainDb != 0 {
+		samples = audio.ApplyGainPCM16(baseSamples, handle.Config.RTCStream.OutputGainDb)
+	}
+
+	handle.Node.SetState(node.StateSpeaking)
+	err := handle.Audio.Play(ctx, samples, sampleRate)
+	handle.Node.SetState(node.StateIdle)
+	if err != nil {
+		return fmt.Errorf("failed to play audio: %w", err)
+	}
+	return nil
+}
+
 // AcquireNode reserves a node for an exclusive turn, blocking until the caller
 // owns it (higher priority first) or ctx is cancelled. The returned release
 // func MUST be called when the turn ends. It is used by the ask flow, which

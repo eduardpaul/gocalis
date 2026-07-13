@@ -33,6 +33,12 @@ type Config struct {
 	// re-capture the prompt itself. Ignored when barge-in interrupted the prompt.
 	CaptureDelaySeconds float64
 
+	// PostSpeechSilenceSeconds is the trailing silence required to conclude the
+	// user's turn after speech has started. Lower values reduce the gap between
+	// user stop-speaking and the end chime, at the cost of more aggressive turn
+	// cutting. Defaults to 1.5s when unset.
+	PostSpeechSilenceSeconds float64
+
 	// PromptSamples and PromptSampleRate allow the caller to provide
 	// pre-synthesized prompt audio. When empty, the engine synthesizes
 	// TTSText itself.
@@ -151,11 +157,21 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 		// yields no prompt, in which case just the listening chime is played
 		// below (the TTS pipeline is never run for empty text).
 		if len(samples) > 0 && sampleRate > 0 {
+			padForRTC := handle.Config.Type == "rtc_stream"
 			// Concatenate the "start listening" chime onto the prompt so both play
 			// in a single, gapless transmission. Playing the chime as a separate
 			// call would trigger another route-assert + buffer/drain cycle, leaving
 			// an audible silence between the end of the prompt and the chime.
+			if padForRTC {
+				// Doorbell backchannels can clip packet edges; add a tiny guard silence
+				// before the chime and at utterance tail so the prompt ending and chime
+				// are not cut off by transcode/jitter-buffer timing.
+				samples = append(samples, silencePCMAt(sampleRate, 80)...)
+			}
 			samples = append(samples, renderChimeAt(chimeStart, sampleRate)...)
+			if padForRTC {
+				samples = append(samples, silencePCMAt(sampleRate, 180)...)
+			}
 			startChimeSpoken = true
 
 			bargeDetected := make(chan struct{}, 1)
@@ -237,6 +253,11 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 	pollTicker := time.NewTicker(50 * time.Millisecond)
 	defer pollTicker.Stop()
 
+	postSpeechSilence := cfg.PostSpeechSilenceSeconds
+	if postSpeechSilence <= 0 {
+		postSpeechSilence = handle.Config.GetPostSpeechSilenceSeconds(1.5)
+	}
+
 listenLoop:
 	for {
 		select {
@@ -250,7 +271,7 @@ listenLoop:
 				hadSpeech = true
 				lastCount = count
 				lastSpeechTime = time.Now()
-			} else if hadSpeech && time.Since(lastSpeechTime) > 1500*time.Millisecond {
+			} else if hadSpeech && time.Since(lastSpeechTime) > time.Duration(postSpeechSilence*float64(time.Second)) {
 				break listenLoop
 			}
 		}
@@ -322,6 +343,19 @@ listenLoop:
 		Audio:         captured,
 		SampleRate:    16000,
 	}
+}
+
+// silencePCMAt returns mono PCM16 silence for the given sample rate and
+// duration in milliseconds.
+func silencePCMAt(sampleRate int, ms int) []int16 {
+	if sampleRate <= 0 || ms <= 0 {
+		return nil
+	}
+	n := sampleRate * ms / 1000
+	if n <= 0 {
+		return nil
+	}
+	return make([]int16, n)
 }
 
 // playChime plays a short UI chime on the node. It uses an independent context

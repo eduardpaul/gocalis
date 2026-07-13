@@ -2,6 +2,7 @@ package audio
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 )
 
@@ -85,4 +86,105 @@ func putUint32LE(b []byte, v uint32) {
 	b[1] = byte(v >> 8)
 	b[2] = byte(v >> 16)
 	b[3] = byte(v >> 24)
+}
+
+func uint16LE(b []byte) uint16 {
+	return uint16(b[0]) | uint16(b[1])<<8
+}
+
+func uint32LE(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+// DecodeWAVPCM16 parses an uncompressed PCM16 WAV byte slice and returns the
+// mono samples together with the sample rate. Multi-channel input is downmixed
+// to mono by averaging channels. It only supports PCM format (1) with 16 bits
+// per sample, which is what every recording produced by Gocalis uses.
+func DecodeWAVPCM16(data []byte) ([]int16, int, error) {
+	if len(data) < 12 {
+		return nil, 0, fmt.Errorf("wav too short: %d bytes", len(data))
+	}
+	if string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil, 0, fmt.Errorf("not a RIFF/WAVE file")
+	}
+
+	var (
+		sampleRate    int
+		numChannels   int
+		bitsPerSample int
+		haveFmt       bool
+		haveData      bool
+		pcm           []byte
+	)
+
+	// Walk the chunk list that follows the 12-byte RIFF/WAVE header.
+	off := 12
+	for off+8 <= len(data) {
+		id := string(data[off : off+4])
+		size := int(uint32LE(data[off+4 : off+8]))
+		body := off + 8
+		if size < 0 || body+size > len(data) {
+			size = len(data) - body // tolerate a truncated final chunk
+		}
+		switch id {
+		case "fmt ":
+			if size < 16 {
+				return nil, 0, fmt.Errorf("fmt chunk too small: %d bytes", size)
+			}
+			format := int(uint16LE(data[body : body+2]))
+			numChannels = int(uint16LE(data[body+2 : body+4]))
+			sampleRate = int(uint32LE(data[body+4 : body+8]))
+			bitsPerSample = int(uint16LE(data[body+14 : body+16]))
+			if format != 1 {
+				return nil, 0, fmt.Errorf("unsupported WAV format %d (only PCM)", format)
+			}
+			haveFmt = true
+		case "data":
+			pcm = data[body : body+size]
+			haveData = true
+		}
+		// Chunks are word-aligned: an odd size is followed by a pad byte.
+		off = body + size
+		if size%2 == 1 {
+			off++
+		}
+	}
+
+	if !haveFmt {
+		return nil, 0, fmt.Errorf("missing fmt chunk")
+	}
+	if !haveData {
+		return nil, 0, fmt.Errorf("missing data chunk")
+	}
+	if bitsPerSample != 16 {
+		return nil, 0, fmt.Errorf("unsupported bits per sample %d (only 16)", bitsPerSample)
+	}
+	if numChannels < 1 {
+		return nil, 0, fmt.Errorf("invalid channel count %d", numChannels)
+	}
+	if sampleRate <= 0 {
+		return nil, 0, fmt.Errorf("invalid sample rate %d", sampleRate)
+	}
+
+	total := len(pcm) / 2
+	interleaved := make([]int16, total)
+	for i := 0; i < total; i++ {
+		interleaved[i] = int16(uint16LE(pcm[2*i : 2*i+2]))
+	}
+
+	if numChannels == 1 {
+		return interleaved, sampleRate, nil
+	}
+
+	// Downmix interleaved multi-channel audio to mono by averaging channels.
+	frames := total / numChannels
+	mono := make([]int16, frames)
+	for f := 0; f < frames; f++ {
+		var acc int
+		for c := 0; c < numChannels; c++ {
+			acc += int(interleaved[f*numChannels+c])
+		}
+		mono[f] = int16(acc / numChannels)
+	}
+	return mono, sampleRate, nil
 }

@@ -27,9 +27,17 @@ fi
 if [[ "${1:-}" == "--build" ]]; then
   RUN_USER="$(stat -c '%U' "$APP_DIR")"
   echo "==> Rebuilding gocalis binary as ${RUN_USER}..."
+  if [[ -f "$BIN_PATH" ]]; then
+    echo "    before: $(stat -c '%y  %s bytes' "$BIN_PATH")"
+  else
+    echo "    before: (no existing binary)"
+  fi
   # The default ~/.bashrc returns early for non-interactive shells, so prepend
   # the common Go locations so a tarball install (/usr/local/go/bin) is found.
-  sudo -u "$RUN_USER" -H bash -lc "export PATH=\"/usr/local/go/bin:\$HOME/go/bin:\$HOME/.local/bin:\$PATH\"; cd '$APP_DIR' && CGO_ENABLED=1 go build -o '$BIN_PATH' ./cmd"
+  # -v lists the packages actually recompiled; a fast build with no output just
+  # means the Go build cache is up to date and only a relink was needed.
+  sudo -u "$RUN_USER" -H bash -lc "export PATH=\"/usr/local/go/bin:\$HOME/go/bin:\$HOME/.local/bin:\$PATH\"; cd '$APP_DIR' && CGO_ENABLED=1 go build -v -o '$BIN_PATH' ./cmd"
+  echo "    after:  $(stat -c '%y  %s bytes' "$BIN_PATH")"
 fi
 
 echo "==> Restarting ${SERVICE_NAME}..."

@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"gocalis/internal/ai"
 	"gocalis/internal/ask"
+	"gocalis/internal/audio"
 	"gocalis/internal/brain"
 )
 
@@ -81,6 +83,8 @@ func (e *Executor) Execute(ctx context.Context, req Request) {
 		e.executeSpeakerID(ctx, req)
 	case "ask":
 		e.executeAsk(ctx, req)
+	case "play":
+		e.executePlay(ctx, req)
 	default:
 		e.publishError(req.NodeID, fmt.Sprintf("unknown action: %s", req.Action))
 	}
@@ -112,6 +116,51 @@ func (e *Executor) executeTTS(ctx context.Context, req Request) {
 
 	e.Publisher.Publish(Response{
 		Event:  "tts_completed",
+		NodeID: req.NodeID,
+		Status: "success",
+	})
+}
+
+// executePlay plays back a base64-encoded PCM16 WAV recording on a node,
+// following the same routing rules as TTS: node_id "all" broadcasts to every
+// node and Priority orders the node's turn.
+func (e *Executor) executePlay(ctx context.Context, req Request) {
+	if req.NodeID == "" {
+		e.publishError("", "missing 'node_id' parameter")
+		return
+	}
+	if req.AudioWavBase64 == "" {
+		e.publishError(req.NodeID, "missing 'audio_wav_base64' parameter")
+		return
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(req.AudioWavBase64)
+	if err != nil {
+		e.publishError(req.NodeID, "invalid base64 audio: "+err.Error())
+		return
+	}
+
+	samples, sampleRate, err := audio.DecodeWAVPCM16(raw)
+	if err != nil {
+		e.publishError(req.NodeID, "invalid WAV audio: "+err.Error())
+		return
+	}
+
+	if req.NodeID == "all" {
+		log.Printf("[Executor] Play recording on all nodes (%d samples @ %dHz)\n", len(samples), sampleRate)
+		err = e.Brain.PlaySamplesAll(ctx, samples, sampleRate, req.Priority)
+	} else {
+		log.Printf("[Executor] Play recording on node '%s' (%d samples @ %dHz)\n", req.NodeID, len(samples), sampleRate)
+		err = e.Brain.PlaySamples(ctx, req.NodeID, samples, sampleRate, req.Priority)
+	}
+
+	if err != nil {
+		e.publishError(req.NodeID, err.Error())
+		return
+	}
+
+	e.Publisher.Publish(Response{
+		Event:  "play_completed",
 		NodeID: req.NodeID,
 		Status: "success",
 	})
@@ -170,23 +219,39 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 	log.Printf("[Executor] Ask on node '%s' (barge_in=%v)\n", req.NodeID, req.BargeIn)
 
 	result := e.AskEngine.Run(ctx, ask.Config{
-		ContextID:         req.ContextID,
-		NodeID:            req.NodeID,
-		TTSText:           req.Text,
-		BargeIn:           req.BargeIn,
-		RequireSpeakerID:  req.RequireSpeakerID,
-		VADTimeoutSeconds: req.VADTimeoutSeconds,
-		Priority:          req.Priority,
+		ContextID:                req.ContextID,
+		NodeID:                   req.NodeID,
+		TTSText:                  req.Text,
+		BargeIn:                  req.BargeIn,
+		RequireSpeakerID:         req.RequireSpeakerID,
+		VADTimeoutSeconds:        req.VADTimeoutSeconds,
+		PostSpeechSilenceSeconds: req.PostSpeechSilenceSeconds,
+		Priority:                 req.Priority,
 	})
 
-	e.Publisher.Publish(Response{
-		Event:     "ask_completed",
-		NodeID:    req.NodeID,
-		Status:    result.Status,
-		Text:      result.Transcription,
-		Speaker:   result.Speaker,
-		Message:   result.ErrorMessage,
-	})
+	resp := Response{
+		Event:   "ask_completed",
+		NodeID:  req.NodeID,
+		Status:  result.Status,
+		Speaker: result.Speaker,
+		Message: result.ErrorMessage,
+	}
+
+	switch req.OutputFormat {
+	case "audio":
+		if len(result.Audio) > 0 {
+			resp.AudioWavBase64 = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, result.SampleRate))
+		}
+	case "text":
+		resp.Text = result.Transcription
+	default:
+		resp.Text = result.Transcription
+		if len(result.Audio) > 0 {
+			resp.AudioWavBase64 = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, result.SampleRate))
+		}
+	}
+
+	e.Publisher.Publish(resp)
 }
 
 func (e *Executor) publishError(nodeID string, message string) {

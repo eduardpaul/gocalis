@@ -73,6 +73,10 @@ type Client struct {
 	tbMu           sync.Mutex
 	tb             *talkbackSender
 	tbCancel       context.CancelFunc
+
+	reconnectMu  sync.Mutex
+	reconnecting bool
+	closing      bool
 }
 
 // Config configures a WebRTC Client. SignalingURL and SendCodec drive the receive
@@ -212,6 +216,10 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 			client.onceConnect.Do(func() {
 				close(client.connected)
 			})
+			return
+		}
+		if s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateFailed {
+			client.scheduleReconnect("peer connection state " + s.String())
 		}
 	})
 
@@ -270,8 +278,13 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	})
 
-	// Create and set local Offer
-	offer, err := c.pc.CreateOffer(nil)
+	// Create and set local Offer. When reconnecting an existing PeerConnection,
+	// force ICE restart so media can recover after network/signaling dropouts.
+	offerOpts := &webrtc.OfferOptions{}
+	if c.pc.RemoteDescription() != nil {
+		offerOpts.ICERestart = true
+	}
+	offer, err := c.pc.CreateOffer(offerOpts)
 	if err != nil {
 		wsConn.Close()
 		return err
@@ -305,6 +318,7 @@ func (c *Client) Connect(ctx context.Context) error {
 			_, message, err := wsConn.ReadMessage()
 			if err != nil {
 				log.Printf("[Signaling] WebSocket read loop exited: %v\n", err)
+				c.scheduleReconnect("signaling read loop exited")
 				return
 			}
 
@@ -627,6 +641,10 @@ func (c *Client) silenceFrame() []byte {
 
 // Close closes the PeerConnection.
 func (c *Client) Close() error {
+	c.reconnectMu.Lock()
+	c.closing = true
+	c.reconnectMu.Unlock()
+
 	c.tbMu.Lock()
 	if c.tbCancel != nil {
 		c.tbCancel()
@@ -643,6 +661,54 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// scheduleReconnect starts a best-effort reconnection loop for the receive
+// PeerConnection. It is idempotent while a reconnect attempt is in flight.
+func (c *Client) scheduleReconnect(reason string) {
+	c.reconnectMu.Lock()
+	if c.closing || c.reconnecting {
+		c.reconnectMu.Unlock()
+		return
+	}
+	c.reconnecting = true
+	c.reconnectMu.Unlock()
+
+	go func() {
+		defer func() {
+			c.reconnectMu.Lock()
+			c.reconnecting = false
+			c.reconnectMu.Unlock()
+		}()
+
+		for attempt := 1; attempt <= 12; attempt++ {
+			c.reconnectMu.Lock()
+			if c.closing {
+				c.reconnectMu.Unlock()
+				return
+			}
+			c.reconnectMu.Unlock()
+
+			state := c.pc.ConnectionState()
+			if state == webrtc.PeerConnectionStateConnected {
+				return
+			}
+
+			log.Printf("[WebRTC] Reconnect attempt %d (%s); state=%s", attempt, reason, state)
+			rctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			err := c.Connect(rctx)
+			cancel()
+			if err == nil {
+				log.Printf("[WebRTC] Reconnect succeeded on attempt %d", attempt)
+				return
+			}
+
+			log.Printf("[WebRTC] Reconnect attempt %d failed: %v", attempt, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		log.Printf("[WebRTC] Reconnect attempts exhausted; manual restart may be required")
+	}()
+}
+
 // talkbackEnabled reports whether outbound TTS should use the go2rtc AAC-ELD
 // backchannel instead of the receive PeerConnection track.
 func (c *Client) talkbackEnabled() bool {
@@ -656,7 +722,21 @@ func (c *Client) ensureTalkback() (*talkbackSender, error) {
 	c.tbMu.Lock()
 	defer c.tbMu.Unlock()
 	if c.tb != nil {
-		return c.tb, nil
+		state := c.tb.pc.ConnectionState()
+		switch state {
+		case webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateDisconnected,
+			webrtc.PeerConnectionStateClosed:
+			log.Printf("[Talkback] cached sender is %s; recreating", state)
+			if c.tbCancel != nil {
+				c.tbCancel()
+				c.tbCancel = nil
+			}
+			c.tb.close()
+			c.tb = nil
+		default:
+			return c.tb, nil
+		}
 	}
 
 	in := c.talkbackIn
@@ -705,6 +785,7 @@ func (c *Client) readRemoteTrack(track *webrtc.TrackRemote) {
 		rtpPacket, _, err := track.ReadRTP()
 		if err != nil {
 			log.Printf("[WebRTC] readRemoteTrack error reading RTP: %v\n", err)
+			c.scheduleReconnect("remote RTP read failed")
 			return
 		}
 
