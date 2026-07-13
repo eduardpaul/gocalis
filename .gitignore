@@ -33,10 +33,10 @@ Thumbs.db
 *.log
 
 # Generated WAV and audio files
-*.wav
+**/*.wav
 
 # Downloaded models and caches
-/models/*
+models/*
 
 
 # Compressed archives from download scripts
