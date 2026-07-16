@@ -12,6 +12,7 @@ import (
 	"gocalis/internal/ask"
 	"gocalis/internal/audio"
 	"gocalis/internal/brain"
+	"gocalis/internal/config"
 )
 
 // Executor runs actions requested by any transport adapter using the central brain
@@ -30,13 +31,13 @@ type Executor struct {
 }
 
 // NewExecutor creates a command executor backed by the given engines and publisher.
-func NewExecutor(brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher) *Executor {
+func NewExecutor(brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig) *Executor {
 	return &Executor{
 		Brain:         brain,
 		ASREngine:     asr,
 		SpeakerEngine: speaker,
 		Publisher:     publisher,
-		AskEngine:     ask.NewEngine(brain, asr, speaker),
+		AskEngine:     ask.NewEngine(brain, asr, speaker, speakerIDCfg),
 		AudioBaseDir:  ".",
 	}
 }

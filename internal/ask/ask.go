@@ -8,11 +8,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"time"
 
 	"gocalis/internal/ai"
 	"gocalis/internal/brain"
+	"gocalis/internal/config"
 	"gocalis/internal/node"
 	"gocalis/internal/session"
 )
@@ -71,17 +73,19 @@ type Result struct {
 
 // Engine runs ask sessions against the central brain.
 type Engine struct {
-	Brain     *brain.Brain
-	ASR       ai.Transcriber
-	SpeakerID ai.SpeakerIdentifier
+	Brain      *brain.Brain
+	ASR        ai.Transcriber
+	SpeakerID  ai.SpeakerIdentifier
+	SpeakerCfg config.SpeakerIDConfig
 }
 
 // NewEngine creates an ask engine backed by the given brain and AI engines.
-func NewEngine(b *brain.Brain, asr ai.Transcriber, speakerID ai.SpeakerIdentifier) *Engine {
+func NewEngine(b *brain.Brain, asr ai.Transcriber, speakerID ai.SpeakerIdentifier, speakerCfg config.SpeakerIDConfig) *Engine {
 	return &Engine{
-		Brain:     b,
-		ASR:       asr,
-		SpeakerID: speakerID,
+		Brain:      b,
+		ASR:        asr,
+		SpeakerID:  speakerID,
+		SpeakerCfg: speakerCfg,
 	}
 }
 
@@ -303,32 +307,152 @@ listenLoop:
 		}
 	}
 
+	var verifiedSpeaker string
 	if cfg.RequireSpeakerID {
-		speaker, err := e.SpeakerID.IdentifySamples(captured, 16000)
-		if err != nil {
-			handle.Node.SetState(node.StateIdle)
-			return Result{
-				ContextID:    cfg.ContextID,
-				NodeID:       cfg.NodeID,
-				Status:       "error",
-				ErrorMessage: "speaker identification failed: " + err.Error(),
+		audioDuration := float64(len(captured)) / 16000.0
+		minDur := float64(e.SpeakerCfg.MinAudioDurationSeconds)
+
+		scoreOk := false
+		var matchedSpk string
+		if audioDuration >= minDur {
+			var err error
+			matchedSpk, err = e.SpeakerID.IdentifySamples(captured, 16000)
+			if err == nil && matchedSpk != "" {
+				scoreOk = true
 			}
 		}
-		if speaker == "" {
-			handle.Node.SetState(node.StateIdle)
-			return Result{
-				ContextID: cfg.ContextID,
-				NodeID:    cfg.NodeID,
-				Status:    "verification_failed",
+
+		if !scoreOk {
+			log.Printf("[Ask:%s] Low confidence or short audio (duration: %.2fs, min: %.2fs). Initiating voice challenge.\n", cfg.NodeID, audioDuration, minDur)
+
+			handle.Node.SetState(node.StateChallenging)
+
+			if len(e.SpeakerCfg.ChallengePrompts) == 0 {
+				handle.Node.SetState(node.StateIdle)
+				return Result{
+					ContextID:    cfg.ContextID,
+					NodeID:       cfg.NodeID,
+					Status:       "error",
+					ErrorMessage: "no challenge prompts configured",
+				}
 			}
+
+			challengePrompt := e.SpeakerCfg.ChallengePrompts[rand.Intn(len(e.SpeakerCfg.ChallengePrompts))]
+			challengeText := challengePrompt
+			if e.SpeakerCfg.ChallengeInitPrompt != "" {
+				challengeText = fmt.Sprintf("%s: %s", e.SpeakerCfg.ChallengeInitPrompt, challengePrompt)
+			}
+
+			log.Printf("[Ask:%s] Challenge prompt: %q\n", cfg.NodeID, challengeText)
+
+			challengeSamples, challengeSampleRate, err := e.Brain.Synthesize(challengeText, cfg.Priority)
+			if err != nil {
+				handle.Node.SetState(node.StateIdle)
+				return Result{
+					ContextID:    cfg.ContextID,
+					NodeID:       cfg.NodeID,
+					Status:       "error",
+					ErrorMessage: "challenge synthesis failed: " + err.Error(),
+				}
+			}
+
+			handle.Node.SetState(node.StateSpeaking)
+			err = e.Brain.PlayAudio(ctx, cfg.NodeID, challengeSamples, challengeSampleRate)
+			if err != nil && err != context.Canceled {
+				handle.Node.SetState(node.StateIdle)
+				return Result{
+					ContextID:    cfg.ContextID,
+					NodeID:       cfg.NodeID,
+					Status:       "error",
+					ErrorMessage: "challenge playback failed: " + err.Error(),
+				}
+			}
+
+			select {
+			case <-time.After(150 * time.Millisecond):
+			case <-ctx.Done():
+				handle.Node.SetState(node.StateIdle)
+				return Result{
+					ContextID:    cfg.ContextID,
+					NodeID:       cfg.NodeID,
+					Status:       "error",
+					ErrorMessage: "context cancelled during challenge",
+				}
+			}
+
+			sess.ToListening()
+			handle.Node.SetState(node.StateListening)
+			sess.StartCapture()
+
+			deadlineSec := time.After(timeout)
+			hadSpeechSec := false
+			lastCountSec := 0
+			lastSpeechTimeSec := time.Now()
+
+			pollTickerSec := time.NewTicker(50 * time.Millisecond)
+			defer pollTickerSec.Stop()
+
+		listenLoopSec:
+			for {
+				select {
+				case <-ctx.Done():
+					break listenLoopSec
+				case <-deadlineSec:
+					break listenLoopSec
+				case <-pollTickerSec.C:
+					count := sess.CapturedCount()
+					if count > lastCountSec {
+						hadSpeechSec = true
+						lastCountSec = count
+						lastSpeechTimeSec = time.Now()
+					} else if hadSpeechSec && time.Since(lastSpeechTimeSec) > time.Duration(postSpeechSilence*float64(time.Second)) {
+						break listenLoopSec
+					}
+				}
+			}
+
+			secondaryCaptured := sess.StopCapture()
+			e.playChime(cfg.NodeID, chimeStop)
+			sess.ToProcessing()
+			handle.Node.SetState(node.StateProcessing)
+
+			if len(secondaryCaptured) == 0 {
+				log.Printf("[Ask:%s] No speech captured during challenge loop.\n", cfg.NodeID)
+				e.playFailPrompt(ctx, cfg.NodeID, cfg.Priority)
+				handle.Node.SetState(node.StateIdle)
+				return Result{
+					ContextID: cfg.ContextID,
+					NodeID:    cfg.NodeID,
+					Status:    "verification_failed",
+				}
+			}
+
+			matchedSpkSec, err := e.SpeakerID.IdentifySamples(secondaryCaptured, 16000)
+			if err != nil || matchedSpkSec == "" {
+				log.Printf("[Ask:%s] Challenge verification failed. Matched: %q, Err: %v\n", cfg.NodeID, matchedSpkSec, err)
+				e.playFailPrompt(ctx, cfg.NodeID, cfg.Priority)
+				handle.Node.SetState(node.StateIdle)
+				return Result{
+					ContextID: cfg.ContextID,
+					NodeID:    cfg.NodeID,
+					Status:    "verification_failed",
+				}
+			}
+
+			log.Printf("[Ask:%s] Challenge verification successful: speaker=%s\n", cfg.NodeID, matchedSpkSec)
+			verifiedSpeaker = matchedSpkSec
+		} else {
+			log.Printf("[Ask:%s] Speaker verification successful on primary audio: %s\n", cfg.NodeID, matchedSpk)
+			verifiedSpeaker = matchedSpk
 		}
+
 		handle.Node.SetState(node.StateIdle)
 		return Result{
 			ContextID:     cfg.ContextID,
 			NodeID:        cfg.NodeID,
 			Status:        "success",
 			Transcription: transcription,
-			Speaker:       speaker,
+			Speaker:       verifiedSpeaker,
 			Audio:         captured,
 			SampleRate:    16000,
 		}
@@ -370,4 +494,21 @@ func (e *Engine) playChime(nodeID string, kind chimeKind) {
 	if err := e.Brain.PlayAudio(ctx, nodeID, chimePCM(kind), chimeSampleRate); err != nil && err != context.Canceled {
 		log.Printf("[Ask:%s] chime playback error: %v\n", nodeID, err)
 	}
+}
+
+// playFailPrompt plays the challenge failed TTS prompt on the node.
+func (e *Engine) playFailPrompt(ctx context.Context, nodeID string, priority int) {
+	prompt := e.SpeakerCfg.ChallengeFailedPrompt
+	if prompt == "" {
+		prompt = "Acceso denegado."
+	}
+	samples, sampleRate, err := e.Brain.Synthesize(prompt, priority)
+	if err != nil || len(samples) == 0 {
+		return
+	}
+	handle := e.Brain.GetNodeHandle(nodeID)
+	if handle != nil {
+		handle.Node.SetState(node.StateSpeaking)
+	}
+	_ = e.Brain.PlayAudio(ctx, nodeID, samples, sampleRate)
 }

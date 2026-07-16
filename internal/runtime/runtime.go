@@ -278,30 +278,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	}
 	defer wakeStream.Close()
 
-	// Create speaker identification audio stream
-	speakerStream, err := r.speaker.CreateStream(func(speakerName string) {
-		log.Printf("[Node:%s] [SPEAKER IDENTIFIED] Match found: '%s'!\n", nodeCfg.NodeID, speakerName)
-		pNode.SetState(node.StateChallenging)
 
-		// Broadcast speaker identified event to all transports.
-		r.events.Publish(protocol.Response{
-			Event:   "speaker_identified",
-			NodeID:  pNode.NodeID,
-			Speaker: speakerName,
-		})
-
-		// Trigger Spanish custom greeting over the WebRTC backchannel
-		replyText := "Hola " + speakerName + ", bienvenido. ¿Qué tal estás hoy?"
-		log.Printf("[Node:%s] TTS: Routing speaker greeting through brain: \"%s\"\n", nodeCfg.NodeID, replyText)
-		if err := r.brain.Speak(ctx, nodeCfg.NodeID, replyText, 10); err != nil {
-			log.Printf("[Node:%s] TTS: Failed to play speaker greeting: %v\n", nodeCfg.NodeID, err)
-		}
-	})
-	if err != nil {
-		log.Printf("[Node:%s] Failed to create Speaker ID Stream: %v\n", nodeCfg.NodeID, err)
-		return
-	}
-	defer speakerStream.Close()
 
 	// Subscribe incoming audio: wake word runs on the continuous stream while
 	// speaker ID and ask/capture are routed through the VAD Gate.
@@ -356,7 +333,6 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 				segment := vadGate.Front()
 				dbgSegs++
 				log.Printf("[Node:%s] DBG VAD segment #%d -> speaker/ask (%d samples)", nodeCfg.NodeID, dbgSegs, len(segment.Samples))
-				speakerStream.AcceptAudio(segment.Samples)
 
 				// Fan the segment out to any active /ask or AutoAsk sessions
 				// (barge-in signaling + capture) on this node.
@@ -364,9 +340,6 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 				vadGate.Pop()
 			}
 		} else {
-			// Fallback if VAD failed
-			speakerStream.AcceptAudio(samples)
-
 			// Fan raw audio out to active sessions when VAD is unavailable.
 			r.brain.FeedAudio(nodeCfg.NodeID, samples)
 		}
