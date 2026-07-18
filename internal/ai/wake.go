@@ -2,7 +2,9 @@ package ai
 
 import (
 	"errors"
+	"log"
 	"sync"
+	"time"
 
 	"gocalis/internal/config"
 
@@ -134,6 +136,7 @@ func (w *sherpaONNXWakeDetector) CreateStream(onDetected func(keyword string)) (
 		spotter:    w.spotter,
 		stream:     stream,
 		onDetected: onDetected,
+		lastReset:  time.Now(),
 	}, nil
 }
 
@@ -151,6 +154,7 @@ type sherpaONNXWakeStream struct {
 	stream     *sherpa.OnlineStream
 	onDetected func(keyword string)
 	mutex      sync.Mutex
+	lastReset  time.Time
 }
 
 func (ws *sherpaONNXWakeStream) AcceptAudio(samples []float32) {
@@ -159,6 +163,21 @@ func (ws *sherpaONNXWakeStream) AcceptAudio(samples []float32) {
 
 	if ws.stream == nil || ws.spotter == nil {
 		return
+	}
+
+	// Periodically recreate the stream to prevent memory fragmentation or slow heap leaks
+	// inside the underlying C++ sherpa-onnx / ONNX Runtime libraries when running
+	// continuously for long periods (e.g., overnight). Recreating the stream context
+	// is lightweight (it does not reload the model weights) and ensures any accumulated
+	// C++ buffers are cleanly released back to the OS.
+	if time.Since(ws.lastReset) > 1*time.Hour {
+		sherpa.DeleteOnlineStream(ws.stream)
+		ws.stream = sherpa.NewKeywordStream(ws.spotter)
+		ws.lastReset = time.Now()
+		if ws.stream == nil {
+			log.Println("[KWS] Warning: failed to recreate keyword stream during periodic reset")
+			return
+		}
 	}
 
 	ws.stream.AcceptWaveform(16000, samples)
@@ -179,7 +198,15 @@ func (ws *sherpaONNXWakeStream) Reset() {
 	defer ws.mutex.Unlock()
 
 	if ws.stream != nil && ws.spotter != nil {
-		ws.spotter.Reset(ws.stream)
+		// Fully delete and recreate the stream context instead of just resetting it.
+		// This guarantees that any internally accumulated C++ memory or buffers are
+		// released, preventing memory leak / fragmentation buildup over time.
+		sherpa.DeleteOnlineStream(ws.stream)
+		ws.stream = sherpa.NewKeywordStream(ws.spotter)
+		ws.lastReset = time.Now()
+		if ws.stream == nil {
+			log.Println("[KWS] Warning: failed to recreate keyword stream in Reset")
+		}
 	}
 }
 
