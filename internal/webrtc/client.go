@@ -34,7 +34,7 @@ const (
 	opusRate      = 48000
 	opusChannels  = 1
 	opusFrameSize = opusRate / 1000 * frameMs // 960 samples/frame (mono, 20ms)
-	opusBitrate   = 32000                     // ample for 16kHz speech; go2rtc re-encodes to ELD 24k downstream
+	opusBitrate   = 16000                     // lowered from 32kbps to 16kbps for Wi-Fi reliability
 
 	// PCMU (legacy narrowband) path — kept for the diagnostic `-send-codec pcmu`.
 	pcmuFrameBytes = 160 // 20ms @ 8kHz

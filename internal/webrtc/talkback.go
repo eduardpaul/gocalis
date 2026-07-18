@@ -22,7 +22,7 @@ import (
 
 // talkbackBitrate is the Opus bitrate for the WHIP producer feeding go2rtc. It is
 // ample for speech; go2rtc re-encodes it to AAC-ELD downstream for the doorbell.
-const talkbackBitrate = 32000
+const talkbackBitrate = 16000
 
 // talkbackSender delivers outbound TTS to a HomeKit doorbell backchannel using
 // the proven pocwebrtc mechanism instead of sending Opus over the receive
@@ -74,7 +74,12 @@ func newTalkbackSender(setupCtx context.Context, apiBaseURL, inStream, dstStream
 	}
 
 	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		},
 		"audio", "gocalis-talkback",
 	)
 	if err != nil {
