@@ -24,20 +24,22 @@ import (
 var _ audionode.AudioNode = (*Client)(nil)
 
 const (
-	// frameMs is the RTP packetization interval for every codec below. 20ms is
-	// the WebRTC default and what go2rtc/the doorbell jitter buffer expect.
-	frameMs = 20
+	// frameMs is the RTP packetization interval for every codec below. 10ms
+	// divides evenly into the doorbell's 30ms AAC-ELD frame (3 packets in,
+	// 1 frame out), avoiding the 20ms/40ms alternating gap that a 20ms
+	// packetizer produces against a 30ms target.
+	frameMs = 10
 
 	// Opus is negotiated at 48kHz (the WebRTC standard clock) and carries true
 	// wideband speech end-to-end (T18): the source TTS/mic PCM is resampled to
 	// 48kHz, encoded mono, and go2rtc transcodes it to the doorbell's AAC-ELD.
 	opusRate      = 48000
 	opusChannels  = 1
-	opusFrameSize = opusRate / 1000 * frameMs // 960 samples/frame (mono, 20ms)
+	opusFrameSize = opusRate / 1000 * frameMs // 480 samples/frame (mono, 10ms)
 	opusBitrate   = 16000                     // lowered from 32kbps to 16kbps for Wi-Fi reliability
 
 	// PCMU (legacy narrowband) path — kept for the diagnostic `-send-codec pcmu`.
-	pcmuFrameBytes = 160 // 20ms @ 8kHz
+	pcmuFrameBytes = 80 // 10ms @ 8kHz
 
 	// recvModelRate is the rate the downstream wake/ASR/speaker models want.
 	recvModelRate = 16000
