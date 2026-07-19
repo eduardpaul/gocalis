@@ -22,6 +22,7 @@ import (
 	"gocalis/internal/localaudio"
 	"gocalis/internal/node"
 	"gocalis/internal/protocol"
+	"gocalis/internal/telegram"
 	"gocalis/internal/webrtc"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
@@ -43,6 +44,13 @@ type NodeRuntime struct {
 	threads int
 
 	newAudioNode AudioNodeFactory
+
+	// TGManager is the shared logged-in Telegram user session, set by main when
+	// any telegram node is configured; nil otherwise. TGLimiter serializes the
+	// single concurrent 1:1 private call across all telegram nodes. Both are used
+	// only when this node's type is "telegram".
+	TGManager telegram.Manager
+	TGLimiter *telegram.Limiter
 }
 
 // New creates a NodeRuntime with the default WebRTC audio-node factory.
@@ -115,6 +123,11 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			TalkbackStream: nodeCfg.RTCStream.TalkbackStream,
 			TalkbackIn:     nodeCfg.RTCStream.TalkbackInStream,
 		}
+	} else if nodeCfg.Type == "telegram" {
+		if r.TGManager == nil {
+			log.Printf("[Node:%s] Skipping telegram node: no Telegram session available (check 'telegram' config / build with -tags telegram_native)\n", nodeCfg.NodeID)
+			return
+		}
 	} else if nodeCfg.Type != "local" {
 		log.Printf("[Node:%s] Skipping handler: node type '%s' is not supported in this version\n", nodeCfg.NodeID, nodeCfg.Type)
 		return
@@ -152,10 +165,19 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 
 	// Initialize the audio transport (WebRTC/go2rtc or local audio device).
 	var audioNode audionode.AudioNode
-	if nodeCfg.Type == "local" {
+	switch nodeCfg.Type {
+	case "local":
 		log.Printf("[Node:%s] Initializing local audio hardware transport...\n", nodeCfg.NodeID)
 		audioNode = localaudio.New(nodeCfg)
-	} else {
+	case "telegram":
+		log.Printf("[Node:%s] Initializing Telegram call transport (%s %s)...\n", nodeCfg.NodeID, nodeCfg.Telegram.TargetType, nodeCfg.Telegram.Target)
+		tgNode, err := telegram.NewNode(nodeCfg.NodeID, nodeCfg.Telegram, r.TGManager, r.TGLimiter)
+		if err != nil {
+			log.Printf("[Node:%s] Failed to create Telegram transport: %v\n", nodeCfg.NodeID, err)
+			return
+		}
+		audioNode = tgNode
+	default:
 		log.Printf("[Node:%s] Initializing WebRTC audio transport...\n", nodeCfg.NodeID)
 		var err error
 		audioNode, err = r.newAudioNode(rtcCfg)
@@ -278,11 +300,9 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	}
 	defer wakeStream.Close()
 
-
-
 	// Subscribe incoming audio: wake word runs on the continuous stream while
 	// speaker ID and ask/capture are routed through the VAD Gate.
-	halfDuplex := !nodeCfg.RTCStream.EchoCancellation
+	halfDuplex := !nodeCfg.EchoCancellationEnabled()
 	var dbgCalls, dbgDrops, dbgSegs, dbgSamples int64
 	wakeActive := false // whether the wake stream is currently being fed (node IDLE)
 	audioNode.OnAudio(func(samples []float32) {
@@ -356,6 +376,8 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	connectTarget := "local audio devices"
 	if nodeCfg.Type == "rtc_stream" {
 		connectTarget = fmt.Sprintf("WebRTC at %s", rtcCfg.SignalingURL)
+	} else if nodeCfg.Type == "telegram" {
+		connectTarget = fmt.Sprintf("Telegram %s %s", nodeCfg.Telegram.TargetType, nodeCfg.Telegram.Target)
 	}
 	log.Printf("[Node:%s] Connecting to audio transport (%s)...\n", nodeCfg.NodeID, connectTarget)
 	if err := audioNode.Connect(ctx); err != nil {

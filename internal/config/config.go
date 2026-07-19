@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -13,7 +14,42 @@ type Config struct {
 	MQTT             MQTTConfig     `yaml:"mqtt"`
 	Security         SecurityConfig `yaml:"security"`
 	Intercom         IntercomConfig `yaml:"intercom"`
+	Telegram         TelegramConfig `yaml:"telegram"`
 	Nodes            []NodeConfig   `yaml:"nodes"`
+}
+
+// TelegramConfig holds the process-wide Telegram user account used by every
+// telegram node. Signaling (login, contact/group resolution, call setup) runs
+// over the MTProto client (gogram) while call media is carried by ntgcalls.
+// A single logged-in user session backs all telegram nodes: group voice chats
+// can be joined concurrently (one media source per chat), but Telegram permits
+// only ONE active 1:1 private call at a time, so contact-target nodes are
+// serialized by the telegram manager.
+type TelegramConfig struct {
+	// APIID / APIHash are the application credentials from https://my.telegram.org.
+	APIID   int    `yaml:"api_id"`
+	APIHash string `yaml:"api_hash"`
+	// Phone is the user account's phone number (E.164). The first run performs an
+	// interactive login (code / 2FA) and persists the session to SessionFile.
+	Phone string `yaml:"phone"`
+	// SessionFile is where the authenticated MTProto session is stored so later
+	// runs start without re-authenticating. Defaults to "./telegram.session".
+	SessionFile string `yaml:"session_file"`
+}
+
+// GetSessionFile returns the configured session path, defaulting to
+// "./telegram.session" when unset.
+func (t TelegramConfig) GetSessionFile() string {
+	if t.SessionFile != "" {
+		return t.SessionFile
+	}
+	return "./telegram.session"
+}
+
+// Enabled reports whether the global Telegram account is configured. When false,
+// telegram nodes cannot be brought up.
+func (t TelegramConfig) Enabled() bool {
+	return t.APIID != 0 && t.APIHash != ""
 }
 
 // IntercomConfig holds settings for the two-node intercom bridge feature.
@@ -150,11 +186,85 @@ type CacheConfig struct {
 
 // NodeConfig holds configuration for a specific audio node/channel.
 type NodeConfig struct {
-	NodeID    string          `yaml:"node_id"`
-	Type      string          `yaml:"type"` // "local" or "rtc_stream"
-	Audio     AudioConfig     `yaml:"audio"`
-	RTCStream RTCStreamConfig `yaml:"rtc_stream"`
-	KWS       KWSConfig       `yaml:"kws"`
+	NodeID    string             `yaml:"node_id"`
+	Type      string             `yaml:"type"` // "local", "rtc_stream" or "telegram"
+	Audio     AudioConfig        `yaml:"audio"`
+	RTCStream RTCStreamConfig    `yaml:"rtc_stream"`
+	Telegram  TelegramNodeConfig `yaml:"telegram"`
+	KWS       KWSConfig          `yaml:"kws"`
+}
+
+// TelegramNodeConfig configures a single telegram node: which contact or group
+// it talks to, when the call is placed, and how long to wait for a human peer.
+type TelegramNodeConfig struct {
+	// TargetType selects the call kind: "group" joins a group/channel voice chat
+	// (many listeners, multiple such nodes can be active concurrently) or
+	// "contact" places a 1:1 private call (one peer, at most one active at a time).
+	TargetType string `yaml:"target_type"`
+
+	// Target identifies the peer: a @username, phone number, or numeric chat/user
+	// id, resolved against the logged-in account's dialogs/contacts.
+	Target string `yaml:"target"`
+
+	// AutoWake places/joins the call on startup and holds it, so wake-word and ask
+	// run on the received call audio like an always-on physical node. It is only
+	// valid for TargetType "group" (a standing 1:1 call would ring a contact
+	// forever); ValidateTelegram rejects autowake on a contact node. When false,
+	// the call is placed on demand — only when an ask/play/say/intercom targets
+	// the node — and torn down after IdleTimeoutSeconds of no activity.
+	AutoWake bool `yaml:"autowake"`
+
+	// ReadyTimeoutSeconds bounds how long EnsureReady waits for a remote peer to
+	// join (group) or accept (contact) before failing. Defaults to 60s when unset.
+	ReadyTimeoutSeconds float64 `yaml:"ready_timeout_seconds"`
+
+	// IdleTimeoutSeconds is how long an on-demand call lingers with no active
+	// stream before the node leaves it. Ignored when AutoWake is true. Defaults to
+	// 30s when unset.
+	IdleTimeoutSeconds float64 `yaml:"idle_timeout_seconds"`
+
+	// EchoCancellation declares the transport performs acoustic echo cancellation.
+	// ntgcalls/WebRTC does its own AEC, so this defaults to true behavior via
+	// GetEchoCancellation: the brain's half-duplex mic gate and the intercom's
+	// software AEC are skipped for telegram nodes.
+	EchoCancellation *bool `yaml:"echo_cancellation"`
+}
+
+// GetReadyTimeoutSeconds returns the peer-join wait bound, defaulting to 60s.
+func (t TelegramNodeConfig) GetReadyTimeoutSeconds() float64 {
+	if t.ReadyTimeoutSeconds > 0 {
+		return t.ReadyTimeoutSeconds
+	}
+	return 60
+}
+
+// GetIdleTimeoutSeconds returns the on-demand idle-teardown delay, defaulting to 30s.
+func (t TelegramNodeConfig) GetIdleTimeoutSeconds() float64 {
+	if t.IdleTimeoutSeconds > 0 {
+		return t.IdleTimeoutSeconds
+	}
+	return 30
+}
+
+// GetEchoCancellation reports whether the telegram transport does AEC. It
+// defaults to true (ntgcalls/WebRTC cancels echo) unless explicitly disabled.
+func (t TelegramNodeConfig) GetEchoCancellation() bool {
+	if t.EchoCancellation == nil {
+		return true
+	}
+	return *t.EchoCancellation
+}
+
+// EchoCancellationEnabled reports whether this node's transport performs acoustic
+// echo cancellation, reading the correct per-type field. Nodes that do their own
+// AEC run full-duplex (no half-duplex mic gate while speaking).
+func (n *NodeConfig) EchoCancellationEnabled() bool {
+	switch n.Type {
+	case "telegram":
+		return n.Telegram.GetEchoCancellation()
+	default:
+		return n.RTCStream.EchoCancellation
+	}
 }
 
 // AudioConfig holds settings for local audio hardware.
@@ -256,7 +366,38 @@ func LoadConfig(filePath string) (*Config, error) {
 		cfg.GlobalNumThreads = 4
 	}
 
+	if err := cfg.validateTelegramNodes(); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateTelegramNodes enforces the invariants for telegram nodes so a bad
+// config fails fast at load instead of at call time: a target is required, the
+// target type must be "group" or "contact", and autowake is restricted to group
+// nodes (a standing 1:1 call would ring a contact indefinitely).
+func (c *Config) validateTelegramNodes() error {
+	for _, n := range c.Nodes {
+		if n.Type != "telegram" {
+			continue
+		}
+		if !c.Telegram.Enabled() {
+			return fmt.Errorf("node %q is type telegram but the global 'telegram' account (api_id/api_hash) is not configured", n.NodeID)
+		}
+		if n.Telegram.Target == "" {
+			return fmt.Errorf("telegram node %q requires 'telegram.target'", n.NodeID)
+		}
+		switch n.Telegram.TargetType {
+		case "group", "contact":
+		default:
+			return fmt.Errorf("telegram node %q has invalid 'telegram.target_type' %q (want \"group\" or \"contact\")", n.NodeID, n.Telegram.TargetType)
+		}
+		if n.Telegram.AutoWake && n.Telegram.TargetType != "group" {
+			return fmt.Errorf("telegram node %q: autowake is only allowed for target_type \"group\" (a standing 1:1 call would ring the contact indefinitely)", n.NodeID)
+		}
+	}
+	return nil
 }
 
 // GetKWSNumThreads returns the node-specific KWS num threads, falling back to a default value if not specified (<=0).

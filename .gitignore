@@ -44,3 +44,8 @@ models/*
 *.tar.gz
 *.zip
 
+# Telegram user session (grants full access to the account — never commit)
+*.session
+/telegram.session
+/session.json
+

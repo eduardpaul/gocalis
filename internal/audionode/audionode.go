@@ -41,3 +41,23 @@ type AudioNode interface {
 	// Close tears down the transport and releases resources.
 	Close() error
 }
+
+// CallEndpoint is an optional capability for AudioNodes whose media path is only
+// usable once a remote party is present — e.g. a Telegram call where audio can
+// only flow after the callee accepts (1:1) or another participant joins the
+// group voice chat. Transports that are continuously available (local soundcard,
+// go2rtc/WebRTC stream) do NOT implement it.
+//
+// Callers that are about to stream to or from a node (brain speak/play, the
+// intercom bridge) check whether the node's AudioNode implements CallEndpoint
+// and, if so, block on EnsureReady before treating the node as live. For an
+// on-demand endpoint EnsureReady also establishes the call as its first step;
+// for an autowake endpoint it waits on the already-placed call. This is what
+// makes an intercom to a group "start only once one other user has joined".
+type CallEndpoint interface {
+	// EnsureReady blocks until the endpoint has a live remote peer and audio can
+	// flow, or returns an error if ctx is cancelled or the peer never arrives
+	// within the endpoint's own readiness deadline. It is safe to call
+	// concurrently and repeatedly; once ready, subsequent calls return promptly.
+	EnsureReady(ctx context.Context) error
+}

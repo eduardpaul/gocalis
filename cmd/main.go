@@ -24,6 +24,7 @@ import (
 	"gocalis/internal/protocol"
 	"gocalis/internal/runtime"
 	"gocalis/internal/server"
+	"gocalis/internal/telegram"
 	"gocalis/internal/webrtc"
 	"gocalis/internal/webserver"
 
@@ -59,7 +60,7 @@ func main() {
 	// are skipped by the node runtime, so they must not dilute the thread budget.
 	numNodes := 0
 	for _, n := range cfg.Nodes {
-		if n.Type == "rtc_stream" {
+		if n.Type == "rtc_stream" || n.Type == "telegram" {
 			numNodes++
 		}
 	}
@@ -82,6 +83,10 @@ func main() {
 	}
 	if *channel == "asr-file" {
 		runASRFileMode(cfg, *audioFile, threadsPerModel)
+		return
+	}
+	if *channel == "telegram-login" {
+		runTelegramLoginMode(cfg)
 		return
 	}
 	if *channel == "rtc-record" {
@@ -183,6 +188,36 @@ func main() {
 			defer mqttClient.Close()
 		}
 
+		// Bring up the shared Telegram user session once, when any telegram node is
+		// configured. One login backs every telegram node; the limiter serializes
+		// the single concurrent 1:1 private call Telegram allows per account. A
+		// failure here (e.g. not built with -tags telegram_native, or login failed)
+		// is non-fatal: telegram nodes are skipped and the rest of gocalis runs.
+		var tgManager telegram.Manager
+		var tgLimiter *telegram.Limiter
+		hasTelegramNode := false
+		for _, n := range cfg.Nodes {
+			if n.Type == "telegram" {
+				hasTelegramNode = true
+				break
+			}
+		}
+		if hasTelegramNode {
+			tgLimiter = telegram.NewLimiter()
+			var terr error
+			tgManager, terr = telegram.NewManager(cfg.Telegram)
+			if terr != nil {
+				log.Printf("[Main] Telegram nodes disabled: %v\n", terr)
+				tgManager = nil
+			} else {
+				defer func() {
+					if err := tgManager.Close(); err != nil {
+						log.Printf("[Main] Telegram session close error: %v\n", err)
+					}
+				}()
+			}
+		}
+
 		// Start configuration hot-reloading file watcher (speaker profiles only).
 		config.WatchSpeakers(*configPath, func() {
 			log.Println("[Main] Config changed; hot-reloading speaker profiles...")
@@ -200,6 +235,8 @@ func main() {
 		for i := range cfg.Nodes {
 			nodeCfg := cfg.Nodes[i]
 			rt := runtime.New(nodeCfg, cfg, asrEngine, speakerEngine, eventBus, centralBrain, executor.AskEngine, threadsPerModel)
+			rt.TGManager = tgManager
+			rt.TGLimiter = tgLimiter
 			nodeWG.Add(1)
 			go func() {
 				defer nodeWG.Done()
@@ -254,6 +291,23 @@ func main() {
 	default:
 		log.Fatalf("Unknown channel mode: %s. Supported modes: webrtc, demo, wake-file, asr-file, rtc-record, rtc-say, rtc-loopback", *channel)
 	}
+}
+
+// runTelegramLoginMode performs the one-time interactive Telegram user login and
+// persists the session file, so later `-channel webrtc` runs start without
+// re-authenticating. Under the default build it reports that telegram support was
+// not compiled in; build with `-tags telegram_native` to actually authenticate.
+func runTelegramLoginMode(cfg *config.Config) {
+	if !cfg.Telegram.Enabled() {
+		log.Fatal("telegram-login: configure the global 'telegram' block (api_id/api_hash) first")
+	}
+	log.Printf("telegram-login: connecting as %s (session: %s)...\n", cfg.Telegram.Phone, cfg.Telegram.GetSessionFile())
+	mgr, err := telegram.NewManager(cfg.Telegram)
+	if err != nil {
+		log.Fatalf("telegram-login: %v", err)
+	}
+	defer mgr.Close()
+	log.Println("telegram-login: session ready.")
 }
 
 func findNodeConfig(cfg *config.Config, nodeID string) *config.NodeConfig {

@@ -123,6 +123,18 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 		defer release()
 	}
 
+	// For a call-based node (Telegram) that is not already live, place/join the
+	// call and wait for a human peer before playing the prompt. No-op for always
+	// available transports (local soundcard, go2rtc/WebRTC).
+	if err := e.Brain.EnsureNodeReady(ctx, cfg.NodeID); err != nil {
+		return Result{
+			ContextID:    cfg.ContextID,
+			NodeID:       cfg.NodeID,
+			Status:       "error",
+			ErrorMessage: err.Error(),
+		}
+	}
+
 	// Each turn owns an isolated Session registered on the brain so the audio
 	// ingestion path fans captured speech (and barge-in) into it. A unique ID lets
 	// concurrent turns coexist on the same node even if they share a context ID.

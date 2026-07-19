@@ -144,6 +144,10 @@ func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority 
 	}
 	defer release()
 
+	if err := b.ensureReady(ctx, handle); err != nil {
+		return err
+	}
+
 	return b.speakToHandle(ctx, handle, text, priority)
 }
 
@@ -169,6 +173,10 @@ func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16,
 		return err
 	}
 	defer release()
+
+	if err := b.ensureReady(ctx, handle); err != nil {
+		return err
+	}
 
 	return b.playSamplesToHandle(ctx, handle, samples, sampleRate)
 }
@@ -392,6 +400,36 @@ func (b *Brain) PlayAudio(ctx context.Context, nodeID string, samples []int16, s
 	}
 
 	return handle.Audio.Play(ctx, samples, sampleRate)
+}
+
+// ensureReady blocks until a call-based node's remote peer is present, when the
+// node's transport implements audionode.CallEndpoint (e.g. a Telegram call).
+// For a transport that is always available it is a no-op. It is called after the
+// turn slot is acquired but before any audio is streamed, so an on-demand call
+// is placed (and a human peer awaited) only when there is actually something to
+// say/play, and so a busy device is not dialed out from under a queued turn.
+func (b *Brain) ensureReady(ctx context.Context, handle *NodeHandle) error {
+	ep, ok := handle.Audio.(audionode.CallEndpoint)
+	if !ok {
+		return nil
+	}
+	if err := ep.EnsureReady(ctx); err != nil {
+		return fmt.Errorf("node '%s' not ready: %w", handle.Node.NodeID, err)
+	}
+	return nil
+}
+
+// EnsureNodeReady blocks until the node's transport has a live remote peer, when
+// it is a call-based endpoint (audionode.CallEndpoint); otherwise it is a no-op.
+// The ask flow calls this after reserving the node so an on-demand Telegram call
+// is placed (and a human peer awaited) before the prompt is played. It errors if
+// the node is unknown or the peer never arrives.
+func (b *Brain) EnsureNodeReady(ctx context.Context, nodeID string) error {
+	handle := b.GetNodeHandle(nodeID)
+	if handle == nil {
+		return fmt.Errorf("node '%s' not registered", nodeID)
+	}
+	return b.ensureReady(ctx, handle)
 }
 
 // snapshotHandles returns a copy of the current node handles slice.

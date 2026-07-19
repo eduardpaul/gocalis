@@ -8,12 +8,24 @@ import CommandCenter from './components/CommandCenter'
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/events`
 const API_URL = `${window.location.protocol}//${window.location.host}/api`
 
+// Extract token from query parameters if present
+const urlParams = new URLSearchParams(window.location.search)
+const token = urlParams.get('token') || ''
+
 function App() {
   const [connected, setConnected] = useState(false)
   const [status, setStatus] = useState(null)
   const [nodes, setNodes] = useState([])
   const [events, setEvents] = useState([])
   const wsRef = useRef(null)
+
+  const getHeaders = () => {
+    const headers = { 'Content-Type': 'application/json' }
+    if (token) {
+      headers['X-Auth-Token'] = token
+    }
+    return headers
+  }
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -34,7 +46,8 @@ function App() {
   }, [])
 
   const connectWebSocket = useCallback(() => {
-    const ws = new WebSocket(WS_URL)
+    const wsUrl = token ? `${WS_URL}?token=${encodeURIComponent(token)}` : WS_URL
+    const ws = new WebSocket(wsUrl)
     wsRef.current = ws
 
     ws.onopen = () => setConnected(true)
@@ -76,7 +89,7 @@ function App() {
   const execute = async (action, payload) => {
     const res = await fetch(`${API_URL}/execute`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getHeaders(),
       body: JSON.stringify({ action, ...payload }),
     })
     return res.json()
@@ -85,7 +98,7 @@ function App() {
   const synthesize = async (payload) => {
     const res = await fetch(`${API_URL}/synthesize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getHeaders(),
       body: JSON.stringify(payload),
     })
     return res.json()
@@ -94,14 +107,17 @@ function App() {
   const ask = async (payload) => {
     const res = await fetch(`${API_URL}/ask`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getHeaders(),
       body: JSON.stringify(payload),
     })
     return res.json()
   }
 
   const reloadSpeakers = async () => {
-    const res = await fetch(`${API_URL}/reload-speakers`, { method: 'POST' })
+    const res = await fetch(`${API_URL}/reload-speakers`, {
+      method: 'POST',
+      headers: getHeaders(),
+    })
     return res.json()
   }
 

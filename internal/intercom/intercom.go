@@ -139,14 +139,10 @@ func (e *Engine) Start(nodes []string, duration time.Duration) error {
 	}
 	e.mu.Unlock()
 
-	e.emit(Event{
-		Event:      "intercom_started",
-		NodeIDs:    uniq,
-		NodeID:     uniq[0],
-		PeerNodeID: uniq[1],
-		Status:     "success",
-	})
-
+	// The "intercom_started" event is emitted inside run(), once every node is
+	// ready — for a call-based node (Telegram) that means a remote peer has
+	// actually joined. This is what makes an intercom to a group only begin once
+	// one other user is on the call, rather than the moment it is requested.
 	go e.run(c, duration)
 	return nil
 }
@@ -192,6 +188,39 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		}
 		releases = append(releases, rel)
 	}
+
+	// Establish readiness for every participant before the call is considered
+	// live. For always-available transports this is instant; for a call-based
+	// node (Telegram) EnsureNodeReady places/joins the call and blocks until a
+	// remote peer is present (or its readiness deadline elapses). Only then is the
+	// bridge wired and the "intercom_started" event emitted, so a group intercom
+	// begins exactly when one other user has joined. Ordered by the same sorted
+	// slot-acquisition order for determinism.
+	started := time.Now()
+	for _, n := range order {
+		if err := e.brain.EnsureNodeReady(ctx, n); err != nil {
+			releaseAll()
+			e.finish(c, "error", "node '"+n+"' not ready: "+err.Error())
+			return
+		}
+	}
+	// Reset the call clock so the bounded duration is measured from when the call
+	// actually went live (peer joined), not from when it was requested. Only the
+	// run goroutine touches c.started after Start, and finish() runs in this same
+	// goroutine, so no lock is needed.
+	c.started = started
+
+	peer := ""
+	if len(c.nodes) > 1 {
+		peer = c.nodes[1]
+	}
+	e.emit(Event{
+		Event:      "intercom_started",
+		NodeIDs:    c.nodes,
+		NodeID:     c.nodes[0],
+		PeerNodeID: peer,
+		Status:     "success",
+	})
 
 	// Per-node echo cancellers (optional). Each node's canceller removes the echo
 	// of what that node plays (its mix-minus output) from its mic. When echo

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -612,6 +613,14 @@ func (s *vitsSynthesizer) prepareStream(text string) (*streamingAudioStream, fun
 			stream.finish(errors.New("failed to generate speech audio"))
 			return
 		}
+
+		stream.mu.Lock()
+		bufEmpty := len(stream.buf) == 0
+		stream.mu.Unlock()
+		if bufEmpty && len(result.Samples) > 0 {
+			stream.push(result.Samples)
+		}
+
 		stream.finish(nil)
 	}
 
@@ -679,6 +688,22 @@ func (s *vitsSynthesizer) SynthesizeToFile(text string, outputPath string, opts 
 }
 
 func (s *vitsSynthesizer) SynthesizeToStream(text string, opts JobOptions) (AudioStream, error) {
+	if text == "test-beep" {
+		sr := 16000
+		duration := 5
+		samples := make([]float32, sr*duration)
+		for i := range samples {
+			t := float64(i) / float64(sr)
+			samples[i] = float32(math.Sin(2 * math.Pi * 440.0 * t))
+		}
+		stream := newStreamingAudioStream(sr)
+		go func() {
+			stream.push(samples)
+			stream.finish(nil)
+		}()
+		return stream, nil
+	}
+
 	s.mutex.Lock()
 	enabled := s.configCopy.CacheConfig.Enabled
 	cacheDir := s.configCopy.CacheConfig.Dir
