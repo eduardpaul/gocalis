@@ -9,13 +9,15 @@ RUN npm run build
 # Stage 2: Build and run the Go application
 FROM golang:1.24-bookworm
 
-# Install basic development tools, alsa-utils for sound, and libopus(+file)
-# dev headers + pkg-config for the CGO Opus wideband transport (T18).
+# Install basic development tools, alsa-utils for sound, libopus(+file) dev
+# headers + pkg-config for the CGO Opus wideband transport (T18), and libspeexdsp
+# for the CGO intercom acoustic echo canceller.
 RUN apt-get update && apt-get install -y \
     alsa-utils \
     bzip2 \
     libopus-dev \
     libopusfile-dev \
+    libspeexdsp-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

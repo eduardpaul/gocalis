@@ -303,6 +303,13 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			return
 		}
 
+		// Intercom tap: while this node is bridged to a peer, forward the raw
+		// continuous mic to the intercom engine (which streams it to the peer's
+		// speaker). No tap installed = a cheap map lookup. The node is in the
+		// INTERCOM state during a call, so the half-duplex gate above does not
+		// drop this audio and full-duplex conversation is preserved.
+		r.brain.ForwardRawAudio(nodeCfg.NodeID, samples)
+
 		// Wake word detection runs on the CONTINUOUS audio stream, but only while the
 		// node is IDLE (waiting for a fresh activation). The streaming zipformer KWS
 		// needs future (right-context) frames to decode the final phonemes of a

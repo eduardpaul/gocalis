@@ -7,22 +7,25 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gocalis/internal/ai"
 	"gocalis/internal/ask"
 	"gocalis/internal/audio"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
+	"gocalis/internal/intercom"
 )
 
 // Executor runs actions requested by any transport adapter using the central brain
 // and the AI engines, then publishes the results back through EventPublisher.
 type Executor struct {
-	Brain         *brain.Brain
-	ASREngine     ai.Transcriber
-	SpeakerEngine ai.SpeakerIdentifier
-	Publisher     EventPublisher
-	AskEngine     *ask.Engine
+	Brain          *brain.Brain
+	ASREngine      ai.Transcriber
+	SpeakerEngine  ai.SpeakerIdentifier
+	Publisher      EventPublisher
+	AskEngine      *ask.Engine
+	IntercomEngine *intercom.Engine
 
 	// AudioBaseDir constrains where transport-supplied audio_file paths may point.
 	// It defaults to the process working directory. Requests referencing paths
@@ -31,8 +34,8 @@ type Executor struct {
 }
 
 // NewExecutor creates a command executor backed by the given engines and publisher.
-func NewExecutor(brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig) *Executor {
-	return &Executor{
+func NewExecutor(brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig, intercomCfg config.IntercomConfig) *Executor {
+	e := &Executor{
 		Brain:         brain,
 		ASREngine:     asr,
 		SpeakerEngine: speaker,
@@ -40,6 +43,21 @@ func NewExecutor(brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdent
 		AskEngine:     ask.NewEngine(brain, asr, speaker, speakerIDCfg),
 		AudioBaseDir:  ".",
 	}
+	// The intercom engine reports lifecycle events (started/ended) asynchronously;
+	// translate them onto the shared event bus.
+	e.IntercomEngine = intercom.NewEngine(brain, intercomCfg, func(ev intercom.Event) {
+		e.Publisher.Publish(Response{
+			Event:           ev.Event,
+			NodeID:          ev.NodeID,
+			NodeIDs:         ev.NodeIDs,
+			PeerNodeID:      ev.PeerNodeID,
+			Status:          ev.Status,
+			Reason:          ev.Reason,
+			Message:         ev.Message,
+			DurationSeconds: ev.DurationSeconds,
+		})
+	}, intercom.NewSpeexEchoCanceller)
+	return e
 }
 
 // resolveAudioFile validates a transport-supplied audio file path and returns a
@@ -86,6 +104,10 @@ func (e *Executor) Execute(ctx context.Context, req Request) {
 		e.executeAsk(ctx, req)
 	case "play":
 		e.executePlay(ctx, req)
+	case "intercom":
+		e.executeIntercom(ctx, req)
+	case "intercom_stop":
+		e.executeIntercomStop(req)
 	default:
 		e.publishError(req.NodeID, fmt.Sprintf("unknown action: %s", req.Action))
 	}
@@ -253,6 +275,44 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 	}
 
 	e.Publisher.Publish(resp)
+}
+
+// executeIntercom starts a live N-node intercom bridge. Participants come from
+// 'node_ids' (two or more); for convenience a two-node call may instead pass
+// 'node_id' + 'peer_node_id'. The call runs in the background (bounded by the
+// configured/overridden timeout) and reports its end via an "intercom_ended"
+// event; the started event is emitted by the engine.
+func (e *Executor) executeIntercom(_ context.Context, req Request) {
+	nodes := req.NodeIDs
+	if len(nodes) == 0 {
+		if req.NodeID != "" {
+			nodes = append(nodes, req.NodeID)
+		}
+		if req.PeerNodeID != "" {
+			nodes = append(nodes, req.PeerNodeID)
+		}
+	}
+	if len(nodes) < 2 {
+		e.publishError(req.NodeID, "intercom requires at least two nodes ('node_ids', or 'node_id'+'peer_node_id')")
+		return
+	}
+	duration := time.Duration(req.DurationSeconds * float64(time.Second))
+	log.Printf("[Executor] Intercom among [%s] (duration=%v)\n", strings.Join(nodes, ", "), duration)
+	if err := e.IntercomEngine.Start(nodes, duration); err != nil {
+		e.publishError(nodes[0], err.Error())
+	}
+}
+
+// executeIntercomStop ends the intercom call that node_id participates in.
+func (e *Executor) executeIntercomStop(req Request) {
+	if req.NodeID == "" {
+		e.publishError("", "intercom_stop requires 'node_id'")
+		return
+	}
+	log.Printf("[Executor] Intercom stop requested for '%s'\n", req.NodeID)
+	if !e.IntercomEngine.Stop(req.NodeID) {
+		e.publishError(req.NodeID, "no active intercom call for node")
+	}
 }
 
 func (e *Executor) publishError(nodeID string, message string) {

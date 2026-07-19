@@ -133,7 +133,8 @@ func main() {
 		eventBus := protocol.NewMultiPublisher()
 
 		// Shared command executor used by all transports.
-		executor := protocol.NewExecutor(centralBrain, asrEngine, speakerEngine, eventBus, cfg.Models.SpeakerID)
+		executor := protocol.NewExecutor(centralBrain, asrEngine, speakerEngine, eventBus, cfg.Models.SpeakerID, cfg.Intercom)
+		defer executor.IntercomEngine.Shutdown()
 
 		// Initialize global WebSocket API server for Node-RED integration.
 		log.Printf("Starting Global Node-RED WebSocket API Server on %s...\n", *wsAddr)

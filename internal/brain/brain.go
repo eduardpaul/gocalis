@@ -43,6 +43,13 @@ type Brain struct {
 	nodes      map[string]*NodeHandle
 	nodesMutex sync.RWMutex
 	sessions   *session.Registry
+
+	// rawTaps holds a per-node continuous-mic sink used by the intercom bridge.
+	// The capture path calls ForwardRawAudio for every mic chunk; when a tap is
+	// installed for that node the raw (non-VAD-gated) audio is forwarded to it.
+	// Empty map / no tap installed = zero overhead on the hot capture path.
+	rawTaps   map[string]func(samples []float32)
+	rawTapsMu sync.RWMutex
 }
 
 // New creates a new Brain backed by the given TTS engine.
@@ -51,6 +58,7 @@ func New(ttsEngine ai.Synthesizer) *Brain {
 		ttsEngine: ttsEngine,
 		nodes:     make(map[string]*NodeHandle),
 		sessions:  session.NewRegistry(),
+		rawTaps:   make(map[string]func(samples []float32)),
 	}
 }
 

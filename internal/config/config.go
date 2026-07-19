@@ -12,7 +12,60 @@ type Config struct {
 	Models           ModelsConfig   `yaml:"models"`
 	MQTT             MQTTConfig     `yaml:"mqtt"`
 	Security         SecurityConfig `yaml:"security"`
+	Intercom         IntercomConfig `yaml:"intercom"`
 	Nodes            []NodeConfig   `yaml:"nodes"`
+}
+
+// IntercomConfig holds settings for the two-node intercom bridge feature.
+type IntercomConfig struct {
+	// DefaultTimeoutSeconds is the default automatic end time for an intercom
+	// call when the request does not override it. A call always ends by this
+	// deadline unless stopped earlier. Defaults to 60s when unset (<=0).
+	DefaultTimeoutSeconds float64 `yaml:"default_timeout_seconds"`
+
+	// EchoCancellation controls the software acoustic echo canceller applied to
+	// each node's mic before it is forwarded to the peer, so a device without
+	// hardware echo cancellation does not feed its own speaker output (the peer's
+	// voice) back into the call.
+	EchoCancellation IntercomAECConfig `yaml:"echo_cancellation"`
+}
+
+// IntercomAECConfig configures the per-node software echo canceller.
+type IntercomAECConfig struct {
+	// Enabled turns the software echo canceller on. When false, mics are bridged
+	// verbatim (safe only when the devices do hardware AEC or are acoustically
+	// isolated).
+	Enabled bool `yaml:"enabled"`
+	// TailMs is the adaptive-filter length in milliseconds: the echo-path delay
+	// budget (network + speaker + acoustic + mic). Defaults to 250ms when unset.
+	TailMs int `yaml:"tail_ms"`
+	// FrameMs is the processing frame size in milliseconds. Defaults to 20ms.
+	FrameMs int `yaml:"frame_ms"`
+}
+
+// GetDefaultTimeoutSeconds returns the configured default intercom timeout,
+// falling back to 60s when unset (<=0).
+func (c IntercomConfig) GetDefaultTimeoutSeconds() float64 {
+	if c.DefaultTimeoutSeconds > 0 {
+		return c.DefaultTimeoutSeconds
+	}
+	return 60
+}
+
+// GetTailMs returns the configured AEC filter tail length, defaulting to 250ms.
+func (a IntercomAECConfig) GetTailMs() int {
+	if a.TailMs > 0 {
+		return a.TailMs
+	}
+	return 250
+}
+
+// GetFrameMs returns the configured AEC frame size, defaulting to 20ms.
+func (a IntercomAECConfig) GetFrameMs() int {
+	if a.FrameMs > 0 {
+		return a.FrameMs
+	}
+	return 20
 }
 
 // SecurityConfig holds transport hardening settings for the HTTP/WebSocket APIs.

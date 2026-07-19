@@ -22,6 +22,15 @@ type Request struct {
 	OutputFormat             string  `json:"output_format,omitempty"`
 	VADTimeoutSeconds        float64 `json:"vad_timeout_seconds,omitempty"`
 	PostSpeechSilenceSeconds float64 `json:"post_speech_silence_seconds,omitempty"`
+
+	// Intercom fields. For action == "intercom", the participants are NodeIDs
+	// (two or more); as a convenience for two-node calls NodeID + PeerNodeID may
+	// be used instead. DurationSeconds optionally overrides the configured
+	// default call timeout. For action == "intercom_stop", NodeID identifies a
+	// participant of the call to end.
+	NodeIDs         []string `json:"node_ids,omitempty"`
+	PeerNodeID      string   `json:"peer_node_id,omitempty"`
+	DurationSeconds float64  `json:"duration_seconds,omitempty"`
 }
 
 // Response defines the structure of outgoing events and command responses.
@@ -44,6 +53,16 @@ type Response struct {
 	Recording  string `json:"recording,omitempty"`   // base64-encoded WAV (PCM16) of the captured speech
 	SampleRate int    `json:"sample_rate,omitempty"` // sample rate of the recording
 	Timestamp  int64  `json:"timestamp,omitempty"`   // unix seconds when the event was raised
+
+	// Intercom event fields (event == "intercom_started" / "intercom_ended").
+	// NodeIDs lists every participant; NodeID/PeerNodeID mirror the first two for
+	// two-node clients. Reason is why the call ended ("timeout", "stopped",
+	// "shutdown", "error"); DurationSeconds is the call length on
+	// "intercom_ended".
+	NodeIDs         []string `json:"node_ids,omitempty"`
+	PeerNodeID      string   `json:"peer_node_id,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
+	DurationSeconds float64  `json:"duration_seconds,omitempty"`
 }
 
 // EventPublisher is the common interface for broadcasting events to transports.

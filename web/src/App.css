@@ -211,6 +211,17 @@
   width: auto;
 }
 
+.intercom-participants {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 6px;
+}
+
+.intercom-participants .checkbox-label {
+  align-self: auto;
+}
+
 .result-view strong {
   display: block;
   margin-bottom: 6px;
