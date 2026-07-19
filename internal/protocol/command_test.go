@@ -42,3 +42,29 @@ func TestResolveAudioFile(t *testing.T) {
 		})
 	}
 }
+
+// Validate gates Execute, so every dispatched action must be accepted here or
+// it is unreachable over the API.
+func TestValidateIntercomActions(t *testing.T) {
+	tests := []struct {
+		name    string
+		req     Request
+		wantErr bool
+	}{
+		{"intercom node_ids", Request{Action: "intercom", NodeIDs: []string{"a", "b"}}, false},
+		{"intercom node_id+peer", Request{Action: "intercom", NodeID: "a", PeerNodeID: "b"}, false},
+		{"intercom with duration", Request{Action: "intercom", NodeIDs: []string{"a", "b"}, DurationSeconds: 30}, false},
+		{"intercom negative duration", Request{Action: "intercom", NodeIDs: []string{"a", "b"}, DurationSeconds: -1}, true},
+		{"intercom too many nodes", Request{Action: "intercom", NodeIDs: make([]string, maxIntercomNodes+1)}, true},
+		{"intercom_stop", Request{Action: "intercom_stop", NodeID: "a"}, false},
+		{"intercom_stop without node", Request{Action: "intercom_stop"}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.req.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}

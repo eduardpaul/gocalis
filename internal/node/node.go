@@ -13,6 +13,11 @@ const (
 	StateListening   NodeState = "LISTENING"
 	StateProcessing  NodeState = "PROCESSING"
 	StateChallenging NodeState = "CHALLENGING"
+	// StateIntercom: the node is bridged to a peer node in a live intercom
+	// session. Unlike SPEAKING it does NOT gate the capture path (intercom needs
+	// full-duplex mic), and unlike IDLE it suppresses wake detection so a keyword
+	// spoken during the call does not spawn a competing ask turn.
+	StateIntercom NodeState = "INTERCOM"
 )
 
 type stateTransition struct {

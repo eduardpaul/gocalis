@@ -10,6 +10,7 @@ const TABS = [
   { id: 'say', label: 'Say', hint: 'Speak text on a node' },
   { id: 'tts', label: 'TTS', hint: 'Render text to a WAV file (no playback)' },
   { id: 'ask', label: 'Ask', hint: 'Speak a prompt, listen, and transcribe the reply' },
+  { id: 'intercom', label: 'Intercom', hint: 'Bridge two nodes into a live two-way call' },
   { id: 'asr', label: 'ASR', hint: 'Transcribe an audio file' },
   { id: 'speaker_id', label: 'Speaker ID', hint: 'Identify the speaker in an audio file' },
 ]
@@ -17,6 +18,8 @@ const TABS = [
 function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers }) {
   const [activeTab, setActiveTab] = useState('say')
   const [nodeId, setNodeId] = useState('all')
+  const [intercomNodes, setIntercomNodes] = useState([])
+  const [intercomDuration, setIntercomDuration] = useState(60)
   const [text, setText] = useState('')
   const [filename, setFilename] = useState('')
   const [audioFile, setAudioFile] = useState('')
@@ -33,6 +36,23 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
   const singleNodeOptions = (nodes || []).map((n) => ({ value: n.node_id, label: n.node_id }))
 
   const activeMeta = TABS.find((t) => t.id === activeTab)
+
+  // selectTab switches tabs, seeding the intercom participant set with the first
+  // two available nodes (a call needs at least two).
+  const selectTab = (id) => {
+    if (id === 'intercom' && intercomNodes.length < 2) {
+      setIntercomNodes(singleNodeOptions.slice(0, 2).map((o) => o.value))
+    }
+    setActiveTab(id)
+    setLastResult(null)
+  }
+
+  // toggleIntercomNode adds or removes a node from the participant set.
+  const toggleIntercomNode = (value) => {
+    setIntercomNodes((prev) =>
+      prev.includes(value) ? prev.filter((v) => v !== value) : [...prev, value]
+    )
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -52,6 +72,14 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           require_speaker_id: requireSpeakerId,
           vad_timeout_seconds: Number(vadTimeout),
           priority: Number(priority),
+        })
+      } else if (activeTab === 'intercom') {
+        if (intercomNodes.length < 2) {
+          throw new Error('Select at least two nodes to bridge')
+        }
+        result = await onExecute('intercom', {
+          node_ids: intercomNodes,
+          duration_seconds: Number(intercomDuration),
         })
       } else {
         // asr / speaker_id
@@ -81,6 +109,26 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     }
   }
 
+  // handleIntercomStop ends the active call that the selected nodes participate
+  // in (stopping any one participant ends the whole call).
+  const handleIntercomStop = async () => {
+    const a = intercomNodes[0]
+    if (!a) {
+      setLastResult({ status: 'error', error_message: 'Select a participating node to stop' })
+      return
+    }
+    setLoading(true)
+    setLastResult(null)
+    try {
+      const result = await onExecute('intercom_stop', { node_id: a })
+      setLastResult(result)
+    } catch (err) {
+      setLastResult({ status: 'error', error_message: err.message })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="card command-center">
       <h2>Command Center</h2>
@@ -90,10 +138,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           <button
             key={tab.id}
             className={activeTab === tab.id ? 'active' : ''}
-            onClick={() => {
-              setActiveTab(tab.id)
-              setLastResult(null)
-            }}
+            onClick={() => selectTab(tab.id)}
           >
             {tab.label}
           </button>
@@ -197,6 +242,42 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           </>
         )}
 
+        {activeTab === 'intercom' && (
+          <>
+            <label>
+              Participants <span className="hint">(select two or more nodes to bridge)</span>
+              <div className="intercom-participants">
+                {singleNodeOptions.length === 0 && <span className="hint">No nodes available</span>}
+                {singleNodeOptions.map((opt) => (
+                  <label key={opt.value} className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={intercomNodes.includes(opt.value)}
+                      onChange={() => toggleIntercomNode(opt.value)}
+                    />
+                    {opt.label}
+                  </label>
+                ))}
+              </div>
+            </label>
+            <label>
+              Auto-end after (seconds) <span className="hint">(0 = server default)</span>
+              <input
+                type="number"
+                value={intercomDuration}
+                onChange={(e) => setIntercomDuration(e.target.value)}
+                min={0}
+                max={3600}
+              />
+            </label>
+            <p className="hint">
+              While a call is live, every participant is held: any Say/Ask targeting them is queued
+              until it ends. Each node hears all the others (mix-minus). The call auto-ends after the
+              timeout, or use Stop below.
+            </p>
+          </>
+        )}
+
         {(activeTab === 'asr' || activeTab === 'speaker_id') && (
           <>
             <label>
@@ -223,26 +304,34 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           </>
         )}
 
-        <div className="form-row">
-          <label>
-            Priority
-            <input
-              type="number"
-              value={priority}
-              onChange={(e) => setPriority(e.target.value)}
-              min={0}
-              max={100}
-            />
-          </label>
-        </div>
+        {activeTab !== 'intercom' && (
+          <div className="form-row">
+            <label>
+              Priority
+              <input
+                type="number"
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                min={0}
+                max={100}
+              />
+            </label>
+          </div>
+        )}
 
         <div className="command-actions">
           <button type="submit" className="btn" disabled={loading}>
-            {loading ? 'Sending...' : `Run ${activeMeta?.label ?? activeTab}`}
+            {loading ? 'Sending...' : activeTab === 'intercom' ? 'Start Intercom' : `Run ${activeMeta?.label ?? activeTab}`}
           </button>
-          <button type="button" className="btn btn-secondary" onClick={handleReload} disabled={loading}>
-            Reload Speakers
-          </button>
+          {activeTab === 'intercom' ? (
+            <button type="button" className="btn btn-secondary" onClick={handleIntercomStop} disabled={loading}>
+              Stop Intercom
+            </button>
+          ) : (
+            <button type="button" className="btn btn-secondary" onClick={handleReload} disabled={loading}>
+              Reload Speakers
+            </button>
+          )}
         </div>
       </form>
 
