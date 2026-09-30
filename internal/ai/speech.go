@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,11 +11,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"gocalis/internal/audio"
+	"gocalis/internal/audionode"
 	"gocalis/internal/config"
+	"gocalis/internal/workqueue"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
@@ -23,11 +25,11 @@ import (
 type Transcriber interface {
 	// TranscribeSamples transcribes mono float32 samples (range [-1,1]). Samples
 	// not already at 16000Hz are resampled. This is the primary, in-memory path.
-	TranscribeSamples(samples []float32, sampleRate int, opts JobOptions) (string, error)
+	TranscribeSamples(ctx context.Context, samples []float32, sampleRate int, opts JobOptions) (string, error)
 
 	// TranscribeFile transcribes an audio file on disk (must be WAV/PCM). It is a
 	// thin convenience wrapper over TranscribeSamples.
-	TranscribeFile(filePath string, opts JobOptions) (string, error)
+	TranscribeFile(ctx context.Context, filePath string, opts JobOptions) (string, error)
 
 	// CreateStream initializes a live, chunk-based audio transcription stream.
 	CreateStream() (TranscriptionStream, error)
@@ -42,7 +44,7 @@ type TranscriptionStream interface {
 	AcceptAudio(samples []float32)
 
 	// Result returns the current transcribed text from the accumulated audio.
-	Result(opts JobOptions) string
+	Result(ctx context.Context, opts JobOptions) (string, error)
 
 	// Reset clears the accumulated audio buffer.
 	Reset()
@@ -54,102 +56,49 @@ type TranscriptionStream interface {
 // Synthesizer defines the interface for Text-to-Speech (TTS).
 type Synthesizer interface {
 	// SynthesizeToFile converts text to speech and saves it as a WAV file on disk.
-	SynthesizeToFile(text string, outputPath string, opts JobOptions) error
+	SynthesizeToFile(ctx context.Context, text string, outputPath string, opts JobOptions) error
 
 	// SynthesizeToStream converts text to speech and returns a stream reader.
-	SynthesizeToStream(text string, opts JobOptions) (AudioStream, error)
+	SynthesizeToStream(ctx context.Context, text string, opts JobOptions) (AudioStream, error)
 
 	// Close releases resources associated with the Synthesizer.
 	Close()
 }
 
-// AudioStream defines the interface for reading synthesized audio in chunks.
-type AudioStream interface {
-	// SampleRate returns the sample rate of the generated audio (e.g. 22050Hz).
-	SampleRate() int
+// AudioStream is the shared cancellation-aware PCM source used by audio nodes.
+type AudioStream = audionode.PCM16Source
 
-	// ReadPCM16 reads the next chunk of PCM16 samples. Returns io.EOF when done.
-	ReadPCM16(chunkSize int) ([]int16, error)
-}
+const maxQueuedJobs = 32
+const MaxTextBytes = 4000
+const MaxAudioSeconds = 120
 
 // --- Whisper/Moonshine ASR Implementation with Priority Queue ---
 
 type asrJob struct {
+	ctx        context.Context
 	samples    []float32
-	priority   int
-	resultChan chan string
+	resultChan chan asrResult
 }
 
-type asrPriorityQueue struct {
-	jobs   []*asrJob
-	cond   *sync.Cond
-	mutex  sync.Mutex
-	closed bool
-}
-
-func newASRPriorityQueue() *asrPriorityQueue {
-	pq := &asrPriorityQueue{
-		jobs: make([]*asrJob, 0),
-	}
-	pq.cond = sync.NewCond(&pq.mutex)
-	return pq
-}
-
-func (pq *asrPriorityQueue) Push(job *asrJob) {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	if pq.closed {
-		return
-	}
-
-	pq.jobs = append(pq.jobs, job)
-	pq.cond.Signal()
-}
-
-func (pq *asrPriorityQueue) Pop() *asrJob {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	for len(pq.jobs) == 0 && !pq.closed {
-		pq.cond.Wait()
-	}
-
-	if pq.closed || len(pq.jobs) == 0 {
-		return nil
-	}
-
-	// Stable priority queue pop: highest priority value runs first
-	bestIdx := 0
-	for i := 1; i < len(pq.jobs); i++ {
-		if pq.jobs[i].priority > pq.jobs[bestIdx].priority {
-			bestIdx = i
-		}
-	}
-
-	job := pq.jobs[bestIdx]
-	pq.jobs = append(pq.jobs[:bestIdx], pq.jobs[bestIdx+1:]...)
-
-	return job
-}
-
-func (pq *asrPriorityQueue) Close() {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	pq.closed = true
-	pq.cond.Broadcast()
+type asrResult struct {
+	text string
+	err  error
 }
 
 type whisperTranscriber struct {
 	recognizer *sherpa.OfflineRecognizer
-	config     *sherpa.OfflineRecognizerConfig
-	pq         *asrPriorityQueue
-	mutex      sync.Mutex
+	pq         *workqueue.Queue[*asrJob]
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 // NewTranscriber initializes a new Transcriber using configuration.
 func NewTranscriber(cfg config.ASRConfig, numThreads int) (Transcriber, error) {
+	if cfg.Engine != "whisper" && cfg.Engine != "moonshine" {
+		return nil, fmt.Errorf("unsupported ASR engine %q", cfg.Engine)
+	}
 	config := sherpa.OfflineRecognizerConfig{}
 	config.FeatConfig.SampleRate = 16000
 	config.FeatConfig.FeatureDim = 80
@@ -160,19 +109,13 @@ func NewTranscriber(cfg config.ASRConfig, numThreads int) (Transcriber, error) {
 	config.ModelConfig.Provider = "cpu"
 	config.DecodingMethod = "greedy_search"
 
-	// Dynamically configure Whisper or Moonshine based on model path
-	if strings.Contains(strings.ToLower(cfg.Encoder), "moonshine") {
+	if cfg.Engine == "moonshine" {
 		config.ModelConfig.Moonshine.Encoder = cfg.Encoder
-		if strings.Contains(strings.ToLower(cfg.Decoder), "merged") {
-			config.ModelConfig.Moonshine.MergedDecoder = cfg.Decoder
-		} else {
-			config.ModelConfig.Moonshine.UncachedDecoder = cfg.Decoder
-			config.ModelConfig.Moonshine.CachedDecoder = cfg.Decoder
-		}
+		config.ModelConfig.Moonshine.MergedDecoder = cfg.Decoder
 	} else {
 		config.ModelConfig.Whisper.Encoder = cfg.Encoder
 		config.ModelConfig.Whisper.Decoder = cfg.Decoder
-		config.ModelConfig.Whisper.Language = "es" // default to Spanish
+		config.ModelConfig.Whisper.Language = cfg.Language
 		config.ModelConfig.Whisper.Task = "transcribe"
 	}
 
@@ -181,10 +124,11 @@ func NewTranscriber(cfg config.ASRConfig, numThreads int) (Transcriber, error) {
 		return nil, errors.New("failed to initialize offline recognizer")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	syn := &whisperTranscriber{
+		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		recognizer: recognizer,
-		config:     &config,
-		pq:         newASRPriorityQueue(),
+		pq:         workqueue.New[*asrJob](maxQueuedJobs),
 	}
 
 	// Start background worker loop to serialize CPU-heavy ASR operations
@@ -194,35 +138,35 @@ func NewTranscriber(cfg config.ASRConfig, numThreads int) (Transcriber, error) {
 }
 
 func (t *whisperTranscriber) workerLoop() {
+	defer close(t.done)
 	for {
-		t.mutex.Lock()
-		queue := t.pq
-		t.mutex.Unlock()
-
-		if queue == nil {
-			break
+		job, ok := t.pq.Pop()
+		if !ok {
+			return
 		}
-
-		job := queue.Pop()
-		if job == nil {
-			break
+		if err := job.ctx.Err(); err != nil {
+			job.resultChan <- asrResult{err: err}
+			continue
 		}
-
-		text := t.decodeSync(job.samples)
-		job.resultChan <- text
+		if t.ctx.Err() != nil {
+			return
+		}
+		text, err := t.decodeSync(job.samples)
+		job.resultChan <- asrResult{text: text, err: err}
 	}
 }
 
-func (t *whisperTranscriber) decodeSync(samples []float32) string {
-	t.mutex.Lock()
+func (t *whisperTranscriber) decodeSync(samples []float32) (string, error) {
 	recognizer := t.recognizer
-	t.mutex.Unlock()
 
 	if recognizer == nil {
-		return ""
+		return "", errors.New("ASR recognizer unavailable")
 	}
 
 	stream := sherpa.NewOfflineStream(recognizer)
+	if stream == nil {
+		return "", errors.New("failed to create ASR stream")
+	}
 	defer sherpa.DeleteOfflineStream(stream)
 
 	// Whisper expects 16000Hz.
@@ -230,41 +174,47 @@ func (t *whisperTranscriber) decodeSync(samples []float32) string {
 	recognizer.Decode(stream)
 	res := stream.GetResult()
 	if res == nil {
-		return ""
+		return "", errors.New("ASR recognizer unavailable")
 	}
-	return res.Text
+	return res.Text, nil
 }
 
-func (t *whisperTranscriber) TranscribeSamples(samples []float32, sampleRate int, opts JobOptions) (string, error) {
+func (t *whisperTranscriber) TranscribeSamples(ctx context.Context, samples []float32, sampleRate int, opts JobOptions) (string, error) {
+	if sampleRate <= 0 || sampleRate > 192000 {
+		return "", errors.New("invalid sample rate")
+	}
+	if len(samples) > sampleRate*MaxAudioSeconds {
+		return "", errors.New("audio exceeds maximum duration")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if sampleRate != 16000 {
 		samples = audio.ResampleFloat32(samples, sampleRate, 16000)
 	}
-
-	t.mutex.Lock()
-	queue := t.pq
-	t.mutex.Unlock()
-
-	if queue == nil {
-		return "", errors.New("ASR transcriber is closed")
+	result := make(chan asrResult, 1)
+	if err := t.pq.Push(ctx, &asrJob{ctx: ctx, samples: append([]float32(nil), samples...), resultChan: result}, opts.Priority); err != nil {
+		return "", err
 	}
-
-	resultChan := make(chan string, 1)
-	queue.Push(&asrJob{
-		samples:    samples,
-		priority:   opts.Priority,
-		resultChan: resultChan,
-	})
-
-	text := <-resultChan
-	return text, nil
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-t.ctx.Done():
+		return "", workqueue.ErrClosed
+	case res := <-result:
+		return res.text, res.err
+	}
 }
 
-func (t *whisperTranscriber) TranscribeFile(filePath string, opts JobOptions) (string, error) {
+func (t *whisperTranscriber) TranscribeFile(ctx context.Context, filePath string, opts JobOptions) (string, error) {
+	if err := validateAudioFile(ctx, filePath); err != nil {
+		return "", err
+	}
 	wave := sherpa.ReadWave(filePath)
 	if wave == nil {
 		return "", errors.New("failed to read WAV file")
 	}
-	return t.TranscribeSamples(wave.Samples, wave.SampleRate, opts)
+	return t.TranscribeSamples(ctx, wave.Samples, wave.SampleRate, opts)
 }
 
 func (t *whisperTranscriber) CreateStream() (TranscriptionStream, error) {
@@ -275,18 +225,15 @@ func (t *whisperTranscriber) CreateStream() (TranscriptionStream, error) {
 }
 
 func (t *whisperTranscriber) Close() {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-
-	if t.pq != nil {
+	t.closeOnce.Do(func() {
+		t.cancel()
 		t.pq.Close()
-		t.pq = nil
-	}
-
-	if t.recognizer != nil {
-		sherpa.DeleteOfflineRecognizer(t.recognizer)
+		<-t.done
+		if t.recognizer != nil {
+			sherpa.DeleteOfflineRecognizer(t.recognizer)
+		}
 		t.recognizer = nil
-	}
+	})
 }
 
 // --- Live Transcription Stream Implementation ---
@@ -300,38 +247,25 @@ type whisperStream struct {
 func (s *whisperStream) AcceptAudio(samples []float32) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	remaining := 16000*MaxAudioSeconds - len(s.samples)
+	if len(samples) > remaining {
+		samples = samples[:remaining]
+	}
 	s.samples = append(s.samples, samples...)
 }
 
-func (s *whisperStream) Result(opts JobOptions) string {
+func (s *whisperStream) Result(ctx context.Context, opts JobOptions) (string, error) {
 	s.mutex.Lock()
 	if len(s.samples) == 0 {
 		s.mutex.Unlock()
-		return ""
+		return "", nil
 	}
 	// Copy samples buffer to avoid modification during queued execution
 	samplesCopy := make([]float32, len(s.samples))
 	copy(samplesCopy, s.samples)
 	s.mutex.Unlock()
 
-	t := s.transcriber
-	t.mutex.Lock()
-	queue := t.pq
-	t.mutex.Unlock()
-
-	if queue == nil {
-		return ""
-	}
-
-	resultChan := make(chan string, 1)
-	queue.Push(&asrJob{
-		samples:    samplesCopy,
-		priority:   opts.Priority,
-		resultChan: resultChan,
-	})
-
-	text := <-resultChan
-	return text
+	return s.transcriber.TranscribeSamples(ctx, samplesCopy, 16000, opts)
 }
 
 func (s *whisperStream) Reset() {
@@ -349,10 +283,10 @@ func (s *whisperStream) Close() {
 // --- VITS/Supertonic TTS Implementation with Priority Queue ---
 
 type ttsJob struct {
+	ctx        context.Context
 	text       string
 	outputPath string
 	isStream   bool
-	priority   int
 	resultChan chan ttsResult
 }
 
@@ -361,83 +295,29 @@ type ttsResult struct {
 	err         error
 }
 
-type priorityQueue struct {
-	jobs   []*ttsJob
-	cond   *sync.Cond
-	mutex  sync.Mutex
-	closed bool
-}
-
-func newPriorityQueue() *priorityQueue {
-	pq := &priorityQueue{
-		jobs: make([]*ttsJob, 0),
-	}
-	pq.cond = sync.NewCond(&pq.mutex)
-	return pq
-}
-
-func (pq *priorityQueue) Push(job *ttsJob) {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	if pq.closed {
-		return
-	}
-
-	pq.jobs = append(pq.jobs, job)
-	pq.cond.Signal()
-}
-
-func (pq *priorityQueue) Pop() *ttsJob {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	for len(pq.jobs) == 0 && !pq.closed {
-		pq.cond.Wait()
-	}
-
-	if pq.closed || len(pq.jobs) == 0 {
-		return nil
-	}
-
-	// Stable priority queue pop: find the item with the highest priority score.
-	// If scores are equal, FIFO is preserved.
-	bestIdx := 0
-	for i := 1; i < len(pq.jobs); i++ {
-		if pq.jobs[i].priority > pq.jobs[bestIdx].priority {
-			bestIdx = i
-		}
-	}
-
-	job := pq.jobs[bestIdx]
-	pq.jobs = append(pq.jobs[:bestIdx], pq.jobs[bestIdx+1:]...)
-
-	return job
-}
-
-func (pq *priorityQueue) Close() {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	pq.closed = true
-	pq.cond.Broadcast()
-}
-
 type vitsSynthesizer struct {
 	tts        *sherpa.OfflineTts
-	config     *sherpa.OfflineTtsConfig
 	configCopy config.TTSConfig
-	pq         *priorityQueue
-	mutex      sync.Mutex
+	pq         *workqueue.Queue[*ttsJob]
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
-func getCacheFilename(text string) string {
-	hash := sha256.Sum256([]byte(text))
+func (s *vitsSynthesizer) cacheFilename(text string) string {
+	voiceConfig := s.configCopy
+	voiceConfig.CacheConfig = config.CacheConfig{}
+	voice, _ := json.Marshal(voiceConfig)
+	hash := sha256.Sum256(append(voice, []byte(text)...))
 	return hex.EncodeToString(hash[:]) + ".wav"
 }
 
 // NewSynthesizer initializes a new Synthesizer using configuration.
 func NewSynthesizer(cfg config.TTSConfig, numThreads int) (Synthesizer, error) {
+	if cfg.Engine != "vits" && cfg.Engine != "supertonic" {
+		return nil, fmt.Errorf("unsupported TTS engine %q", cfg.Engine)
+	}
 	config := sherpa.OfflineTtsConfig{}
 
 	// Raspberry Pi 5 optimization settings:
@@ -456,9 +336,9 @@ func NewSynthesizer(cfg config.TTSConfig, numThreads int) (Synthesizer, error) {
 		config.Model.Supertonic.VoiceStyle = cfg.ModelDir + "/voice.bin"
 	} else {
 		// Default VITS/Piper configuration
-		config.Model.Vits.Model = "./models/vits-es/es_ES-sharvard-medium.onnx"
-		config.Model.Vits.Tokens = "./models/vits-es/tokens.txt"
-		config.Model.Vits.DataDir = "./models/vits-es/espeak-ng-data"
+		config.Model.Vits.Model = cfg.Model
+		config.Model.Vits.Tokens = cfg.Tokens
+		config.Model.Vits.DataDir = cfg.DataDir
 		config.Model.Vits.NoiseScale = 0.667
 		config.Model.Vits.NoiseScaleW = 0.8
 		config.Model.Vits.LengthScale = 1.0
@@ -469,11 +349,12 @@ func NewSynthesizer(cfg config.TTSConfig, numThreads int) (Synthesizer, error) {
 		return nil, errors.New("failed to initialize offline TTS engine")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	syn := &vitsSynthesizer{
+		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		tts:        tts,
-		config:     &config,
 		configCopy: cfg,
-		pq:         newPriorityQueue(),
+		pq:         workqueue.New[*ttsJob](maxQueuedJobs),
 	}
 
 	// Pre-generate cached phrases if cache is enabled
@@ -483,10 +364,10 @@ func NewSynthesizer(cfg config.TTSConfig, numThreads int) (Synthesizer, error) {
 		} else {
 			log.Printf("[TTS Cache] Pre-generating %d cached phrases...\n", len(cfg.CacheConfig.PreGenerate))
 			for _, phrase := range cfg.CacheConfig.PreGenerate {
-				cacheFile := filepath.Join(cfg.CacheConfig.Dir, getCacheFilename(phrase))
+				cacheFile := filepath.Join(cfg.CacheConfig.Dir, syn.cacheFilename(phrase))
 				if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
 					log.Printf("[TTS Cache] Pre-synthesizing: \"%s\" -> %s\n", phrase, cacheFile)
-					err := syn.synthesizeToFileSync(phrase, cacheFile)
+					err := syn.synthesizeToFileSync(ctx, phrase, cacheFile)
 					if err != nil {
 						log.Printf("[TTS Cache] Warning: failed to pre-synthesize phrase \"%s\": %v\n", phrase, err)
 					}
@@ -503,34 +384,36 @@ func NewSynthesizer(cfg config.TTSConfig, numThreads int) (Synthesizer, error) {
 }
 
 func (s *vitsSynthesizer) workerLoop() {
+	defer close(s.done)
 	for {
-		s.mutex.Lock()
-		queue := s.pq
-		s.mutex.Unlock()
-
-		if queue == nil {
-			break
+		job, ok := s.pq.Pop()
+		if !ok {
+			return
 		}
-
-		job := queue.Pop()
-		if job == nil {
-			break
+		if err := job.ctx.Err(); err != nil {
+			job.resultChan <- ttsResult{err: err}
+			continue
 		}
-
+		if s.ctx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithCancel(job.ctx)
+		stop := context.AfterFunc(s.ctx, cancel)
 		if job.isStream {
-			stream, gen, err := s.prepareStream(job.text)
-			if err != nil {
-				job.resultChan <- ttsResult{err: err}
-				continue
+			stream, gen, err := s.prepareStream(ctx, job.text)
+			job.resultChan <- ttsResult{audioStream: stream, err: err}
+			if err == nil {
+				gen()
 			}
-			// Hand the stream back immediately so the caller can start playing
-			// the first chunk while synthesis continues to fill the buffer.
-			job.resultChan <- ttsResult{audioStream: stream}
-			gen()
 		} else {
-			err := s.synthesizeToFileSync(job.text, job.outputPath)
+			err := ctx.Err()
+			if err == nil {
+				err = s.synthesizeToFileSync(ctx, job.text, job.outputPath)
+			}
 			job.resultChan <- ttsResult{err: err}
 		}
+		stop()
+		cancel()
 	}
 }
 
@@ -557,22 +440,37 @@ func (s *vitsSynthesizer) genConfig() sherpa.GenerationConfig {
 	return gc
 }
 
-func (s *vitsSynthesizer) synthesizeToFileSync(text string, outputPath string) error {
+func (s *vitsSynthesizer) synthesizeToFileSync(ctx context.Context, text string, outputPath string) error {
 	genConfig := s.genConfig()
 
-	s.mutex.Lock()
 	ttsEngine := s.tts
-	s.mutex.Unlock()
 
 	if ttsEngine == nil {
 		return errors.New("TTS engine is closed")
 	}
 
-	audio := ttsEngine.GenerateWithConfig(text, &genConfig, nil)
-	if audio.Samples == nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	total := 0
+	limit := ttsEngine.SampleRate() * MaxAudioSeconds
+	audio := ttsEngine.GenerateWithConfig(text, &genConfig, func(samples []float32, _ float32) bool {
+		total += len(samples)
+		return ctx.Err() == nil && total <= limit
+	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if total > limit {
+		return errors.New("generated audio exceeds maximum duration")
+	}
+	if audio == nil || audio.Samples == nil {
 		return errors.New("failed to generate speech audio")
 	}
 
+	if len(audio.Samples) > audio.SampleRate*MaxAudioSeconds {
+		return errors.New("generated audio exceeds maximum duration")
+	}
 	if ok := audio.Save(outputPath); !ok {
 		return errors.New("failed to save WAV file")
 	}
@@ -583,10 +481,8 @@ func (s *vitsSynthesizer) synthesizeToFileSync(text string, outputPath string) e
 // that must be run (synchronously, on the serialized worker) to fill it. The
 // closure drives sherpa's generation callback so audio chunks are emitted as
 // they are produced rather than after the whole utterance is synthesized.
-func (s *vitsSynthesizer) prepareStream(text string) (*streamingAudioStream, func(), error) {
-	s.mutex.Lock()
+func (s *vitsSynthesizer) prepareStream(ctx context.Context, text string) (*streamingAudioStream, func(), error) {
 	ttsEngine := s.tts
-	s.mutex.Unlock()
 
 	if ttsEngine == nil {
 		return nil, nil, errors.New("TTS engine is closed")
@@ -602,12 +498,13 @@ func (s *vitsSynthesizer) prepareStream(text string) (*streamingAudioStream, fun
 		// decoupled from the slower real-time playback consumer, so the worker
 		// is only busy for the synthesis duration, not the whole playback.
 		result := ttsEngine.GenerateWithConfig(text, &genConfig, func(samples []float32, _ float32) bool {
-			chunk := make([]float32, len(samples))
-			copy(chunk, samples)
-			stream.push(chunk)
-			return true
+			return stream.push(ctx, samples) == nil
 		})
 
+		if err := ctx.Err(); err != nil {
+			stream.finish(err)
+			return
+		}
 		if result == nil || result.Samples == nil {
 			stream.finish(errors.New("failed to generate speech audio"))
 			return
@@ -635,7 +532,10 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func readWavToStream(filePath string) (AudioStream, error) {
+func readWavToStream(ctx context.Context, filePath string) (AudioStream, error) {
+	if err := validateAudioFile(ctx, filePath); err != nil {
+		return nil, err
+	}
 	wave := sherpa.ReadWave(filePath)
 	if wave == nil {
 		return nil, fmt.Errorf("failed to read cached WAV file: %s", filePath)
@@ -647,80 +547,119 @@ func readWavToStream(filePath string) (AudioStream, error) {
 	}, nil
 }
 
-func (s *vitsSynthesizer) SynthesizeToFile(text string, outputPath string, opts JobOptions) error {
-	s.mutex.Lock()
+func (s *vitsSynthesizer) SynthesizeToFile(ctx context.Context, text string, outputPath string, opts JobOptions) error {
+	if err := validateText(ctx, text); err != nil {
+		return err
+	}
+	if s.ctx.Err() != nil {
+		return workqueue.ErrClosed
+	}
 	enabled := s.configCopy.CacheConfig.Enabled
 	cacheDir := s.configCopy.CacheConfig.Dir
 	queue := s.pq
-	s.mutex.Unlock()
 
 	if enabled && cacheDir != "" {
-		cacheFile := filepath.Join(cacheDir, getCacheFilename(text))
+		cacheFile := filepath.Join(cacheDir, s.cacheFilename(text))
 		if _, err := os.Stat(cacheFile); err == nil {
 			log.Printf("[TTS Cache] Hit! Copying pre-generated file for text: \"%s\"\n", text)
 			return copyFile(cacheFile, outputPath)
 		}
 	}
 
-	if queue == nil {
-		return errors.New("TTS synthesizer is closed")
-	}
-
 	resultChan := make(chan ttsResult, 1)
-	queue.Push(&ttsJob{
+	if err := queue.Push(ctx, &ttsJob{
+		ctx:        ctx,
 		text:       text,
 		outputPath: outputPath,
 		isStream:   false,
-		priority:   opts.Priority,
 		resultChan: resultChan,
-	})
-	res := <-resultChan
+	}, opts.Priority); err != nil {
+		return err
+	}
+	var res ttsResult
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.ctx.Done():
+		return workqueue.ErrClosed
+	case res = <-resultChan:
+	}
 	return res.err
 }
 
-func (s *vitsSynthesizer) SynthesizeToStream(text string, opts JobOptions) (AudioStream, error) {
-	s.mutex.Lock()
+func (s *vitsSynthesizer) SynthesizeToStream(ctx context.Context, text string, opts JobOptions) (AudioStream, error) {
+	if err := validateText(ctx, text); err != nil {
+		return nil, err
+	}
+	if s.ctx.Err() != nil {
+		return nil, workqueue.ErrClosed
+	}
 	enabled := s.configCopy.CacheConfig.Enabled
 	cacheDir := s.configCopy.CacheConfig.Dir
 	queue := s.pq
-	s.mutex.Unlock()
 
 	if enabled && cacheDir != "" {
-		cacheFile := filepath.Join(cacheDir, getCacheFilename(text))
+		cacheFile := filepath.Join(cacheDir, s.cacheFilename(text))
 		if _, err := os.Stat(cacheFile); err == nil {
 			log.Printf("[TTS Cache] Hit! Streaming pre-generated file for text: \"%s\"\n", text)
-			return readWavToStream(cacheFile)
+			return readWavToStream(ctx, cacheFile)
 		}
 	}
 
-	if queue == nil {
-		return nil, errors.New("TTS synthesizer is closed")
-	}
-
 	resultChan := make(chan ttsResult, 1)
-	queue.Push(&ttsJob{
+	if err := queue.Push(ctx, &ttsJob{
+		ctx:        ctx,
 		text:       text,
 		isStream:   true,
-		priority:   opts.Priority,
 		resultChan: resultChan,
-	})
-	res := <-resultChan
+	}, opts.Priority); err != nil {
+		return nil, err
+	}
+	var res ttsResult
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.ctx.Done():
+		return nil, workqueue.ErrClosed
+	case res = <-resultChan:
+	}
 	return res.audioStream, res.err
 }
 
 func (s *vitsSynthesizer) Close() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if s.pq != nil {
+	s.closeOnce.Do(func() {
+		s.cancel()
 		s.pq.Close()
-		s.pq = nil
-	}
-
-	if s.tts != nil {
-		sherpa.DeleteOfflineTts(s.tts)
+		<-s.done
+		if s.tts != nil {
+			sherpa.DeleteOfflineTts(s.tts)
+		}
 		s.tts = nil
+	})
+}
+
+func validateAudioFile(ctx context.Context, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 24<<20 {
+		return errors.New("audio file must be regular and at most 24 MiB")
+	}
+	return nil
+}
+
+func validateText(ctx context.Context, text string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(text) > MaxTextBytes {
+		return errors.New("text exceeds maximum length")
+	}
+	return nil
 }
 
 // --- Audio Stream Reader Implementation ---
@@ -735,7 +674,13 @@ func (as *vitsAudioStream) SampleRate() int {
 	return as.sampleRate
 }
 
-func (as *vitsAudioStream) ReadPCM16(chunkSize int) ([]int16, error) {
+func (as *vitsAudioStream) ReadPCM16(ctx context.Context, chunkSize int) ([]int16, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if chunkSize <= 0 {
+		return nil, errors.New("chunk size must be positive")
+	}
 	if as.offset >= len(as.samples) {
 		return nil, io.EOF
 	}
@@ -757,16 +702,17 @@ func (as *vitsAudioStream) ReadPCM16(chunkSize int) ([]int16, error) {
 // producer (sherpa's generation callback) while a consumer (playback) drains
 // them via ReadPCM16. An internal buffer decouples the two: synthesis fills the
 // buffer at CPU speed and finishes quickly, while playback reads at real-time
-// pace. ReadPCM16 blocks only when the buffer is empty and generation is still
-// in progress.
+// pace. The producer buffers at most two seconds and waits for the consumer.
+// Reads and writes unblock when their context is cancelled.
 type streamingAudioStream struct {
 	sampleRate int
 
-	mu   sync.Mutex
-	cond *sync.Cond
-	buf  []int16
-	done bool
-	err  error
+	mu    sync.Mutex
+	cond  *sync.Cond
+	buf   []int16
+	done  bool
+	err   error
+	total int
 }
 
 func newStreamingAudioStream(sampleRate int) *streamingAudioStream {
@@ -775,51 +721,74 @@ func newStreamingAudioStream(sampleRate int) *streamingAudioStream {
 	return s
 }
 
-// push appends newly generated float32 samples to the buffer.
-func (as *streamingAudioStream) push(samples []float32) {
-	pcm := audio.FloatToPCM16(samples)
+// push converts borrowed native callback samples directly to owned PCM, limiting
+// buffered audio to two seconds. Backpressure ends promptly on cancellation.
+func (as *streamingAudioStream) push(ctx context.Context, samples []float32) error {
 	as.mu.Lock()
-	as.buf = append(as.buf, pcm...)
-	as.cond.Broadcast()
-	as.mu.Unlock()
+	defer as.mu.Unlock()
+	stop := context.AfterFunc(ctx, func() { as.mu.Lock(); as.cond.Broadcast(); as.mu.Unlock() })
+	defer stop()
+	if as.total+len(samples) > as.sampleRate*MaxAudioSeconds {
+		as.done = true
+		as.err = errors.New("generated audio exceeds maximum duration")
+		as.cond.Broadcast()
+		return as.err
+	}
+	as.total += len(samples)
+	capacity := as.sampleRate * 2
+	for len(samples) > 0 {
+		for len(as.buf) >= capacity && ctx.Err() == nil && !as.done {
+			as.cond.Wait()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if as.done {
+			return io.ErrClosedPipe
+		}
+		n := min(len(samples), capacity-len(as.buf))
+		as.buf = append(as.buf, audio.FloatToPCM16(samples[:n])...)
+		samples = samples[n:]
+		as.cond.Broadcast()
+	}
+	return nil
 }
 
-// finish marks generation complete, optionally with a terminal error.
 func (as *streamingAudioStream) finish(err error) {
 	as.mu.Lock()
-	as.done = true
-	as.err = err
+	if !as.done {
+		as.done = true
+		as.err = err
+	}
 	as.cond.Broadcast()
 	as.mu.Unlock()
 }
 
-func (as *streamingAudioStream) SampleRate() int {
-	return as.sampleRate
-}
+func (as *streamingAudioStream) SampleRate() int { return as.sampleRate }
 
-func (as *streamingAudioStream) ReadPCM16(chunkSize int) ([]int16, error) {
+func (as *streamingAudioStream) ReadPCM16(ctx context.Context, chunkSize int) ([]int16, error) {
+	if chunkSize <= 0 {
+		return nil, errors.New("chunk size must be positive")
+	}
 	as.mu.Lock()
-	for len(as.buf) == 0 && !as.done {
+	defer as.mu.Unlock()
+	stop := context.AfterFunc(ctx, func() { as.mu.Lock(); as.cond.Broadcast(); as.mu.Unlock() })
+	defer stop()
+	for len(as.buf) == 0 && !as.done && ctx.Err() == nil {
 		as.cond.Wait()
 	}
-
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(as.buf) == 0 {
-		err := as.err
-		as.mu.Unlock()
-		if err != nil {
-			return nil, err
+		if as.err != nil {
+			return nil, as.err
 		}
 		return nil, io.EOF
 	}
-
-	n := chunkSize
-	if n > len(as.buf) {
-		n = len(as.buf)
-	}
-	out := make([]int16, n)
-	copy(out, as.buf[:n])
+	n := min(chunkSize, len(as.buf))
+	out := append([]int16(nil), as.buf[:n]...)
 	as.buf = as.buf[n:]
-	as.mu.Unlock()
-
+	as.cond.Broadcast()
 	return out, nil
 }

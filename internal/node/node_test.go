@@ -8,6 +8,7 @@ import (
 
 func TestSetStateDeliversTransitionsInOrder(t *testing.T) {
 	n := NewPhysicalNode("test", "rtc_stream")
+	defer n.Close()
 
 	var mu sync.Mutex
 	var got []NodeState
@@ -45,6 +46,7 @@ func TestSetStateDeliversTransitionsInOrder(t *testing.T) {
 
 func TestSetStateIgnoresNoOpTransition(t *testing.T) {
 	n := NewPhysicalNode("test", "rtc_stream")
+	defer n.Close()
 
 	var mu sync.Mutex
 	count := 0

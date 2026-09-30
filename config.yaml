@@ -1,9 +1,9 @@
 global_num_threads: 4
 # Transport hardening for the HTTP / WebSocket control plane.
-# Both fields are optional and default to backward-compatible behavior.
+# A token protects control requests and transcript/recording event streams.
 security:
   # Shared bearer token required on control endpoints (/api/execute, /api/ask,
-  # /ask, /api/reload-speakers) and to open the Node-RED WebSocket. Empty = auth
+  # /ask, /api/reload-speakers) and both event WebSockets. Empty = auth
   # disabled (any LAN client can drive the device). Sent via
   # "Authorization: Bearer <token>", "X-Auth-Token", or "?token=".
   auth_token: ""
@@ -17,6 +17,8 @@ models:
     threshold: 0.5
     min_silence_duration_ms: 700
   asr:
+    engine: "moonshine"
+    language: "es"
     encoder: "./models/sherpa-onnx-moonshine-base-es-quantized-2026-02-27/encoder_model.ort"
     decoder: "./models/sherpa-onnx-moonshine-base-es-quantized-2026-02-27/decoder_model_merged.ort"
     tokens: "./models/sherpa-onnx-moonshine-base-es-quantized-2026-02-27/tokens.txt"
@@ -26,7 +28,7 @@ models:
     min_audio_duration_seconds: 2
     confidence_threshold: 0.55
     challenge_failed_prompt: "Acceso denegado."
-    challenge_init_promt: "Por favor, repita"
+    challenge_init_prompt: "Por favor, repita"
     challenge_prompts:
       - "Mi voz es mi pasaporte."
       - "Confirmo mi identidad mediante el timbre acústico de mi voz."
@@ -76,8 +78,6 @@ nodes:
       input_device_index: "Anker PowerConf S330"
       output_device_index: "Anker PowerConf S330"
       sample_rate: 16000
-      channels: 1
-      chunk_size: 1024
       gain: 1.5
     kws:
       enabled: true
@@ -88,6 +88,7 @@ nodes:
       keywords_file: "./models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01/keywords.txt"
       threshold: 0.25
       auto_ask: true
+      auto_ask_capture_delay_seconds: 1.5
       priority: 10
       wake_responses: []
       num_threads: 1
@@ -95,10 +96,8 @@ nodes:
   - node_id: "front_door"
     type: "rtc_stream"
     rtc_stream:
-      rtsp_url: "rtsp://192.168.50.5:8554/doorbell_raw_homekit?audio=all"
       api_url: "http://192.168.50.5:1984"
       stream_name: "doorbell"
-      codec: "eld"
       output_gain_db: 6.0
       # Route outbound TTS to the Aqara G4 HomeKit backchannel via go2rtc:
       # gocalis pushes Opus over a WebRTC WHIP producer into talkback_in_stream,
@@ -120,6 +119,7 @@ nodes:
       keywords_file: "./models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01/keywords.txt"
       threshold: 0.25
       auto_ask: true
+      auto_ask_capture_delay_seconds: 1.5
       priority: 10
       wake_responses: 
         - "¿Qué desea?"

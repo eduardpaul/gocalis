@@ -56,7 +56,7 @@ type speakerIdentifier struct {
 	// AcceptAudio) take RLock; mutators that free/swap them (ReloadSpeakers,
 	// Close) take Lock. This prevents a hot-reload from freeing the manager
 	// while a live stream is mid-Search across the cgo boundary.
-	mutex sync.RWMutex
+	mutex sync.Mutex
 }
 
 // NewSpeakerIdentifier creates and initializes a SpeakerIdentifier. It automatically
@@ -141,8 +141,8 @@ func (s *speakerIdentifier) extractEmbedding(sampleRate int, samples []float32) 
 }
 
 func (s *speakerIdentifier) IdentifySamples(samples []float32, sampleRate int) (string, error) {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
 	if s.extractor == nil || s.manager == nil {
 		return "", errors.New("speaker identifier is closed")
@@ -166,18 +166,18 @@ func (s *speakerIdentifier) IdentifyFile(filePath string) (string, error) {
 }
 
 func (s *speakerIdentifier) CreateStream(onSpeakerIdentified func(speakerName string)) (SpeakerStream, error) {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
 	if s.extractor == nil {
 		return nil, errors.New("speaker identifier is closed")
 	}
 
 	return &speakerStream{
-		sID:                s,
-		stream:             s.extractor.CreateStream(),
+		sID:                 s,
+		stream:              s.extractor.CreateStream(),
 		onSpeakerIdentified: onSpeakerIdentified,
-		samplesCount:       0,
+		samplesCount:        0,
 	}, nil
 }
 
@@ -185,6 +185,9 @@ func (s *speakerIdentifier) ReloadSpeakers() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	if s.extractor == nil {
+		return errors.New("speaker identifier is closed")
+	}
 	log.Println("[SpeakerID] Reloading speaker embeddings from directory...")
 	dim := s.extractor.Dim()
 	newManager := sherpa.NewSpeakerEmbeddingManager(dim)
@@ -252,11 +255,11 @@ func (s *speakerIdentifier) Close() {
 // --- Live Speaker Stream ---
 
 type speakerStream struct {
-	sID                *speakerIdentifier
-	stream             *sherpa.OnlineStream
+	sID                 *speakerIdentifier
+	stream              *sherpa.OnlineStream
 	onSpeakerIdentified func(speakerName string)
-	samplesCount       int
-	mutex              sync.Mutex
+	samplesCount        int
+	mutex               sync.Mutex
 }
 
 func (ss *speakerStream) AcceptAudio(samples []float32) {
@@ -269,8 +272,8 @@ func (ss *speakerStream) AcceptAudio(samples []float32) {
 
 	// Hold the identifier's read lock so a concurrent ReloadSpeakers/Close
 	// cannot free the extractor or manager while we use them.
-	ss.sID.mutex.RLock()
-	defer ss.sID.mutex.RUnlock()
+	ss.sID.mutex.Lock()
+	defer ss.sID.mutex.Unlock()
 
 	if ss.sID.extractor == nil || ss.sID.manager == nil {
 		return
@@ -299,6 +302,11 @@ func (ss *speakerStream) AcceptAudio(samples []float32) {
 func (ss *speakerStream) Reset() {
 	ss.mutex.Lock()
 	defer ss.mutex.Unlock()
+	ss.sID.mutex.Lock()
+	defer ss.sID.mutex.Unlock()
+	if ss.sID.extractor == nil {
+		return
+	}
 
 	if ss.stream != nil {
 		sherpa.DeleteOnlineStream(ss.stream)

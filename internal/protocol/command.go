@@ -7,17 +7,20 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gocalis/internal/ai"
 	"gocalis/internal/ask"
 	"gocalis/internal/audio"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
+	"gocalis/internal/taskgroup"
 )
 
 // Executor runs actions requested by any transport adapter using the central brain
 // and the AI engines, then publishes the results back through EventPublisher.
 type Executor struct {
+	Tasks         *taskgroup.Group
 	Brain         *brain.Brain
 	ASREngine     ai.Transcriber
 	SpeakerEngine ai.SpeakerIdentifier
@@ -31,8 +34,9 @@ type Executor struct {
 }
 
 // NewExecutor creates a command executor backed by the given engines and publisher.
-func NewExecutor(brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig) *Executor {
+func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig) *Executor {
 	return &Executor{
+		Tasks:         taskgroup.New(ctx, 32),
 		Brain:         brain,
 		ASREngine:     asr,
 		SpeakerEngine: speaker,
@@ -75,6 +79,14 @@ func (e *Executor) resolveAudioFile(audioFile string) (string, error) {
 
 // Execute dispatches a request to the appropriate handler based on Action.
 func (e *Executor) Execute(ctx context.Context, req Request) {
+	if err := req.Validate(); err != nil {
+		e.publishError(req.NodeID, err.Error())
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		e.publishError(req.NodeID, err.Error())
+		return
+	}
 	switch req.Action {
 	case "tts":
 		e.executeTTS(ctx, req)
@@ -175,7 +187,7 @@ func (e *Executor) executeASR(ctx context.Context, req Request) {
 	}
 
 	log.Printf("[Executor] ASR for file '%s' (node: %s)\n", audioFile, req.NodeID)
-	text, err := e.ASREngine.TranscribeFile(audioFile, ai.JobOptions{Priority: req.Priority})
+	text, err := e.ASREngine.TranscribeFile(ctx, audioFile, ai.JobOptions{Priority: req.Priority})
 	if err != nil {
 		e.publishError(req.NodeID, "ASR transcription failed: "+err.Error())
 		return
@@ -219,16 +231,7 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 
 	log.Printf("[Executor] Ask on node '%s' (barge_in=%v)\n", req.NodeID, req.BargeIn)
 
-	result := e.AskEngine.Run(ctx, ask.Config{
-		ContextID:                req.ContextID,
-		NodeID:                   req.NodeID,
-		TTSText:                  req.Text,
-		BargeIn:                  req.BargeIn,
-		RequireSpeakerID:         req.RequireSpeakerID,
-		VADTimeoutSeconds:        req.VADTimeoutSeconds,
-		PostSpeechSilenceSeconds: req.PostSpeechSilenceSeconds,
-		Priority:                 req.Priority,
-	})
+	result := e.AskEngine.Run(ctx, req.AskConfig())
 
 	resp := Response{
 		Event:   "ask_completed",
@@ -263,4 +266,54 @@ func (e *Executor) publishError(nodeID string, message string) {
 		Status:  "error",
 		Message: message,
 	})
+}
+
+// Submit admits detached commands into the application's bounded task lifetime.
+func (e *Executor) Submit(req Request) error {
+	if err := req.Validate(); err != nil {
+		return err
+	}
+	return e.Tasks.Go(func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+		defer cancel()
+		e.Execute(ctx, req)
+	})
+}
+
+func (r Request) AskConfig() ask.Config {
+	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: r.CaptureDelaySeconds, Priority: r.Priority}
+}
+
+func (r Request) Validate() error {
+	if len(r.Text) > ai.MaxTextBytes {
+		return fmt.Errorf("text exceeds %d bytes", ai.MaxTextBytes)
+	}
+	if len(r.ContextID) > 256 || len(r.NodeID) > 256 || len(r.AudioFile) > 4096 {
+		return fmt.Errorf("request identifier or path is too long")
+	}
+	if r.OutputFormat != "" && r.OutputFormat != "text" && r.OutputFormat != "audio" && r.OutputFormat != "both" {
+		return fmt.Errorf("output_format must be text, audio or both")
+	}
+	switch r.Action {
+	case "tts":
+		if r.NodeID == "" || strings.TrimSpace(r.Text) == "" {
+			return fmt.Errorf("tts requires node_id and text")
+		}
+	case "play":
+		if r.NodeID == "" || r.AudioWavBase64 == "" {
+			return fmt.Errorf("play requires node_id and audio_wav_base64")
+		}
+		if len(r.AudioWavBase64) > 8<<20 {
+			return fmt.Errorf("audio payload exceeds 8 MiB")
+		}
+	case "asr", "speaker_id":
+		if r.AudioFile == "" {
+			return fmt.Errorf("audio_file is required")
+		}
+	case "ask":
+		return r.AskConfig().Validate()
+	default:
+		return fmt.Errorf("unknown action: %s", r.Action)
+	}
+	return nil
 }

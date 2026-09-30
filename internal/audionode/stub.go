@@ -10,8 +10,9 @@ import (
 // that do not yet have a real transport. It records played audio and lets
 // callers inject captured microphone audio via Emit.
 type Stub struct {
-	mu      sync.Mutex
-	onAudio func(samples []float32)
+	mu         sync.Mutex
+	callbackMu sync.Mutex
+	onAudio    func(samples []float32)
 
 	Played    [][]int16
 	Connected bool
@@ -45,7 +46,7 @@ func (s *Stub) PlayStream(ctx context.Context, src PCM16Source) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		chunk, err := src.ReadPCM16(1024)
+		chunk, err := src.ReadPCM16(ctx, 1024)
 		buf = append(buf, chunk...)
 		if err == io.EOF {
 			break
@@ -69,6 +70,8 @@ func (s *Stub) OnAudio(callback func(samples []float32)) {
 
 // Close marks the stub as closed.
 func (s *Stub) Close() error {
+	s.callbackMu.Lock()
+	defer s.callbackMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Closed = true
@@ -77,8 +80,13 @@ func (s *Stub) Close() error {
 
 // Emit delivers samples to the registered OnAudio callback, simulating mic input.
 func (s *Stub) Emit(samples []float32) {
+	s.callbackMu.Lock()
+	defer s.callbackMu.Unlock()
 	s.mu.Lock()
 	cb := s.onAudio
+	if s.Closed {
+		cb = nil
+	}
 	s.mu.Unlock()
 	if cb != nil {
 		cb(samples)

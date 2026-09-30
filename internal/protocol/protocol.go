@@ -2,6 +2,8 @@
 // abstraction used by all transport adapters (WebSocket, MQTT, etc.).
 package protocol
 
+import "sync"
+
 // Request defines the structure of incoming commands from any transport.
 type Request struct {
 	Action    string `json:"action"` // "tts", "asr", "speaker_id", "ask", "play"
@@ -21,6 +23,7 @@ type Request struct {
 	RequireSpeakerID         bool    `json:"require_speaker_id,omitempty"`
 	OutputFormat             string  `json:"output_format,omitempty"`
 	VADTimeoutSeconds        float64 `json:"vad_timeout_seconds,omitempty"`
+	CaptureDelaySeconds      float64 `json:"capture_delay_seconds,omitempty"`
 	PostSpeechSilenceSeconds float64 `json:"post_speech_silence_seconds,omitempty"`
 }
 
@@ -53,6 +56,7 @@ type EventPublisher interface {
 
 // MultiPublisher fans out events to every registered publisher.
 type MultiPublisher struct {
+	mu         sync.RWMutex
 	publishers []EventPublisher
 }
 
@@ -63,12 +67,17 @@ func NewMultiPublisher() *MultiPublisher {
 
 // Add registers a new event publisher.
 func (m *MultiPublisher) Add(p EventPublisher) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.publishers = append(m.publishers, p)
 }
 
 // Publish sends the event to all registered publishers.
 func (m *MultiPublisher) Publish(event Response) {
-	for _, p := range m.publishers {
+	m.mu.RLock()
+	publishers := append([]EventPublisher(nil), m.publishers...)
+	m.mu.RUnlock()
+	for _, p := range publishers {
 		p.Publish(event)
 	}
 }

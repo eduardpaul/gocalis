@@ -4,9 +4,10 @@ package brain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"sort"
 	"strings"
 	"sync"
 
@@ -20,10 +21,9 @@ import (
 
 // NodeHandle bundles everything the brain needs to control a single physical audio node.
 type NodeHandle struct {
-	Node       *node.PhysicalNode
-	Audio      audionode.AudioNode
-	Config     config.NodeConfig
-	speakMutex sync.Mutex
+	Node   *node.PhysicalNode
+	Audio  audionode.AudioNode
+	Config config.NodeConfig
 	// queue serializes turns (speak utterances and full ask flows) on this node
 	// so a lower-priority speak waits for an in-progress higher-priority ask
 	// instead of cutting into it. Assigned by RegisterNode.
@@ -80,6 +80,9 @@ func (b *Brain) RegisterNode(nodeID string, handle *NodeHandle) {
 func (b *Brain) UnregisterNode(nodeID string) {
 	b.nodesMutex.Lock()
 	defer b.nodesMutex.Unlock()
+	if h := b.nodes[nodeID]; h != nil {
+		h.queue.close()
+	}
 	delete(b.nodes, nodeID)
 }
 
@@ -110,6 +113,7 @@ func (b *Brain) ListNodes() []NodeInfo {
 			State:  string(h.Node.GetState()),
 		})
 	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].NodeID < infos[j].NodeID })
 	return infos
 }
 
@@ -140,8 +144,7 @@ func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority 
 }
 
 // PlaySamples plays a pre-recorded PCM16 clip on a single node, honoring the
-// node's turn queue and priority exactly like Speak. Unlike SpeakSamples it
-// does not reject a busy node: it waits for its turn on the queue.
+// node's turn queue and priority exactly like Speak.
 func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16, sampleRate int, priority int) error {
 	b.nodesMutex.RLock()
 	handle, ok := b.nodes[nodeID]
@@ -151,6 +154,9 @@ func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16,
 		return fmt.Errorf("node '%s' not registered", nodeID)
 	}
 
+	if sampleRate <= 0 || sampleRate > 192000 || len(samples) > sampleRate*ai.MaxAudioSeconds {
+		return fmt.Errorf("invalid audio rate or duration")
+	}
 	// Empty audio is a no-op: never take the node's turn slot for nothing.
 	if len(samples) == 0 {
 		return nil
@@ -179,19 +185,7 @@ func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate 
 		return fmt.Errorf("no nodes registered")
 	}
 
-	var wg sync.WaitGroup
-	for _, h := range handles {
-		wg.Add(1)
-		go func(nodeID string) {
-			defer wg.Done()
-			if err := b.PlaySamples(ctx, nodeID, samples, sampleRate, priority); err != nil {
-				log.Printf("[Brain] Broadcast play to node '%s' failed: %v\n", nodeID, err)
-			}
-		}(h.Node.NodeID)
-	}
-	wg.Wait()
-
-	return nil
+	return b.playAll(ctx, handles, samples, sampleRate, priority)
 }
 
 // playSamplesToHandle plays pre-recorded samples on a single node with the same
@@ -201,9 +195,6 @@ func (b *Brain) playSamplesToHandle(ctx context.Context, handle *NodeHandle, bas
 	if len(baseSamples) == 0 {
 		return nil
 	}
-
-	handle.speakMutex.Lock()
-	defer handle.speakMutex.Unlock()
 
 	handle.Node.SetState(node.StateProcessing)
 
@@ -221,70 +212,72 @@ func (b *Brain) playSamplesToHandle(ctx context.Context, handle *NodeHandle, bas
 	return nil
 }
 
-// AcquireNode reserves a node for an exclusive turn, blocking until the caller
-// owns it (higher priority first) or ctx is cancelled. The returned release
-// func MUST be called when the turn ends. It is used by the ask flow, which
-// holds the node for its whole prompt -> listen -> ASR turn so a queued speak
-// waits until the turn completes.
-func (b *Brain) AcquireNode(ctx context.Context, nodeID string, priority int) (func(), error) {
-	b.nodesMutex.RLock()
-	handle, ok := b.nodes[nodeID]
-	b.nodesMutex.RUnlock()
-
-	if !ok {
+// AcquireNode reserves a node for an exclusive turn, in priority/FIFO order.
+func (b *Brain) AcquireNode(ctx context.Context, nodeID string, priority int) (*Turn, error) {
+	handle := b.GetNodeHandle(nodeID)
+	if handle == nil {
 		return nil, fmt.Errorf("node '%s' not registered", nodeID)
 	}
-	return handle.queue.acquire(ctx, priority)
+	release, err := handle.queue.acquire(ctx, priority)
+	if err != nil {
+		return nil, err
+	}
+	return &Turn{Handle: handle, release: release}, nil
 }
 
 // SpeakAll routes the same TTS utterance to every registered node.
 //
-// Each node is driven independently through its own turn queue at the given
-// priority: a node that is free plays right away, while a node busy with a
-// higher-priority turn (e.g. an ask) queues the utterance and plays it once
-// that turn finishes. Nodes never block one another.
+// The utterance is synthesized once. Each node then waits independently for
+// its turn and applies its own gain without changing the shared recording.
 func (b *Brain) SpeakAll(ctx context.Context, text string, priority int) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
-
 	handles := b.snapshotHandles()
 	if len(handles) == 0 {
 		return fmt.Errorf("no nodes registered")
 	}
+	samples, rate, err := b.Synthesize(ctx, text, priority)
+	if err != nil {
+		return err
+	}
+	return b.playAll(ctx, handles, samples, rate, priority)
+}
 
+func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []int16, rate, priority int) error {
+	errs := make([]error, len(handles))
 	var wg sync.WaitGroup
-	for _, h := range handles {
+	for i, handle := range handles {
 		wg.Add(1)
-		go func(nodeID string) {
+		go func() {
 			defer wg.Done()
-			if err := b.Speak(ctx, nodeID, text, priority); err != nil {
-				log.Printf("[Brain] Broadcast to node '%s' failed: %v\n", nodeID, err)
+			release, err := handle.queue.acquire(ctx, priority)
+			if err == nil {
+				defer release()
+				err = b.playSamplesToHandle(ctx, handle, samples, rate)
 			}
-		}(h.Node.NodeID)
+			if err != nil {
+				errs[i] = fmt.Errorf("node %s: %w", handle.Node.NodeID, err)
+			}
+		}()
 	}
 	wg.Wait()
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // speakToHandle synthesizes audio for a single node and streams it as it is
 // generated, so playback can begin before synthesis completes.
 func (b *Brain) speakToHandle(ctx context.Context, handle *NodeHandle, text string, priority int) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	// Empty text is a no-op: never spin up the TTS pipeline for nothing.
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 
-	// The caller already holds this node's turn slot (via the queue), so this is
-	// the only turn touching the device; speakMutex just guards against a stray
-	// concurrent low-level Play (e.g. a chime) on the same handle.
-	handle.speakMutex.Lock()
-	defer handle.speakMutex.Unlock()
-
 	handle.Node.SetState(node.StateProcessing)
 
-	audioStream, err := b.ttsEngine.SynthesizeToStream(text, ai.JobOptions{Priority: priority})
+	audioStream, err := b.ttsEngine.SynthesizeToStream(ctx, text, ai.JobOptions{Priority: priority})
 	if err != nil {
 		handle.Node.SetState(node.StateIdle)
 		return fmt.Errorf("TTS synthesis failed: %w", err)
@@ -305,85 +298,41 @@ func (b *Brain) speakToHandle(ctx context.Context, handle *NodeHandle, text stri
 }
 
 // Synthesize converts text to PCM16 samples using the brain's TTS engine.
-func (b *Brain) Synthesize(text string, priority int) ([]int16, int, error) {
+func (b *Brain) Synthesize(ctx context.Context, text string, priority int) ([]int16, int, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	// Empty text is a no-op: never spin up the TTS pipeline for nothing.
 	if strings.TrimSpace(text) == "" {
 		return nil, 0, nil
 	}
 
-	audioStream, err := b.ttsEngine.SynthesizeToStream(text, ai.JobOptions{Priority: priority})
+	audioStream, err := b.ttsEngine.SynthesizeToStream(ctx, text, ai.JobOptions{Priority: priority})
 	if err != nil {
 		return nil, 0, fmt.Errorf("TTS synthesis failed: %w", err)
 	}
-	return readAllSamples(audioStream)
+	return readAllSamples(ctx, audioStream)
 }
 
-// SpeakSamples plays pre-synthesized PCM16 samples on a single node.
-func (b *Brain) SpeakSamples(ctx context.Context, nodeID string, samples []int16, sampleRate int) error {
-	b.nodesMutex.RLock()
-	handle, ok := b.nodes[nodeID]
-	b.nodesMutex.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("node '%s' not registered", nodeID)
-	}
-
-	return b.sendSamplesToHandle(ctx, handle, samples, sampleRate)
+// Turn holds exclusive ownership of one node until Release is called.
+// State-neutral playback is available only through a reserved turn.
+type Turn struct {
+	Handle  *NodeHandle
+	release func()
 }
 
-// sendSamplesToHandle plays pre-synthesized audio on a single node.
-func (b *Brain) sendSamplesToHandle(ctx context.Context, handle *NodeHandle, baseSamples []int16, sampleRate int) error {
-	handle.speakMutex.Lock()
-	defer handle.speakMutex.Unlock()
+func (t *Turn) Release() { t.release() }
 
-	if handle.Node.GetState() == node.StateSpeaking {
-		return fmt.Errorf("node '%s' is already speaking", handle.Node.NodeID)
+func (t *Turn) Play(ctx context.Context, samples []int16, sampleRate int) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	handle.Node.SetState(node.StateProcessing)
-
-	samples := baseSamples
-	if handle.Config.RTCStream.OutputGainDb != 0 {
-		samples = audio.ApplyGainPCM16(baseSamples, handle.Config.RTCStream.OutputGainDb)
+	if sampleRate <= 0 {
+		return fmt.Errorf("invalid sample rate")
 	}
-
-	return b.playSamplesLocked(ctx, handle, samples, sampleRate)
-}
-
-// playSamplesLocked sends already-prepared samples to the node's audio output.
-// The caller must hold handle.speakMutex.
-func (b *Brain) playSamplesLocked(ctx context.Context, handle *NodeHandle, samples []int16, sampleRate int) error {
-	handle.Node.SetState(node.StateSpeaking)
-	err := handle.Audio.Play(ctx, samples, sampleRate)
-	handle.Node.SetState(node.StateIdle)
-	if err != nil {
-		return fmt.Errorf("failed to send audio: %w", err)
+	if t.Handle.Config.RTCStream.OutputGainDb != 0 {
+		samples = audio.ApplyGainPCM16(samples, t.Handle.Config.RTCStream.OutputGainDb)
 	}
-	return nil
-}
-
-// PlayAudio plays pre-synthesized samples on a node WITHOUT changing the node's
-// reported state. It is used for cosmetic audio (UI chimes) and for the ask
-// flow's prompt, where the caller drives the node's state machine explicitly so
-// the event stream stays clean (e.g. idle -> speaking -> listening) instead of
-// emitting spurious PROCESSING/SPEAKING/IDLE transitions per clip.
-func (b *Brain) PlayAudio(ctx context.Context, nodeID string, samples []int16, sampleRate int) error {
-	b.nodesMutex.RLock()
-	handle, ok := b.nodes[nodeID]
-	b.nodesMutex.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("node '%s' not registered", nodeID)
-	}
-
-	handle.speakMutex.Lock()
-	defer handle.speakMutex.Unlock()
-
-	if handle.Config.RTCStream.OutputGainDb != 0 {
-		samples = audio.ApplyGainPCM16(samples, handle.Config.RTCStream.OutputGainDb)
-	}
-
-	return handle.Audio.Play(ctx, samples, sampleRate)
+	return t.Handle.Audio.Play(ctx, samples, sampleRate)
 }
 
 // snapshotHandles returns a copy of the current node handles slice.
@@ -399,19 +348,19 @@ func (b *Brain) snapshotHandles() []*NodeHandle {
 }
 
 // readAllSamples drains an AudioStream into a single int16 slice.
-func readAllSamples(stream ai.AudioStream) ([]int16, int, error) {
+func readAllSamples(ctx context.Context, stream ai.AudioStream) ([]int16, int, error) {
 	var samples []int16
 	chunkSize := 1024
 
 	for {
-		chunk, err := stream.ReadPCM16(chunkSize)
+		chunk, err := stream.ReadPCM16(ctx, chunkSize)
+		samples = append(samples, chunk...)
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
 			return nil, 0, err
 		}
-		samples = append(samples, chunk...)
 	}
 
 	return samples, stream.SampleRate(), nil
@@ -429,8 +378,8 @@ func (g *gainSource) SampleRate() int {
 	return g.src.SampleRate()
 }
 
-func (g *gainSource) ReadPCM16(chunkSize int) ([]int16, error) {
-	chunk, err := g.src.ReadPCM16(chunkSize)
+func (g *gainSource) ReadPCM16(ctx context.Context, chunkSize int) ([]int16, error) {
+	chunk, err := g.src.ReadPCM16(ctx, chunkSize)
 	if len(chunk) > 0 {
 		chunk = audio.ApplyGainPCM16(chunk, g.gainDb)
 	}

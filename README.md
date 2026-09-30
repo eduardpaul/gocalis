@@ -47,14 +47,14 @@ gocalis/
 All AI modules are decoupled using clean interfaces that natively support both **file** (disk) and **stream** (live buffer) modes:
 
 ### 1. TTS (Text-to-Speech with Queue Serialization)
-*   **File Output**: `SynthesizeToFile(text string, outputPath string, opts JobOptions) error` — submits task to queue, waits, and saves WAV to disk.
-*   **Stream Output**: `SynthesizeToStream(text string, opts JobOptions) (AudioStream, error)` — submits the task to the queue and returns a stream reader (`ReadPCM16(chunkSize)`) **before** synthesis finishes. Audio chunks are emitted as they are produced by the Sherpa generation callback, so the first audio can play while later audio is still being synthesized (lower first-audio latency). The brain's single-node `Speak` path uses `AudioNode.PlayStream` to play chunks as they arrive.
+*   **File Output**: `SynthesizeToFile(ctx context.Context, text string, outputPath string, opts JobOptions) error` — submits task to queue, waits, and saves WAV to disk.
+*   **Stream Output**: `SynthesizeToStream(ctx context.Context, text string, opts JobOptions) (AudioStream, error)` — submits the task to the queue and returns a stream reader (`ReadPCM16(ctx, chunkSize)`) **before** synthesis finishes. Audio chunks are emitted as they are produced by the Sherpa generation callback, so the first audio can play while later audio is still being synthesized (lower first-audio latency). The brain's single-node `Speak` path uses `AudioNode.PlayStream` to play chunks as they arrive.
 *   *Scheduling*: Priority is carried by `JobOptions` (a submission/scheduler concern) rather than leaking into the domain method signatures.
-*   *Optimization*: The synthesizer implements an internal **priority worker queue** via Go channels. Concurrent requests (e.g. from multiple audio nodes or Node-RED automation) are serialized automatically so the heavy ONNX synthesis runs one request at a time (preventing CPU thread thrashing and latency spikes). Generation fills an internal buffer at CPU speed and the worker frees up as soon as synthesis completes, decoupled from the slower real-time playback consumer.
+*   *Optimization*: The synthesizer implements an internal **priority worker queue** with bounded, stable priority admission. Concurrent requests (e.g. from multiple audio nodes or Node-RED automation) are serialized automatically so the heavy ONNX synthesis runs one request at a time (preventing CPU thread thrashing and latency spikes). Generation buffers at most two seconds of PCM and applies cancellation-aware backpressure. Broadcast commands synthesize once and share immutable PCM across nodes.
 
 ### 2. ASR (Speech-to-Text)
-*   **Samples Input**: `TranscribeSamples(samples []float32, sampleRate int, opts JobOptions) (string, error)` — transcribes an in-memory PCM buffer (resampling to 16 kHz when needed). This is the primary path used by the live `/ask` capture flow (no temp-WAV round-trip).
-*   **File Input**: `TranscribeFile(filePath string, opts JobOptions) (string, error)` — thin wrapper that reads a WAV file and calls `TranscribeSamples`.
+*   **Samples Input**: `TranscribeSamples(ctx context.Context, samples []float32, sampleRate int, opts JobOptions) (string, error)` — transcribes an in-memory PCM buffer (resampling to 16 kHz when needed). This is the primary path used by the live `/ask` capture flow (no temp-WAV round-trip).
+*   **File Input**: `TranscribeFile(ctx context.Context, filePath string, opts JobOptions) (string, error)` — thin wrapper that reads a WAV file and calls `TranscribeSamples`.
 *   **Stream Input**: `CreateStream() (TranscriptionStream, error)` — initializes a live, chunk-based PCM receiver (`AcceptAudio`) transcribing on-the-fly.
 
 ### 3. Wake Word Detection (KWS)
@@ -222,150 +222,51 @@ Events are published to `gocalis/event/<event_type>`, for example:
 
 ---
 
-## 🛠️ How to Build & Run the Project
+## Build and run
 
-This section details how to get the `gocalis` proxy and the React dashboard up and running.
-
-### 1. Build the Web Dashboard (Required for Go Embedding)
-Because `gocalis` embeds the React dashboard assets at compile time using Go `embed`, you must build the frontend before running or testing the Go project:
+The runtime image contains a compiled Go executable, the embedded dashboard and the required native inference/audio libraries. It does not contain a Go toolchain. Configure model paths and nodes in `config.yaml`, and place the matching artifacts under `models/` before starting the service. Missing files are reported before native model initialization.
 
 ```bash
-# 1. Install dependencies and build the React application
-cd web
-npm install
-npm run build
-cd ..
-
-# 2. Copy the dist folder to the webserver package (so go:embed can find it)
-cp -r web/dist internal/webserver/dist
-```
-
-> [!IMPORTANT]
-> If you are using Docker Compose with local volume mounts (e.g., `.:/app`), the host's directory overrides the container's `/app` folder. Thus, the compiled `internal/webserver/dist` folder must exist on the **host** for it to be visible inside the running container.
-
-### 2. Setup the Docker Development Environment
-Bring up the development container (which installs the required audio libraries and configures network access):
-```bash
-docker compose up -d --build
-```
-
-### 3. Download Model Files
-Initialize the ONNX models for automatic speech recognition (ASR), text-to-speech (TTS), and speaker identification (Speaker ID):
-
-*   **Spanish Models** (Whisper Tiny & VITS es):
-    ```bash
-    docker compose exec app bash scripts/download_spanish_models.sh
-    ```
-*   **English Models** (Moonshine Tiny & Supertonic 3):
-    ```bash
-    docker compose exec app bash scripts/download_models.sh
-    ```
-*   **Speaker Verification Model** (Wespeaker CAM++):
-    ```bash
-    docker compose exec app bash scripts/download_speaker_id_model.sh
-    ```
-
-### 4. Running Gocalis
-You can run `gocalis` in two primary modes using command-line flags:
-
-#### A. WebRTC Proxy & Server Mode (Default)
-Starts the unified speech agent, opens the Node-RED WebSocket API server, and launches the dashboard HTTP server:
-```bash
-docker compose exec app go run cmd/main.go -channel webrtc -config config.yaml -ws-addr :9090 -http-addr :8080
-```
-Parameters:
-- `-channel`: Either `webrtc` (production/server) or `demo` (local pipeline validation).
-- `-config`: Path to the YAML configuration file (default: `config.yaml`).
-- `-ws-addr`: WebSocket port for automation platform integration (default: `:9090`).
-- `-http-addr`: Web dashboard listen address (default: `:8080`).
-
-#### B. Validation Demo Mode
-Runs a local execution loop of the Spanish ASR, TTS, and Speaker ID pipeline using mock input files and streams, then plays the output using `aplay` (requires host audio configuration):
-```bash
-docker compose exec app go run cmd/main.go -channel demo -config config.yaml
-```
-
----
-
-## 🧪 How to Test
-
-Gocalis uses standard Go unit testing. All tests are located in `*_test.go` files inside their respective packages.
-
-### 1. Preparation
-Ensure the Web Dashboard is built and copied to `internal/webserver/dist` (see [Build the Web Dashboard](#1-build-the-web-dashboard-required-for-go-embedding) above). If this folder is missing, Go compiler/test setup will fail with: `pattern all:dist: no matching files found`.
-
-### 2. Run All Tests
-Execute all package tests inside the container environment:
-```bash
-docker compose exec app go test ./...
-```
-
-### 3. Running Specific Subsets of Tests
-*   **Run without caching**: Force tests to execute again rather than using cached results:
-    ```bash
-    docker compose exec app go test -count=1 ./...
-    ```
-*   **Run a specific package**:
-    ```bash
-    docker compose exec app go test ./internal/audio/...
-    ```
-*   **Run a single test by name pattern**:
-    ```bash
-    docker compose exec app go test -v ./internal/audio/... -run TestFloatPCM16RoundTrip
-    ```
-*   **Run with the Data Race Detector**: Check for concurrent write conflicts (e.g., hot-reloading configurations or streams):
-    ```bash
-    docker compose exec app go test -race ./...
-    ```
-
----
-
-## 🔍 How to Debug
-
-### 1. Viewing Logs
-The Go app logs directly to `stdout`/`stderr` with microsecond precision timestamp formatting:
-```bash
-# View active container output
+docker compose up -d --build app
 docker compose logs -f app
 ```
 
-### 2. Interactive Debugging with Delve (`dlv`)
-To debug the running Go binary line-by-line, inspect variables, or set breakpoints:
+Compose mounts only configuration and models, so repository mounts cannot hide the embedded dashboard. It uses host networking for WebRTC and maps `/dev/snd` for local ALSA nodes. For a deployment using only WebRTC, remove the `devices` entry if the host has no sound devices. `privileged` mode is unnecessary.
 
-#### A. Running with Delve inside the Container
-1. Execute Delve inside the app container, starting a headless debug server:
-   ```bash
-   docker compose exec app dlv debug cmd/main.go --headless --listen=:2345 --api-version=2 --accept-multiclient -- -channel webrtc -config config.yaml
-   ```
-   *(Note: Make sure to expose port `2345` in `docker-compose.yaml` if you want to connect a debugger client from the host).*
+The default dashboard is at `http://localhost:8080`; the automation WebSocket is `ws://localhost:9090/ws`. Configure `security.auth_token` to require a bearer token for controls and both event sockets. Enter it in the dashboard's access-token field; it is stored for the current browser tab. The status endpoints remain public.
 
-#### B. VS Code Launch Configuration (`.vscode/launch.json`)
-You can attach your IDE debugger to the headless Delve server. Add the following to your `.vscode/launch.json`:
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Attach to Delve (Docker)",
-      "type": "go",
-      "request": "attach",
-      "mode": "remote",
-      "port": 2345,
-      "host": "127.0.0.1",
-      "showLog": true
-    }
-  ]
-}
+## Container-based testing
+
+The separate `test` image includes Go, native development libraries, tests and dashboard assets. No host Go installation or audio hardware is required for unit tests:
+
+```bash
+docker compose --profile test run --rm --build test
+docker compose --profile test run --rm test go vet ./...
+docker compose --profile test run --rm test go test -race -count=1 ./internal/ask ./internal/brain ./internal/webrtc
 ```
 
-### 3. WebRTC & Stream Debugging
-When dealing with `rtc_stream` nodes:
-*   **Status Page**: Check `http://localhost:8080/api/status` or `http://localhost:8080/api/nodes` to see if active nodes are running or in an error state.
-*   **Pion Log Output**: Increase logging by modifying the config or runtime to monitor WebRTC signaling/ICE state transitions.
-*   **Self-Barge-in Gate**: If the microphone captures its own speaker output (causing audio loops), verify that the node is running in half-duplex. The mic stream automatically mutes while the node status is `SPEAKING` unless `echo_cancellation` is enabled in `config.yaml`.
+The default test command runs the whole suite with the race detector. The tests use in-memory audio and model stand-ins; real recognition accuracy, echo cancellation and go2rtc delivery still require the configured models and representative hardware.
 
-### 4. Configuration & Speaker Hot-Reloading Troubleshooting
-*   **Modifying configurations**: Update values directly in `config.yaml`.
-*   **Hot-reloading speakers**: Speaker embedding files in `./models/known_speakers/` are monitored. Modifying the folder or calling `POST /api/reload-speakers` triggers a hot-reload of speaker biometrics.
-*   **Check for lock contentions**: Gocalis prevents data races during reloading using a read-write lock (`RWMutex`). Check log outputs if speaker identification requests block during reloading.
+For local frontend work:
 
+```bash
+npm --prefix web ci
+npm --prefix web run lint
+npm --prefix web run build
+mkdir -p internal/webserver/dist
+cp -r web/dist/. internal/webserver/dist/
+```
+
+## Configuration and command contracts
+
+Configuration rejects unknown YAML fields, duplicate node IDs and invalid durations, rates and URLs. ASR explicitly selects `models.asr.engine: whisper` or `moonshine`; Moonshine uses a merged decoder. Whisper uses `models.asr.language` (default `es`). TTS selects `supertonic` with `model_dir`, or `vits` with `model`, `tokens` and `data_dir`. There is no filename-based engine detection.
+
+The speaker challenge key is `challenge_init_prompt`. Local capture is mono 16 kHz. Unused `channels`, `chunk_size`, `rtsp_url` and `codec` configuration keys have been removed. `auto_ask_capture_delay_seconds: 0` disables the delay; use `1.5` for the supplied half-duplex doorbell configuration, or `-1` to select the runtime default.
+
+Speaker profile WAVs under `models.speaker_id.embeddings_dir` reload after a 500 ms trailing debounce, including atomic file replacement. Application configuration changes require a restart. `POST /api/reload-speakers` explicitly rereads the same profile directory.
+
+HTTP `/api/ask` and `/ask` use the same fields as an `action: ask` command: `text`, `node_id`, `context_id`, `barge_in`, `require_speaker_id`, `vad_timeout_seconds`, `capture_delay_seconds`, `post_speech_silence_seconds`, `priority`, and `output_format`. The response's audio is the captured response, not the spoken prompt. Detached `/api/execute` commands return HTTP 202 after admission; invalid requests return 400 and overload/shutdown returns 503.
+
+Each service admits at most 32 concurrent commands. Model and per-node queues hold at most 32 pending jobs/turns. Text is limited to 4,000 bytes; audio and capture to 120 seconds; HTTP and WebSocket command messages to 8 MiB. Each WebSocket server admits at most 64 clients with 32 queued outbound events per client and a five-second write deadline. Slow consumers are disconnected. Talkback buffers at most 100 encoded frames and discards pending playback on cancellation.
+
+Shutdown cancels commands, closes event connections, joins command/wake/capture/reload work, and only then closes inference engines. An engine waits for any active native call before deleting its model. The review and rationale are in [docs/architecture-performance-review.md](docs/architecture-performance-review.md).

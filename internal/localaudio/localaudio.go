@@ -1,7 +1,6 @@
 package localaudio
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"gocalis/internal/audionode"
@@ -27,6 +25,9 @@ type LocalAudioNode struct {
 	recordOut io.ReadCloser
 	mu        sync.Mutex
 	running   bool
+	closed    bool
+	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 // New creates a new LocalAudioNode.
@@ -37,7 +38,7 @@ func New(nodeCfg config.NodeConfig) *LocalAudioNode {
 }
 
 // resolveALSADevice parses aplay -l or arecord -l to find the card shortname matching deviceStr.
-func resolveALSADevice(deviceStr string, isCapture bool) string {
+func resolveALSADevice(ctx context.Context, deviceStr string, isCapture bool) string {
 	if deviceStr == "" || strings.ToLower(deviceStr) == "default" {
 		return "default"
 	}
@@ -47,7 +48,9 @@ func resolveALSADevice(deviceStr string, isCapture bool) string {
 		cmdName = "arecord"
 	}
 
-	out, err := exec.Command(cmdName, "-l").Output()
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, cmdName, "-l").Output()
 	if err != nil {
 		return "default"
 	}
@@ -78,11 +81,14 @@ func (l *LocalAudioNode) Connect(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.closed {
+		return fmt.Errorf("audio node is closed")
+	}
 	if l.running {
 		return nil
 	}
 
-	device := resolveALSADevice(l.nodeCfg.Audio.InputDeviceIndex, true)
+	device := resolveALSADevice(ctx, l.nodeCfg.Audio.InputDeviceIndex, true)
 	sampleRate := l.nodeCfg.Audio.SampleRate
 	if sampleRate <= 0 {
 		sampleRate = 16000
@@ -91,6 +97,7 @@ func (l *LocalAudioNode) Connect(ctx context.Context) error {
 	log.Printf("[LocalAudioNode:%s] Starting arecord on device %s (sample rate: %d)...\n", l.nodeCfg.NodeID, device, sampleRate)
 
 	// arecord -t raw -f S16_LE -r <rate> -c 1 -D <device>
+	ctx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(ctx, "arecord",
 		"-t", "raw",
 		"-f", "S16_LE",
@@ -103,24 +110,31 @@ func (l *LocalAudioNode) Connect(ctx context.Context) error {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cancel()
 		return fmt.Errorf("failed to create arecord stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		cancel()
+		_ = stdout.Close()
 		return fmt.Errorf("failed to start arecord: %w", err)
 	}
 
 	l.recordCmd = cmd
 	l.recordOut = stdout
 	l.running = true
+	l.cancel = cancel
+	l.done = make(chan struct{})
 
 	// Read audio in a loop in a background goroutine
-	go l.readLoop()
+	go l.readLoop(cmd, stdout, l.done)
 
 	return nil
 }
 
-func (l *LocalAudioNode) readLoop() {
+func (l *LocalAudioNode) readLoop(cmd *exec.Cmd, out io.ReadCloser, done chan struct{}) {
+	defer close(done)
+	defer func() { _ = out.Close(); _ = cmd.Wait(); l.mu.Lock(); l.running = false; l.mu.Unlock() }()
 	// 20ms chunk size in samples.
 	// At 16000Hz, 20ms is 320 samples. Each sample is 2 bytes (int16).
 	chunkSamples := 320
@@ -132,7 +146,6 @@ func (l *LocalAudioNode) readLoop() {
 			l.mu.Unlock()
 			break
 		}
-		out := l.recordOut
 		l.mu.Unlock()
 
 		if out == nil {
@@ -176,53 +189,22 @@ func (l *LocalAudioNode) readLoop() {
 		}
 	}
 
-	_ = l.Close()
 }
 
 // Play implements audionode.AudioNode.
 func (l *LocalAudioNode) Play(ctx context.Context, pcm16 []int16, sampleRate int) error {
-	device := resolveALSADevice(l.nodeCfg.Audio.OutputDeviceIndex, false)
-	log.Printf("[LocalAudioNode:%s] Playing %d samples on device %s via aplay...\n", l.nodeCfg.NodeID, len(pcm16), device)
-
-	cmd := exec.CommandContext(ctx, "aplay",
-		"-t", "raw",
-		"-f", "S16_LE",
-		"-r", fmt.Sprintf("%d", sampleRate),
-		"-c", "1",
-		"-D", device,
-	)
-
-	cmd.Stderr = os.Stderr
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create aplay stdin pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start aplay: %w", err)
-	}
-
-	// Write raw bytes to stdin
-	byteBuf := new(bytes.Buffer)
-	err = binary.Write(byteBuf, binary.LittleEndian, pcm16)
-	if err != nil {
-		return fmt.Errorf("failed to encode PCM data: %w", err)
-	}
-
-	_, _ = stdin.Write(byteBuf.Bytes())
-	_ = stdin.Close()
-
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("aplay play failed: %w", err)
-	}
-
-	return nil
+	return l.PlayStream(ctx, audionode.NewSliceSource(pcm16, sampleRate))
 }
 
 // PlayStream implements audionode.AudioNode.
 func (l *LocalAudioNode) PlayStream(ctx context.Context, src audionode.PCM16Source) error {
-	device := resolveALSADevice(l.nodeCfg.Audio.OutputDeviceIndex, false)
+	l.mu.Lock()
+	closed := l.closed
+	l.mu.Unlock()
+	if closed {
+		return fmt.Errorf("audio node is closed")
+	}
+	device := resolveALSADevice(ctx, l.nodeCfg.Audio.OutputDeviceIndex, false)
 	sampleRate := src.SampleRate()
 	log.Printf("[LocalAudioNode:%s] Playing stream on device %s via aplay...\n", l.nodeCfg.NodeID, device)
 
@@ -242,15 +224,15 @@ func (l *LocalAudioNode) PlayStream(ctx context.Context, src audionode.PCM16Sour
 	}
 
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		return fmt.Errorf("failed to start aplay: %w", err)
 	}
 
-	defer func() {
-		_ = stdin.Close()
-		_ = cmd.Wait()
-	}()
+	defer stdin.Close()
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 
 	chunkSize := 1024
+	byteBuf := make([]byte, chunkSize*2)
 	for {
 		select {
 		case <-ctx.Done():
@@ -258,22 +240,28 @@ func (l *LocalAudioNode) PlayStream(ctx context.Context, src audionode.PCM16Sour
 		default:
 		}
 
-		chunk, err := src.ReadPCM16(chunkSize)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-
+		chunk, readErr := src.ReadPCM16(ctx, chunkSize)
 		if len(chunk) > 0 {
-			byteBuf := new(bytes.Buffer)
-			_ = binary.Write(byteBuf, binary.LittleEndian, chunk)
-			_, err = stdin.Write(byteBuf.Bytes())
-			if err != nil {
+			for i, value := range chunk {
+				binary.LittleEndian.PutUint16(byteBuf[i*2:], uint16(value))
+			}
+			if _, err := stdin.Write(byteBuf[:len(chunk)*2]); err != nil {
 				return err
 			}
 		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	_ = stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("aplay failed: %w", err)
 	}
 
 	return nil
@@ -289,32 +277,18 @@ func (l *LocalAudioNode) OnAudio(callback func(samples []float32)) {
 // Close implements audionode.AudioNode.
 func (l *LocalAudioNode) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if !l.running {
-		return nil
-	}
-
+	l.closed = true
 	l.running = false
-	if l.recordCmd != nil && l.recordCmd.Process != nil {
-		_ = l.recordCmd.Process.Signal(syscall.SIGINT)
-
-		go func(cmd *exec.Cmd) {
-			done := make(chan error, 1)
-			go func() {
-				done <- cmd.Wait()
-			}()
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
-			}
-		}(l.recordCmd)
+	if l.cancel != nil {
+		l.cancel()
 	}
-
-	l.recordCmd = nil
-	l.recordOut = nil
+	if l.recordOut != nil {
+		_ = l.recordOut.Close()
+	}
+	done := l.done
+	l.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 	return nil
 }

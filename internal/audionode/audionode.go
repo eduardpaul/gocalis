@@ -4,7 +4,11 @@
 // soundcard, or a test stub can all be plugged in behind the same interface.
 package audionode
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"io"
+)
 
 // PCM16Source yields PCM16 audio in chunks until io.EOF. It is the pull-based
 // contract a node uses to play audio incrementally (e.g. streamed straight from
@@ -15,7 +19,7 @@ type PCM16Source interface {
 
 	// ReadPCM16 returns the next chunk of up to chunkSize samples, or io.EOF
 	// once the source is exhausted.
-	ReadPCM16(chunkSize int) ([]int16, error)
+	ReadPCM16(ctx context.Context, chunkSize int) ([]int16, error)
 }
 
 // AudioNode is a bidirectional audio endpoint: it plays PCM16 audio to a device
@@ -38,6 +42,33 @@ type AudioNode interface {
 	// microphone audio.
 	OnAudio(callback func(samples []float32))
 
-	// Close tears down the transport and releases resources.
+	// Close tears down capture and waits until all microphone callbacks finish.
+	// The owner must cancel and join turns before closing their transport.
 	Close() error
+}
+
+// SliceSource reads immutable PCM clips without copying the complete recording.
+type SliceSource struct {
+	samples      []int16
+	rate, offset int
+}
+
+func NewSliceSource(samples []int16, rate int) *SliceSource {
+	return &SliceSource{samples: samples, rate: rate}
+}
+func (s *SliceSource) SampleRate() int { return s.rate }
+func (s *SliceSource) ReadPCM16(ctx context.Context, size int) ([]int16, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if size <= 0 {
+		return nil, fmt.Errorf("chunk size must be positive")
+	}
+	if s.offset == len(s.samples) {
+		return nil, io.EOF
+	}
+	end := min(len(s.samples), s.offset+size)
+	chunk := s.samples[s.offset:end]
+	s.offset = end
+	return chunk, nil
 }

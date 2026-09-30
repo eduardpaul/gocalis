@@ -5,6 +5,9 @@ package httpsec
 
 import (
 	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -119,4 +122,32 @@ func RequireToken(expected string, next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+const MaxBodyBytes = 8 << 20
+
+// DecodeJSON bounds payloads and rejects unknown fields and trailing documents.
+func DecodeJSON(w http.ResponseWriter, r *http.Request, value any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(value)
+	if err == nil {
+		if next := decoder.Decode(new(any)); next != io.EOF {
+			err = next
+			if err == nil {
+				err = errors.New("multiple JSON values")
+			}
+		}
+	}
+	if err != nil {
+		code := http.StatusBadRequest
+		var limit *http.MaxBytesError
+		if errors.As(err, &limit) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, "invalid JSON payload: "+err.Error(), code)
+		return false
+	}
+	return true
 }

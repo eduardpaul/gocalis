@@ -34,6 +34,8 @@ type PhysicalNode struct {
 	queueMutex sync.Mutex
 	queueCond  *sync.Cond
 	queue      []stateTransition
+	closed     bool
+	done       chan struct{}
 }
 
 // NewPhysicalNode creates a new PhysicalNode in the default IDLE state.
@@ -42,6 +44,7 @@ func NewPhysicalNode(nodeID string, nodeType string) *PhysicalNode {
 		NodeID: nodeID,
 		Type:   nodeType,
 		state:  StateIdle,
+		done:   make(chan struct{}),
 	}
 	n.queueCond = sync.NewCond(&n.queueMutex)
 	go n.dispatchLoop()
@@ -68,7 +71,12 @@ func (n *PhysicalNode) SetState(newState NodeState) {
 	// Enqueue the transition while holding stateMutex so the queue order matches
 	// the exact order of state changes.
 	n.queueMutex.Lock()
-	n.queue = append(n.queue, stateTransition{oldState: oldState, newState: newState})
+	for len(n.queue) >= 64 && !n.closed {
+		n.queueCond.Wait()
+	}
+	if !n.closed {
+		n.queue = append(n.queue, stateTransition{oldState: oldState, newState: newState})
+	}
 	n.queueCond.Signal()
 	n.queueMutex.Unlock()
 	n.stateMutex.Unlock()
@@ -76,13 +84,19 @@ func (n *PhysicalNode) SetState(newState NodeState) {
 
 // dispatchLoop delivers queued transitions to callbacks sequentially, in order.
 func (n *PhysicalNode) dispatchLoop() {
+	defer close(n.done)
 	for {
 		n.queueMutex.Lock()
-		for len(n.queue) == 0 {
+		for len(n.queue) == 0 && !n.closed {
 			n.queueCond.Wait()
+		}
+		if len(n.queue) == 0 && n.closed {
+			n.queueMutex.Unlock()
+			return
 		}
 		transition := n.queue[0]
 		n.queue = n.queue[1:]
+		n.queueCond.Broadcast()
 		n.queueMutex.Unlock()
 
 		n.callbacksMutex.Lock()
@@ -101,4 +115,13 @@ func (n *PhysicalNode) OnStateChanged(callback func(oldState, newState NodeState
 	n.callbacksMutex.Lock()
 	defer n.callbacksMutex.Unlock()
 	n.changeCallbacks = append(n.changeCallbacks, callback)
+}
+
+// Close stops admission, drains queued transitions and joins the dispatcher.
+func (n *PhysicalNode) Close() {
+	n.queueMutex.Lock()
+	n.closed = true
+	n.queueCond.Broadcast()
+	n.queueMutex.Unlock()
+	<-n.done
 }

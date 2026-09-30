@@ -7,7 +7,6 @@ package session
 
 import (
 	"sync"
-	"time"
 )
 
 // State is a stage in a turn's lifecycle.
@@ -35,8 +34,8 @@ type Session struct {
 	state         State
 	captureActive bool
 	captured      []float32
-	lastFeed      time.Time
 
+	barged     bool
 	bargeArmed bool
 	bargeCh    chan struct{}
 }
@@ -75,15 +74,17 @@ func (s *Session) ArmBargeIn() <-chan struct{} {
 	defer s.mu.Unlock()
 	s.bargeCh = make(chan struct{}, 1)
 	s.bargeArmed = true
+	s.barged = false
 	return s.bargeCh
 }
 
 // DisarmBargeIn disables barge-in detection.
-func (s *Session) DisarmBargeIn() {
+func (s *Session) DisarmBargeIn() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.bargeArmed = false
 	s.bargeCh = nil
+	return s.barged
 }
 
 // StartCapture begins accumulating speech samples, discarding any prior buffer.
@@ -92,7 +93,6 @@ func (s *Session) StartCapture() {
 	defer s.mu.Unlock()
 	s.captureActive = true
 	s.captured = nil
-	s.lastFeed = time.Now()
 }
 
 // StopCapture stops accumulating samples and returns what was captured.
@@ -116,15 +116,22 @@ func (s *Session) Feed(samples []float32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.bargeArmed && s.bargeCh != nil {
-		select {
-		case s.bargeCh <- struct{}{}:
-		default:
-		}
+	if len(samples) == 0 {
+		return
+	}
+	if s.bargeArmed && !s.barged {
+		s.barged = true
+		s.captureActive = true
+		s.captured = nil
+		s.state = StateListening
+		s.bargeCh <- struct{}{}
 	}
 
 	if s.captureActive {
+		remaining := 16000*120 - len(s.captured)
+		if len(samples) > remaining {
+			samples = samples[:remaining]
+		}
 		s.captured = append(s.captured, samples...)
-		s.lastFeed = time.Now()
 	}
 }

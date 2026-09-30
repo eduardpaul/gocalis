@@ -259,3 +259,6 @@
   align-self: flex-start;
   text-decoration: none;
 }
+
+.auth-token { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+.auth-token input { width: min(100%, 24rem); }

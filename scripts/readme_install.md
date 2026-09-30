@@ -93,7 +93,7 @@ place.
   dashboard wasn't built. Install npm and re-run `sudo ./scripts/install.sh`, or build
   it manually:
   ```bash
-  cd web && npm install && npm run build && cd ..
+  cd web && npm ci && npm run build && cd ..
   cp -r web/dist internal/webserver/dist
   ```
 - **`go: command not found` during install:** Go isn't in the repo owner's

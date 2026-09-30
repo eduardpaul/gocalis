@@ -6,8 +6,10 @@ package ask
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"strings"
 	"time"
@@ -40,19 +42,6 @@ type Config struct {
 	// user stop-speaking and the end chime, at the cost of more aggressive turn
 	// cutting. Defaults to 1.5s when unset.
 	PostSpeechSilenceSeconds float64
-
-	// PromptSamples and PromptSampleRate allow the caller to provide
-	// pre-synthesized prompt audio. When empty, the engine synthesizes
-	// TTSText itself.
-	PromptSamples    []int16
-	PromptSampleRate int
-
-	// NodeAlreadyAcquired signals that the caller has already reserved the node's
-	// turn (via Brain.AcquireNode) and will release it after Run returns. Run
-	// then skips its own acquisition. Callers that pre-synthesize the prompt use
-	// this to reserve the node BEFORE synthesis so a lower-priority speak cannot
-	// grab the free node during the synthesis window.
-	NodeAlreadyAcquired bool
 }
 
 // Result is the outcome of an ask session.
@@ -91,37 +80,17 @@ func NewEngine(b *brain.Brain, asr ai.Transcriber, speakerID ai.SpeakerIdentifie
 
 // Run executes the ask flow for the given configuration.
 func (e *Engine) Run(ctx context.Context, cfg Config) Result {
-	handle := e.Brain.GetNodeHandle(cfg.NodeID)
-	if handle == nil {
-		return Result{
-			ContextID:    cfg.ContextID,
-			NodeID:       cfg.NodeID,
-			Status:       "error",
-			ErrorMessage: "node not registered",
-		}
+	if err := cfg.Validate(); err != nil {
+		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
 	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Hold the node for the entire ask turn (prompt -> listen -> ASR) so a
-	// lower-priority speak queues behind it instead of cutting into it. Wake
-	// driven AutoAsk passes a high priority; explicit API asks pass the request
-	// priority. Blocks until the node is free (or ctx is cancelled). When the
-	// caller already reserved the node (and pre-synthesized the prompt under that
-	// reservation), Run does not re-acquire.
-	if !cfg.NodeAlreadyAcquired {
-		release, err := e.Brain.AcquireNode(ctx, cfg.NodeID, cfg.Priority)
-		if err != nil {
-			return Result{
-				ContextID:    cfg.ContextID,
-				NodeID:       cfg.NodeID,
-				Status:       "error",
-				ErrorMessage: fmt.Sprintf("could not acquire node: %v", err),
-			}
-		}
-		defer release()
+	turn, err := e.Brain.AcquireNode(ctx, cfg.NodeID, cfg.Priority)
+	if err != nil {
+		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
 	}
+	defer turn.Release()
+	handle := turn.Handle
+	defer handle.Node.SetState(node.StateIdle)
+	handle.Node.SetState(node.StateProcessing)
 
 	// Each turn owns an isolated Session registered on the brain so the audio
 	// ingestion path fans captured speech (and barge-in) into it. A unique ID lets
@@ -140,20 +109,14 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 	// Phase 1: Speak the prompt, allowing barge-in to cancel playback.
 	barged := false
 	startChimeSpoken := false
-	if strings.TrimSpace(cfg.TTSText) != "" || len(cfg.PromptSamples) > 0 {
-		samples := cfg.PromptSamples
-		sampleRate := cfg.PromptSampleRate
-
-		if len(samples) == 0 {
-			var err error
-			samples, sampleRate, err = e.Brain.Synthesize(cfg.TTSText, cfg.Priority)
-			if err != nil {
-				return Result{
-					ContextID:    cfg.ContextID,
-					NodeID:       cfg.NodeID,
-					Status:       "error",
-					ErrorMessage: err.Error(),
-				}
+	if strings.TrimSpace(cfg.TTSText) != "" {
+		samples, sampleRate, err := e.Brain.Synthesize(ctx, cfg.TTSText, cfg.Priority)
+		if err != nil {
+			return Result{
+				ContextID:    cfg.ContextID,
+				NodeID:       cfg.NodeID,
+				Status:       "error",
+				ErrorMessage: err.Error(),
 			}
 		}
 
@@ -178,18 +141,22 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 			}
 			startChimeSpoken = true
 
-			bargeDetected := make(chan struct{}, 1)
+			promptCtx, cancelPrompt := context.WithCancel(ctx)
+			bargeDone := make(chan struct{})
+			bargeCh := (<-chan struct{})(nil)
 			if cfg.BargeIn {
-				bargeCh := sess.ArmBargeIn()
+				bargeCh = sess.ArmBargeIn()
 				go func() {
+					defer close(bargeDone)
 					select {
 					case <-bargeCh:
-						log.Printf("[Ask:%s] Barge-in detected, interrupting prompt and switching to LISTENING\n", cfg.NodeID)
-						bargeDetected <- struct{}{}
-						cancel()
-					case <-ctx.Done():
+						handle.Node.SetState(node.StateListening)
+						cancelPrompt()
+					case <-promptCtx.Done():
 					}
 				}()
+			} else {
+				close(bargeDone)
 			}
 
 			// Drive the state machine explicitly: idle -> speaking. The prompt
@@ -197,26 +164,15 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 			// does not emit its own PROCESSING/SPEAKING/IDLE churn — the flow
 			// transitions straight to LISTENING next.
 			handle.Node.SetState(node.StateSpeaking)
-			err := e.Brain.PlayAudio(ctx, cfg.NodeID, samples, sampleRate)
-			sess.DisarmBargeIn()
-
-			if err != nil && err != context.Canceled {
-				return Result{
-					ContextID:    cfg.ContextID,
-					NodeID:       cfg.NodeID,
-					Status:       "error",
-					ErrorMessage: err.Error(),
-				}
+			err := turn.Play(promptCtx, samples, sampleRate)
+			cancelPrompt()
+			<-bargeDone
+			barged = sess.DisarmBargeIn()
+			if ctx.Err() != nil {
+				return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: ctx.Err().Error()}
 			}
-
-			// If barge-in cancelled the prompt, ensure the node is in LISTENING
-			// before capture starts. This also wins the race with SpeakSamples
-			// resetting the state to IDLE on return.
-			select {
-			case <-bargeDetected:
-				barged = true
-				handle.Node.SetState(node.StateListening)
-			default:
+			if err != nil && !(barged && errors.Is(err, context.Canceled)) {
+				return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
 			}
 		}
 	}
@@ -229,7 +185,8 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 	// re-capture our own audio as speech.
 	if !barged {
 		if !startChimeSpoken {
-			e.playChime(cfg.NodeID, chimeStart)
+			handle.Node.SetState(node.StateSpeaking)
+			e.playChime(ctx, turn, chimeStart)
 		}
 		if cfg.CaptureDelaySeconds > 0 {
 			select {
@@ -242,7 +199,9 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 	// Phase 2: Capture user response until VAD timeout or post-speech silence.
 	sess.ToListening()
 	handle.Node.SetState(node.StateListening)
-	sess.StartCapture()
+	if !barged {
+		sess.StartCapture()
+	}
 
 	timeout := time.Duration(cfg.VADTimeoutSeconds * float64(time.Second))
 	if timeout <= 0 {
@@ -282,13 +241,15 @@ listenLoop:
 	}
 
 	captured := sess.StopCapture()
+	if ctx.Err() != nil {
+		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: ctx.Err().Error()}
+	}
 	// Announce the end of listening with a chime on every device.
-	e.playChime(cfg.NodeID, chimeStop)
+	e.playChime(ctx, turn, chimeStop)
 	sess.ToProcessing()
 	handle.Node.SetState(node.StateProcessing)
 
 	if len(captured) == 0 {
-		handle.Node.SetState(node.StateIdle)
 		return Result{
 			ContextID: cfg.ContextID,
 			NodeID:    cfg.NodeID,
@@ -296,9 +257,8 @@ listenLoop:
 		}
 	}
 
-	transcription, err := e.ASR.TranscribeSamples(captured, 16000, ai.JobOptions{Priority: cfg.Priority})
+	transcription, err := e.ASR.TranscribeSamples(ctx, captured, 16000, ai.JobOptions{Priority: cfg.Priority})
 	if err != nil {
-		handle.Node.SetState(node.StateIdle)
 		return Result{
 			ContextID:    cfg.ContextID,
 			NodeID:       cfg.NodeID,
@@ -328,7 +288,6 @@ listenLoop:
 			handle.Node.SetState(node.StateChallenging)
 
 			if len(e.SpeakerCfg.ChallengePrompts) == 0 {
-				handle.Node.SetState(node.StateIdle)
 				return Result{
 					ContextID:    cfg.ContextID,
 					NodeID:       cfg.NodeID,
@@ -345,9 +304,8 @@ listenLoop:
 
 			log.Printf("[Ask:%s] Challenge prompt: %q\n", cfg.NodeID, challengeText)
 
-			challengeSamples, challengeSampleRate, err := e.Brain.Synthesize(challengeText, cfg.Priority)
+			challengeSamples, challengeSampleRate, err := e.Brain.Synthesize(ctx, challengeText, cfg.Priority)
 			if err != nil {
-				handle.Node.SetState(node.StateIdle)
 				return Result{
 					ContextID:    cfg.ContextID,
 					NodeID:       cfg.NodeID,
@@ -357,9 +315,8 @@ listenLoop:
 			}
 
 			handle.Node.SetState(node.StateSpeaking)
-			err = e.Brain.PlayAudio(ctx, cfg.NodeID, challengeSamples, challengeSampleRate)
+			err = turn.Play(ctx, challengeSamples, challengeSampleRate)
 			if err != nil && err != context.Canceled {
-				handle.Node.SetState(node.StateIdle)
 				return Result{
 					ContextID:    cfg.ContextID,
 					NodeID:       cfg.NodeID,
@@ -371,7 +328,6 @@ listenLoop:
 			select {
 			case <-time.After(150 * time.Millisecond):
 			case <-ctx.Done():
-				handle.Node.SetState(node.StateIdle)
 				return Result{
 					ContextID:    cfg.ContextID,
 					NodeID:       cfg.NodeID,
@@ -412,14 +368,16 @@ listenLoop:
 			}
 
 			secondaryCaptured := sess.StopCapture()
-			e.playChime(cfg.NodeID, chimeStop)
+			if ctx.Err() != nil {
+				return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: ctx.Err().Error()}
+			}
+			e.playChime(ctx, turn, chimeStop)
 			sess.ToProcessing()
 			handle.Node.SetState(node.StateProcessing)
 
 			if len(secondaryCaptured) == 0 {
 				log.Printf("[Ask:%s] No speech captured during challenge loop.\n", cfg.NodeID)
-				e.playFailPrompt(ctx, cfg.NodeID, cfg.Priority)
-				handle.Node.SetState(node.StateIdle)
+				e.playFailPrompt(ctx, turn, cfg.Priority)
 				return Result{
 					ContextID: cfg.ContextID,
 					NodeID:    cfg.NodeID,
@@ -430,8 +388,7 @@ listenLoop:
 			matchedSpkSec, err := e.SpeakerID.IdentifySamples(secondaryCaptured, 16000)
 			if err != nil || matchedSpkSec == "" {
 				log.Printf("[Ask:%s] Challenge verification failed. Matched: %q, Err: %v\n", cfg.NodeID, matchedSpkSec, err)
-				e.playFailPrompt(ctx, cfg.NodeID, cfg.Priority)
-				handle.Node.SetState(node.StateIdle)
+				e.playFailPrompt(ctx, turn, cfg.Priority)
 				return Result{
 					ContextID: cfg.ContextID,
 					NodeID:    cfg.NodeID,
@@ -446,7 +403,6 @@ listenLoop:
 			verifiedSpeaker = matchedSpk
 		}
 
-		handle.Node.SetState(node.StateIdle)
 		return Result{
 			ContextID:     cfg.ContextID,
 			NodeID:        cfg.NodeID,
@@ -458,7 +414,6 @@ listenLoop:
 		}
 	}
 
-	handle.Node.SetState(node.StateIdle)
 	return Result{
 		ContextID:     cfg.ContextID,
 		NodeID:        cfg.NodeID,
@@ -482,33 +437,44 @@ func silencePCMAt(sampleRate int, ms int) []int16 {
 	return make([]int16, n)
 }
 
-// playChime plays a short UI chime on the node. It uses an independent context
-// so the chime always plays even if the caller's context was cancelled (e.g.
-// after the listen loop). The chime is played state-neutrally so it never emits
-// SPEAKING/IDLE transitions — it is cosmetic and must not pollute the node's
-// state stream (the ask flow owns the state machine). Errors are logged and
-// otherwise ignored.
-func (e *Engine) playChime(nodeID string, kind chimeKind) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+// playChime uses the turn's lifetime, so shutdown never starts independent work.
+func (e *Engine) playChime(parent context.Context, turn *brain.Turn, kind chimeKind) {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
-	if err := e.Brain.PlayAudio(ctx, nodeID, chimePCM(kind), chimeSampleRate); err != nil && err != context.Canceled {
-		log.Printf("[Ask:%s] chime playback error: %v\n", nodeID, err)
+	if err := turn.Play(ctx, chimePCM(kind), chimeSampleRate); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("[Ask:%s] chime playback error: %v", turn.Handle.Node.NodeID, err)
 	}
 }
 
 // playFailPrompt plays the challenge failed TTS prompt on the node.
-func (e *Engine) playFailPrompt(ctx context.Context, nodeID string, priority int) {
+func (e *Engine) playFailPrompt(ctx context.Context, turn *brain.Turn, priority int) {
 	prompt := e.SpeakerCfg.ChallengeFailedPrompt
 	if prompt == "" {
 		prompt = "Acceso denegado."
 	}
-	samples, sampleRate, err := e.Brain.Synthesize(prompt, priority)
+	samples, sampleRate, err := e.Brain.Synthesize(ctx, prompt, priority)
 	if err != nil || len(samples) == 0 {
 		return
 	}
-	handle := e.Brain.GetNodeHandle(nodeID)
+	handle := turn.Handle
 	if handle != nil {
 		handle.Node.SetState(node.StateSpeaking)
 	}
-	_ = e.Brain.PlayAudio(ctx, nodeID, samples, sampleRate)
+	_ = turn.Play(ctx, samples, sampleRate)
+}
+
+// Validate limits memory and capture time before acquiring a node.
+func (c Config) Validate() error {
+	if c.NodeID == "" || c.NodeID == "all" {
+		return fmt.Errorf("ask requires one node_id")
+	}
+	if len(c.TTSText) > ai.MaxTextBytes {
+		return fmt.Errorf("prompt exceeds %d bytes", ai.MaxTextBytes)
+	}
+	for _, d := range []struct{ value, max float64 }{{c.VADTimeoutSeconds, ai.MaxAudioSeconds}, {c.CaptureDelaySeconds, 20}, {c.PostSpeechSilenceSeconds, 20}} {
+		if math.IsNaN(d.value) || math.IsInf(d.value, 0) || d.value < 0 || d.value > d.max {
+			return fmt.Errorf("invalid ask duration")
+		}
+	}
+	return nil
 }

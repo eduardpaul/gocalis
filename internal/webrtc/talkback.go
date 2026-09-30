@@ -53,10 +53,13 @@ type talkbackSender struct {
 
 	playMu sync.Mutex // serializes whole utterances (push+flush+drain)
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	queue  [][]byte // encoded frames awaiting isochronous pacing
-	closed bool
+	mu        sync.Mutex
+	cond      *sync.Cond
+	queue     [][]byte // encoded frames awaiting isochronous pacing
+	closed    bool
+	inFlight  bool
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // newTalkbackSender establishes the WHIP producer connection to inStream and the
@@ -111,6 +114,7 @@ func newTalkbackSender(setupCtx context.Context, apiBaseURL, inStream, dstStream
 		track:      track,
 		enc:        enc,
 		scratch:    make([]byte, 4000),
+		done:       make(chan struct{}),
 	}
 	t.cond = sync.NewCond(&t.mu)
 
@@ -186,6 +190,7 @@ func (t *talkbackSender) assertRoute(ctx context.Context) error {
 // run paces the encoded queue (or silence) onto the WebRTC track at 20ms until ctx
 // is cancelled. It is the only goroutine that touches queue/silence/track.
 func (t *talkbackSender) run(ctx context.Context) {
+	defer close(t.done)
 	ticker := time.NewTicker(frameMs * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -193,6 +198,7 @@ func (t *talkbackSender) run(ctx context.Context) {
 		case <-ctx.Done():
 			t.mu.Lock()
 			t.closed = true
+			t.queue = nil
 			t.cond.Broadcast()
 			t.mu.Unlock()
 			return
@@ -200,13 +206,17 @@ func (t *talkbackSender) run(ctx context.Context) {
 		}
 
 		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return
+		}
 		frame := t.silence
 		if len(t.queue) > 0 {
 			frame = t.queue[0]
+			t.queue[0] = nil
 			t.queue = t.queue[1:]
-			if len(t.queue) == 0 {
-				t.cond.Broadcast()
-			}
+			t.inFlight = true
+			t.cond.Broadcast()
 		}
 		t.mu.Unlock()
 
@@ -218,88 +228,110 @@ func (t *talkbackSender) run(ctx context.Context) {
 				log.Printf("[Talkback] write sample: %v", err)
 			}
 		}
+		t.mu.Lock()
+		t.inFlight = false
+		t.cond.Broadcast()
+		t.mu.Unlock()
 	}
 }
 
 // pushPCM resamples pcm16 (at srcRate) to 48kHz, frames it into 20ms Opus packets
 // and enqueues them for pacing. Leftover sub-frame samples carry over to the next
 // call. Callers must hold playMu.
-func (t *talkbackSender) pushPCM(pcm16 []int16, srcRate int) {
+func (t *talkbackSender) pushPCM(ctx context.Context, pcm16 []int16, srcRate int) error {
+	if srcRate <= 0 {
+		return fmt.Errorf("invalid sample rate")
+	}
 	t.pcmIn = append(t.pcmIn, audio.ResampleInt16(pcm16, srcRate, opusRate)...)
-	var frames [][]byte
 	for len(t.pcmIn) >= opusFrameSize {
 		n, err := t.enc.Encode(t.pcmIn[:opusFrameSize], t.scratch)
 		t.pcmIn = t.pcmIn[opusFrameSize:]
 		if err != nil {
-			log.Printf("[Talkback] opus encode: %v", err)
-			continue
+			return fmt.Errorf("talkback encode: %w", err)
 		}
-		frames = append(frames, append([]byte(nil), t.scratch[:n]...))
+		if err := t.enqueue(ctx, append([]byte(nil), t.scratch[:n]...)); err != nil {
+			return err
+		}
 	}
-	t.enqueue(frames)
+	return nil
 }
 
-// flushPCM pads and encodes the final partial frame. Callers must hold playMu.
-func (t *talkbackSender) flushPCM() {
+func (t *talkbackSender) flushPCM(ctx context.Context) error {
 	if len(t.pcmIn) == 0 {
-		return
+		return nil
 	}
-	frame := make([]int16, opusFrameSize) // zero-padded PCM silence
+	frame := make([]int16, opusFrameSize)
 	copy(frame, t.pcmIn)
 	t.pcmIn = nil
 	n, err := t.enc.Encode(frame, t.scratch)
 	if err != nil {
-		log.Printf("[Talkback] opus flush encode: %v", err)
-		return
+		return fmt.Errorf("talkback flush encode: %w", err)
 	}
-	t.enqueue([][]byte{append([]byte(nil), t.scratch[:n]...)})
+	return t.enqueue(ctx, append([]byte(nil), t.scratch[:n]...))
 }
 
-func (t *talkbackSender) enqueue(frames [][]byte) {
-	if len(frames) == 0 {
-		return
-	}
+func (t *talkbackSender) enqueue(ctx context.Context, frame []byte) error {
 	t.mu.Lock()
-	t.queue = append(t.queue, frames...)
+	defer t.mu.Unlock()
+	stop := context.AfterFunc(ctx, func() { t.mu.Lock(); t.cond.Broadcast(); t.mu.Unlock() })
+	defer stop()
+	for len(t.queue) >= 100 && !t.closed && ctx.Err() == nil {
+		t.cond.Wait()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t.closed {
+		return io.ErrClosedPipe
+	}
+	t.queue = append(t.queue, frame)
+	return nil
+}
+
+func (t *talkbackSender) clearPending() {
+	t.mu.Lock()
+	t.queue = nil
+	t.pcmIn = nil
+	t.cond.Broadcast()
 	t.mu.Unlock()
 }
 
-// waitDrained blocks until every queued frame has been paced onto the track, the
-// sender is closed, or ctx is cancelled.
 func (t *talkbackSender) waitDrained(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
-		t.mu.Lock()
-		for len(t.queue) > 0 && !t.closed && ctx.Err() == nil {
-			t.cond.Wait()
-		}
-		t.mu.Unlock()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return ctx.Err()
-	case <-ctx.Done():
-		t.mu.Lock()
-		t.cond.Broadcast()
-		t.mu.Unlock()
-		<-done
-		return ctx.Err()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stop := context.AfterFunc(ctx, func() { t.mu.Lock(); t.cond.Broadcast(); t.mu.Unlock() })
+	defer stop()
+	for (len(t.queue) > 0 || t.inFlight) && !t.closed && ctx.Err() == nil {
+		t.cond.Wait()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t.closed {
+		return io.ErrClosedPipe
+	}
+	return nil
 }
 
 // close clears the go2rtc route (releasing the doorbell backchannel) and tears
 // down the producer PeerConnection.
 func (t *talkbackSender) close() {
-	if clearURL, err := streamsURL(t.apiBaseURL, t.dstStream, ""); err == nil {
-		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = postStreams(cctx, clearURL)
-		cancel()
-	}
-	if t.pc != nil {
-		_ = t.pc.Close()
-	}
+	t.closeOnce.Do(func() {
+		t.mu.Lock()
+		t.closed = true
+		t.queue = nil
+		t.cond.Broadcast()
+		t.mu.Unlock()
+		if t.pc != nil {
+			_ = t.pc.Close()
+		}
+		<-t.done
+		if clearURL, err := streamsURL(t.apiBaseURL, t.dstStream, ""); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = postStreams(ctx, clearURL)
+			cancel()
+		}
+	})
 }
 
 // --- go2rtc HTTP control plane helpers (mirrors pocwebrtc) ---

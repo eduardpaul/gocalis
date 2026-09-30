@@ -15,7 +15,7 @@ type sliceSource struct {
 
 func (s *sliceSource) SampleRate() int { return s.sampleRate }
 
-func (s *sliceSource) ReadPCM16(chunkSize int) ([]int16, error) {
+func (s *sliceSource) ReadPCM16(ctx context.Context, chunkSize int) ([]int16, error) {
 	if s.offset >= len(s.samples) {
 		return nil, io.EOF
 	}

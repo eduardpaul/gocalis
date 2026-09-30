@@ -3,6 +3,7 @@ package brain
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -17,11 +18,12 @@ import (
 // queued broadcast (default priority) while a plain speak simply waits its turn
 // instead of being dropped or cutting in.
 type nodeQueue struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-	pq   waiterPQ
-	seq  uint64
-	busy bool
+	mu     sync.Mutex
+	cond   *sync.Cond
+	pq     waiterPQ
+	seq    uint64
+	busy   bool
+	closed bool
 }
 
 func newNodeQueue() *nodeQueue {
@@ -35,33 +37,38 @@ func newNodeQueue() *nodeQueue {
 // to the next waiter. On cancellation it returns ctx.Err() and a nil release.
 func (q *nodeQueue) acquire(ctx context.Context, priority int) (func(), error) {
 	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return nil, errors.New("node is closed")
+	}
+	if len(q.pq) >= 32 {
+		q.mu.Unlock()
+		return nil, errors.New("node turn queue is full")
+	}
 
 	w := &waiter{priority: priority, seq: q.seq}
 	q.seq++
 	heap.Push(&q.pq, w)
 
-	// cond.Wait cannot select on ctx, so a tiny watcher wakes the loop if ctx is
-	// cancelled while this waiter is still parked. stop tears it down on return.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			q.mu.Lock()
-			w.canceled = true
-			q.cond.Broadcast()
-			q.mu.Unlock()
-		case <-stop:
-		}
-	}()
+	// Wake parked waiters without a watcher goroutine per queued turn.
+	stop := context.AfterFunc(ctx, func() {
+		q.mu.Lock()
+		q.cond.Broadcast()
+		q.mu.Unlock()
+	})
+	defer stop()
 
 	for {
-		if w.canceled {
+		if err := ctx.Err(); err != nil || q.closed {
+			if err == nil {
+				err = errors.New("node is closed")
+			}
 			if w.index >= 0 {
 				heap.Remove(&q.pq, w.index)
+				q.cond.Broadcast()
 			}
 			q.mu.Unlock()
-			return nil, ctx.Err()
+			return nil, err
 		}
 		if !q.busy && q.pq.Len() > 0 && q.pq[0] == w {
 			heap.Pop(&q.pq)
@@ -87,7 +94,6 @@ type waiter struct {
 	priority int
 	seq      uint64
 	index    int
-	canceled bool
 }
 
 // waiterPQ is a max-priority heap (highest priority first, FIFO on ties).
@@ -122,4 +128,11 @@ func (pq *waiterPQ) Pop() any {
 	w.index = -1
 	*pq = old[:n-1]
 	return w
+}
+
+func (q *nodeQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.cond.Broadcast()
+	q.mu.Unlock()
 }

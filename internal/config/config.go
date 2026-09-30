@@ -1,7 +1,14 @@
 package config
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"math"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,7 +24,7 @@ type Config struct {
 
 // SecurityConfig holds transport hardening settings for the HTTP/WebSocket APIs.
 type SecurityConfig struct {
-	// AuthToken, when non-empty, is required on control endpoints (via
+	// AuthToken, when non-empty, is required on controls and event sockets (via
 	// "Authorization: Bearer <token>", "X-Auth-Token: <token>" header, or a
 	// "token" query parameter). When empty, control endpoints are unauthenticated.
 	AuthToken string `yaml:"auth_token"`
@@ -45,9 +52,11 @@ type VADConfig struct {
 
 // ASRConfig contains global Speech-to-Text configurations.
 type ASRConfig struct {
-	Encoder string `yaml:"encoder"`
-	Decoder string `yaml:"decoder"`
-	Tokens  string `yaml:"tokens"`
+	Engine   string `yaml:"engine"` // whisper or moonshine (merged decoder)
+	Language string `yaml:"language"`
+	Encoder  string `yaml:"encoder"`
+	Decoder  string `yaml:"decoder"`
+	Tokens   string `yaml:"tokens"`
 }
 
 // SpeakerIDConfig contains speaker identification and challenge configurations.
@@ -57,7 +66,7 @@ type SpeakerIDConfig struct {
 	MinAudioDurationSeconds float32  `yaml:"min_audio_duration_seconds"`
 	ConfidenceThreshold     float32  `yaml:"confidence_threshold"`
 	ChallengeFailedPrompt   string   `yaml:"challenge_failed_prompt"`
-	ChallengeInitPrompt     string   `yaml:"challenge_init_promt"`
+	ChallengeInitPrompt     string   `yaml:"challenge_init_prompt"`
 	ChallengePrompts        []string `yaml:"challenge_prompts"`
 }
 
@@ -77,6 +86,9 @@ type MQTTConfig struct {
 type TTSConfig struct {
 	Engine   string `yaml:"engine"`
 	ModelDir string `yaml:"model_dir"`
+	Model    string `yaml:"model"`
+	Tokens   string `yaml:"tokens"`
+	DataDir  string `yaml:"data_dir"`
 	// Generation parameters applied to every synthesized utterance.
 	// Sid selects the voice/speaker id, NumSteps controls the diffusion steps
 	// (Supertonic), Speed scales the utterance duration (1.0 = normal) and Lang
@@ -109,17 +121,13 @@ type AudioConfig struct {
 	InputDeviceIndex  string  `yaml:"input_device_index"`
 	OutputDeviceIndex string  `yaml:"output_device_index"`
 	SampleRate        int     `yaml:"sample_rate"`
-	Channels          int     `yaml:"channels"`
-	ChunkSize         int     `yaml:"chunk_size"`
 	Gain              float32 `yaml:"gain"`
 }
 
 // RTCStreamConfig holds settings for WebRTC connections.
 type RTCStreamConfig struct {
-	RtspURL      string  `yaml:"rtsp_url"`
 	ApiURL       string  `yaml:"api_url"`
 	StreamName   string  `yaml:"stream_name"`
-	Codec        string  `yaml:"codec"`
 	OutputGainDb float32 `yaml:"output_gain_db"`
 
 	// TalkbackStream, when set, routes outbound TTS to a HomeKit doorbell
@@ -195,14 +203,18 @@ func LoadConfig(filePath string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, err
 	}
 
-	if cfg.GlobalNumThreads <= 0 {
-		cfg.GlobalNumThreads = 4
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("configuration must contain one YAML document")
 	}
-
+	if err := cfg.normalizeAndValidate(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
@@ -210,14 +222,6 @@ func LoadConfig(filePath string) (*Config, error) {
 func (n *NodeConfig) GetKWSNumThreads(defaultVal int) int {
 	if n.KWS.NumThreads > 0 {
 		return n.KWS.NumThreads
-	}
-	return defaultVal
-}
-
-// GetKWSThreshold returns the node-specific KWS threshold, falling back to a default value if not specified (0).
-func (n *NodeConfig) GetKWSThreshold(defaultVal float32) float32 {
-	if n.KWS.Threshold > 0 {
-		return n.KWS.Threshold
 	}
 	return defaultVal
 }
@@ -231,14 +235,10 @@ func (n *NodeConfig) GetAutoAskTimeoutSeconds(defaultVal float64) float64 {
 	return defaultVal
 }
 
-// GetAutoAskCaptureDelaySeconds returns the node-specific delay before capture
-// starts after the wake reply, falling back to defaultVal when not specified
-// (<0). A value of 0 is honored (no delay) so full-duplex nodes can opt out.
+// GetAutoAskCaptureDelaySeconds returns the normalized capture delay.
+// Zero disables the delay; negative values select the supplied default.
 func (n *NodeConfig) GetAutoAskCaptureDelaySeconds(defaultVal float64) float64 {
 	if n.KWS.AutoAskCaptureDelaySeconds < 0 {
-		return defaultVal
-	}
-	if n.KWS.AutoAskCaptureDelaySeconds == 0 {
 		return defaultVal
 	}
 	return n.KWS.AutoAskCaptureDelaySeconds
@@ -252,4 +252,201 @@ func (n *NodeConfig) GetPostSpeechSilenceSeconds(defaultVal float64) float64 {
 		return n.KWS.PostSpeechSilenceSeconds
 	}
 	return defaultVal
+}
+
+func (c *Config) normalizeAndValidate() error {
+	if c.GlobalNumThreads == 0 {
+		c.GlobalNumThreads = 4
+	}
+	if c.GlobalNumThreads < 1 || c.GlobalNumThreads > 256 {
+		return fmt.Errorf("global_num_threads must be in [1,256]")
+	}
+	if c.Models.ASR.Engine != "whisper" && c.Models.ASR.Engine != "moonshine" {
+		return fmt.Errorf("models.asr.engine must be whisper or moonshine")
+	}
+	if c.Models.ASR.Language == "" {
+		c.Models.ASR.Language = "es"
+	}
+	if c.Models.TTS.Engine != "vits" && c.Models.TTS.Engine != "supertonic" {
+		return fmt.Errorf("models.tts.engine must be vits or supertonic")
+	}
+	paths := map[string]string{"models.asr.encoder": c.Models.ASR.Encoder, "models.asr.decoder": c.Models.ASR.Decoder, "models.asr.tokens": c.Models.ASR.Tokens, "models.vad.silero_onnx_path": c.Models.VAD.SileroOnnxPath, "models.speaker_id.model": c.Models.SpeakerID.Model}
+	if c.Models.TTS.Engine == "supertonic" {
+		paths["models.tts.model_dir"] = c.Models.TTS.ModelDir
+	} else {
+		paths["models.tts.model"] = c.Models.TTS.Model
+		paths["models.tts.tokens"] = c.Models.TTS.Tokens
+		paths["models.tts.data_dir"] = c.Models.TTS.DataDir
+	}
+	for name, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+	}
+	if c.Models.VAD.Threshold == 0 {
+		c.Models.VAD.Threshold = 0.5
+	}
+	if !validNumber(float64(c.Models.VAD.Threshold), 0.01, 1) {
+		return fmt.Errorf("VAD threshold must be in (0,1]")
+	}
+	if c.Models.VAD.MinSilenceDurationMs == 0 {
+		c.Models.VAD.MinSilenceDurationMs = 700
+	}
+	if c.Models.VAD.MinSilenceDurationMs < 1 || c.Models.VAD.MinSilenceDurationMs > 20000 {
+		return fmt.Errorf("VAD silence duration must be in [1,20000] ms")
+	}
+	if !validNumber(float64(c.Models.SpeakerID.ConfidenceThreshold), 0, 1) || !validNumber(float64(c.Models.SpeakerID.MinAudioDurationSeconds), 0, 120) {
+		return fmt.Errorf("invalid speaker confidence or duration")
+	}
+	if c.Models.TTS.Speed == 0 {
+		c.Models.TTS.Speed = 1
+	}
+	if !validNumber(float64(c.Models.TTS.Speed), 0.1, 10) || c.Models.TTS.Sid < 0 || c.Models.TTS.NumSteps < 0 || c.Models.TTS.NumSteps > 100 {
+		return fmt.Errorf("invalid TTS speed, speaker or step count")
+	}
+	if c.Models.TTS.CacheConfig.Enabled && c.Models.TTS.CacheConfig.Dir == "" {
+		return fmt.Errorf("TTS cache directory is required when caching is enabled")
+	}
+	for _, text := range append(append([]string{}, c.Models.TTS.CacheConfig.PreGenerate...), c.Models.SpeakerID.ChallengePrompts...) {
+		if len(text) > 4000 {
+			return fmt.Errorf("configured phrase exceeds 4000 bytes")
+		}
+	}
+	if c.MQTT.QoS < 0 || c.MQTT.QoS > 2 {
+		return fmt.Errorf("mqtt.qos must be in [0,2]")
+	}
+	if c.MQTT.Enabled {
+		u, err := url.Parse(c.MQTT.Broker)
+		if err != nil || u.Host == "" || (u.Scheme != "tcp" && u.Scheme != "ssl" && u.Scheme != "ws" && u.Scheme != "wss") {
+			return fmt.Errorf("invalid MQTT broker URL")
+		}
+	}
+	ids := make(map[string]bool)
+	for i := range c.Nodes {
+		n := &c.Nodes[i]
+		if strings.TrimSpace(n.NodeID) == "" || n.NodeID == "all" || ids[n.NodeID] {
+			return fmt.Errorf("node IDs must be unique, nonempty and cannot be all: %q", n.NodeID)
+		}
+		ids[n.NodeID] = true
+		if n.Type != "local" && n.Type != "rtc_stream" {
+			return fmt.Errorf("unsupported node type %q", n.Type)
+		}
+		if n.Type == "local" {
+			if n.Audio.SampleRate == 0 {
+				n.Audio.SampleRate = 16000
+			}
+			if n.Audio.SampleRate != 16000 {
+				return fmt.Errorf("node %s: capture sample_rate must be 16000", n.NodeID)
+			}
+			if n.Audio.Gain == 0 {
+				n.Audio.Gain = 1
+			}
+			if !validNumber(float64(n.Audio.Gain), 0.01, 100) {
+				return fmt.Errorf("node %s: invalid capture gain", n.NodeID)
+			}
+		} else {
+			u, err := url.Parse(n.RTCStream.ApiURL)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" {
+				return fmt.Errorf("node %s: invalid go2rtc API URL", n.NodeID)
+			}
+			if n.RTCStream.StreamName == "" {
+				return fmt.Errorf("node %s: stream_name is required", n.NodeID)
+			}
+		}
+		if !validNumber(float64(n.RTCStream.OutputGainDb), -60, 30) {
+			return fmt.Errorf("node %s: invalid output gain", n.NodeID)
+		}
+		if n.KWS.Enabled {
+			if n.KWS.Encoder == "" || n.KWS.Decoder == "" || n.KWS.Joiner == "" || n.KWS.Tokens == "" || n.KWS.KeywordsFile == "" {
+				return fmt.Errorf("node %s: all KWS model paths are required", n.NodeID)
+			}
+			if n.KWS.Threshold == 0 {
+				n.KWS.Threshold = 0.25
+			}
+			if !validNumber(float64(n.KWS.Threshold), 0.01, 1) {
+				return fmt.Errorf("node %s: invalid KWS threshold", n.NodeID)
+			}
+		}
+		if n.KWS.NumThreads < 0 || n.KWS.NumThreads > c.GlobalNumThreads {
+			return fmt.Errorf("node %s: KWS threads exceed global thread budget", n.NodeID)
+		}
+		if !validNumber(n.KWS.AutoAskTimeoutSeconds, 0, 120) || !validNumber(n.KWS.PostSpeechSilenceSeconds, 0, 20) || !validNumber(n.KWS.AutoAskCaptureDelaySeconds, -1, 20) {
+			return fmt.Errorf("node %s: invalid ask duration", n.NodeID)
+		}
+		for _, text := range n.KWS.WakeResponses {
+			if len(text) > 4000 {
+				return fmt.Errorf("node %s: wake response exceeds 4000 bytes", n.NodeID)
+			}
+		}
+	}
+	return nil
+}
+
+func validNumber(value, lo, hi float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= lo && value <= hi
+}
+
+// ValidateModelFiles checks paths before entering native model constructors.
+func (c *Config) ValidateModelFiles(mode, nodeID string) error {
+	files := []string{}
+	dirs := []string{}
+	asr, tts, speaker, vad, kws := false, false, false, false, false
+	switch mode {
+	case "webrtc":
+		asr, tts, speaker, vad, kws = true, true, true, true, true
+	case "demo":
+		asr, tts, speaker = true, true, true
+	case "asr-file":
+		asr = true
+	case "wake-file":
+		kws = true
+	case "wake-file-vad":
+		kws, vad = true, true
+	case "rtc-say":
+		tts = true
+	case "rtc-record", "rtc-loopback":
+	default:
+		return fmt.Errorf("unsupported channel mode %q", mode)
+	}
+	if asr {
+		files = append(files, c.Models.ASR.Encoder, c.Models.ASR.Decoder, c.Models.ASR.Tokens)
+	}
+	if speaker {
+		files = append(files, c.Models.SpeakerID.Model)
+	}
+	if vad {
+		files = append(files, c.Models.VAD.SileroOnnxPath)
+	}
+	if tts && c.Models.TTS.Engine == "supertonic" {
+		for _, name := range []string{"duration_predictor.int8.onnx", "text_encoder.int8.onnx", "vector_estimator.int8.onnx", "vocoder.int8.onnx", "tts.json", "unicode_indexer.bin", "voice.bin"} {
+			files = append(files, filepath.Join(c.Models.TTS.ModelDir, name))
+		}
+	} else if tts {
+		files = append(files, c.Models.TTS.Model, c.Models.TTS.Tokens)
+		dirs = append(dirs, c.Models.TTS.DataDir)
+	}
+	for _, n := range c.Nodes {
+		if kws && n.KWS.Enabled && (mode == "webrtc" || n.NodeID == nodeID) {
+			files = append(files, n.KWS.Encoder, n.KWS.Decoder, n.KWS.Joiner, n.KWS.Tokens, n.KWS.KeywordsFile)
+		}
+	}
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("model file %s: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("model path %s must be a regular file", path)
+		}
+	}
+	for _, path := range dirs {
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("model path %s must be a directory", path)
+		}
+	}
+	return nil
 }

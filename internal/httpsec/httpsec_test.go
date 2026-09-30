@@ -3,6 +3,7 @@ package httpsec
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -127,4 +128,26 @@ func TestRequireToken(t *testing.T) {
 			t.Fatalf("status = %d, want 200", rec.Code)
 		}
 	})
+}
+
+func TestDecodeJSONRejectsInvalidAndOversizedPayloads(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		code int
+	}{
+		{`{"text":"ok"}`, 200},
+		{`{"unknown":true}`, 400},
+		{`{"text":"ok"} {}`, 400},
+		{`{"text":"` + strings.Repeat("x", MaxBodyBytes) + `"}`, 413},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+		var value struct {
+			Text string `json:"text"`
+		}
+		DecodeJSON(w, r, &value)
+		if w.Code != tc.code {
+			t.Fatalf("response code = %d, want %d", w.Code, tc.code)
+		}
+	}
 }

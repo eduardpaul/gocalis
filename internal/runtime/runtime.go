@@ -9,8 +9,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"gocalis/internal/taskgroup"
 	"log"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"gocalis/internal/ai"
@@ -35,8 +38,6 @@ type AudioNodeFactory func(cfg webrtc.Config) (audionode.AudioNode, error)
 type NodeRuntime struct {
 	node    config.NodeConfig
 	global  *config.Config
-	asr     ai.Transcriber
-	speaker ai.SpeakerIdentifier
 	events  protocol.EventPublisher
 	brain   *brain.Brain
 	ask     *ask.Engine
@@ -49,8 +50,6 @@ type NodeRuntime struct {
 func New(
 	nodeCfg config.NodeConfig,
 	global *config.Config,
-	asr ai.Transcriber,
-	speaker ai.SpeakerIdentifier,
 	events protocol.EventPublisher,
 	b *brain.Brain,
 	askEngine *ask.Engine,
@@ -59,8 +58,6 @@ func New(
 	return &NodeRuntime{
 		node:    nodeCfg,
 		global:  global,
-		asr:     asr,
-		speaker: speaker,
 		events:  events,
 		brain:   b,
 		ask:     askEngine,
@@ -82,7 +79,13 @@ func signalingURL(apiURL, streamName string) (string, error) {
 	if u.Scheme == "https" {
 		scheme = "wss"
 	}
-	return scheme + "://" + u.Host + "/api/ws?src=" + streamName, nil
+	if u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("invalid go2rtc URL")
+	}
+	u.Scheme = scheme
+	u.Path = strings.TrimRight(u.Path, "/") + "/api/ws"
+	u.RawQuery = url.Values{"src": {streamName}}.Encode()
+	return u.String(), nil
 }
 
 // Run manages the life-cycle, signaling, ASR, TTS, and state transitions for the
@@ -90,6 +93,9 @@ func signalingURL(apiURL, streamName string) (string, error) {
 func (r *NodeRuntime) Run(ctx context.Context) {
 	nodeCfg := r.node
 	pNode := node.NewPhysicalNode(nodeCfg.NodeID, nodeCfg.Type)
+	defer pNode.Close()
+	wakeTasks := taskgroup.New(ctx, 1)
+	var wakePending atomic.Bool
 
 	// Broadcast PhysicalNode state changes to all transports.
 	pNode.OnStateChanged(func(oldState, newState node.NodeState) {
@@ -137,9 +143,11 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		Debug:      0,
 	}
 	vadGate := sherpa.NewVoiceActivityDetector(&vadConfig, 10.0)
-	if vadGate != nil {
-		defer sherpa.DeleteVoiceActivityDetector(vadGate)
+	if vadGate == nil {
+		log.Printf("[Node:%s] Failed to initialize VAD", nodeCfg.NodeID)
+		return
 	}
+	defer sherpa.DeleteVoiceActivityDetector(vadGate)
 
 	// Initialize Wake Word Detector (Sherpa-ONNX streaming KWS from config)
 	log.Printf("[Node:%s] Loading Wake Word Detector (model: %s, keywords: %s)...\n", nodeCfg.NodeID, nodeCfg.KWS.Encoder, nodeCfg.KWS.KeywordsFile)
@@ -164,7 +172,14 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			return
 		}
 	}
-	defer audioNode.Close()
+	var wakeStream ai.WakeStream
+	defer func() {
+		wakeTasks.Close()
+		_ = audioNode.Close()
+		if wakeStream != nil {
+			wakeStream.Close()
+		}
+	}()
 
 	// Register this active connection with the central brain orchestrator.
 	handle := &brain.NodeHandle{
@@ -176,130 +191,122 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	defer r.brain.UnregisterNode(nodeCfg.NodeID)
 
 	// Create wake word audio stream
-	wakeStream, err := wakeDetector.CreateStream(func(keyword string) {
-		log.Printf("[Node:%s] [WAKE WORD DETECTED] Match found: '%s'!\n", nodeCfg.NodeID, keyword)
-
-		// Trigger Spanish TTS Reply over the WebRTC talkback backchannel. When no
-		// wake_responses are configured, there is no spoken reply: the ask flow below
-		// still plays the listening chime, and the empty TTS pipeline is never run.
-		replyText := ""
-		if len(nodeCfg.KWS.WakeResponses) > 0 {
-			replyText = nodeCfg.KWS.WakeResponses[0]
+	wakeStream, err = wakeDetector.CreateStream(func(keyword string) {
+		wakeCtx, finish, err := wakeTasks.Start(ctx)
+		if err != nil {
+			return
 		}
+		if pNode.GetState() != node.StateIdle {
+			finish()
+			return
+		}
+		if !wakePending.CompareAndSwap(false, true) {
+			finish()
+			return
+		}
+		go func() {
+			defer finish()
+			defer wakePending.Store(false)
+			log.Printf("[Node:%s] [WAKE WORD DETECTED] Match found: '%s'!\n", nodeCfg.NodeID, keyword)
 
-		// When AutoAsk is configured, drive the wake reply THROUGH the ask flow so
-		// that capture only begins once the prompt has finished playing (or, when
-		// barge-in is enabled, once the user interrupts it). This makes the next
-		// VAD-detected speech transition the node into listening, instead of racing
-		// a fixed window against playback+jitter latency.
-		//
-		// A SINGLE combined "wake" event is raised per trigger: without AutoAsk it
-		// carries only the device; with AutoAsk it is deferred until the ASR turn
-		// completes and additionally carries the transcription, speaker, and an
-		// optional base64 WAV recording.
-		if nodeCfg.KWS.AutoAsk {
-			// Leave IDLE synchronously so wake detection pauses immediately (no
-			// re-fire on the follow-up speech) and, in half-duplex, the mic is
-			// gated while the prompt plays. Start in the SAME state the ask flow
-			// will use so no spurious transition is emitted — SetState dedups the
-			// repeat. This yields a clean stream:
-			//   with a reply: idle -> speaking -> listening -> processing -> idle
-			//   no reply:     idle -> listening -> processing -> idle
-			if replyText != "" {
-				pNode.SetState(node.StateSpeaking)
-			} else {
-				pNode.SetState(node.StateListening)
+			// Trigger Spanish TTS Reply over the WebRTC talkback backchannel. When no
+			// wake_responses are configured, there is no spoken reply: the ask flow below
+			// still plays the listening chime, and the empty TTS pipeline is never run.
+			replyText := ""
+			if len(nodeCfg.KWS.WakeResponses) > 0 {
+				replyText = nodeCfg.KWS.WakeResponses[0]
 			}
-			go func() {
-				log.Printf("[Node:%s] AutoAsk: playing wake reply then listening for the next speech...\n", nodeCfg.NodeID)
-				result := r.ask.Run(ctx, ask.Config{
-					ContextID:           "autoask-" + nodeCfg.NodeID,
-					NodeID:              nodeCfg.NodeID,
-					TTSText:             replyText,
-					BargeIn:             nodeCfg.KWS.AutoAskBargeIn,
-					VADTimeoutSeconds:   nodeCfg.GetAutoAskTimeoutSeconds(10),
-					CaptureDelaySeconds: nodeCfg.GetAutoAskCaptureDelaySeconds(1.5),
-					Priority:            10,
-				})
 
-				event := protocol.Response{
-					Event:     "wake",
-					NodeID:    nodeCfg.NodeID,
-					Keyword:   keyword,
-					AutoAsk:   true,
-					Status:    result.Status,
-					Text:      result.Transcription,
-					Speaker:   result.Speaker,
-					Timestamp: time.Now().Unix(),
-				}
+			// When AutoAsk is configured, drive the wake reply THROUGH the ask flow so
+			// that capture only begins once the prompt has finished playing (or, when
+			// barge-in is enabled, once the user interrupts it). This makes the next
+			// VAD-detected speech transition the node into listening, instead of racing
+			// a fixed window against playback+jitter latency.
+			//
+			// A SINGLE combined "wake" event is raised per trigger: without AutoAsk it
+			// carries only the device; with AutoAsk it is deferred until the ASR turn
+			// completes and additionally carries the transcription, speaker, and an
+			// optional base64 WAV recording.
+			if nodeCfg.KWS.AutoAsk {
+				func() {
+					log.Printf("[Node:%s] AutoAsk: playing wake reply then listening for the next speech...\n", nodeCfg.NodeID)
+					result := r.ask.Run(wakeCtx, ask.Config{
+						ContextID:           "autoask-" + nodeCfg.NodeID,
+						NodeID:              nodeCfg.NodeID,
+						TTSText:             replyText,
+						BargeIn:             nodeCfg.KWS.AutoAskBargeIn,
+						VADTimeoutSeconds:   nodeCfg.GetAutoAskTimeoutSeconds(10),
+						CaptureDelaySeconds: nodeCfg.GetAutoAskCaptureDelaySeconds(1.5),
+						Priority:            nodeCfg.KWS.Priority,
+					})
 
-				switch result.Status {
-				case "success":
-					log.Printf("[Node:%s] AutoAsk Result: \"%s\"\n", nodeCfg.NodeID, result.Transcription)
-					if nodeCfg.KWS.AutoAskRecord && len(result.Audio) > 0 {
-						sr := result.SampleRate
-						if sr <= 0 {
-							sr = 16000
-						}
-						event.Recording = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, sr))
-						event.SampleRate = sr
+					event := protocol.Response{
+						Event:     "wake",
+						NodeID:    nodeCfg.NodeID,
+						Keyword:   keyword,
+						AutoAsk:   true,
+						Status:    result.Status,
+						Text:      result.Transcription,
+						Speaker:   result.Speaker,
+						Timestamp: time.Now().Unix(),
 					}
-				case "silence_timeout":
-					log.Printf("[Node:%s] AutoAsk: No speech captured (silence).\n", nodeCfg.NodeID)
-				default:
-					log.Printf("[Node:%s] AutoAsk: session ended with status '%s' (%s)\n", nodeCfg.NodeID, result.Status, result.ErrorMessage)
-				}
 
-				r.events.Publish(event)
-			}()
-			return
-		}
+					switch result.Status {
+					case "success":
+						log.Printf("[Node:%s] AutoAsk Result: \"%s\"\n", nodeCfg.NodeID, result.Transcription)
+						if nodeCfg.KWS.AutoAskRecord && len(result.Audio) > 0 {
+							sr := result.SampleRate
+							if sr <= 0 {
+								sr = 16000
+							}
+							event.Recording = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, sr))
+							event.SampleRate = sr
+						}
+					case "silence_timeout":
+						log.Printf("[Node:%s] AutoAsk: No speech captured (silence).\n", nodeCfg.NodeID)
+					default:
+						log.Printf("[Node:%s] AutoAsk: session ended with status '%s' (%s)\n", nodeCfg.NodeID, result.Status, result.ErrorMessage)
+					}
 
-		// No AutoAsk: raise the device-only wake event, then optionally play the reply.
-		pNode.SetState(node.StateListening)
-		r.events.Publish(protocol.Response{
-			Event:     "wake",
-			NodeID:    pNode.NodeID,
-			Keyword:   keyword,
-			Timestamp: time.Now().Unix(),
-		})
+					r.events.Publish(event)
+				}()
+				return
+			}
 
-		if replyText == "" {
-			return
-		}
-		log.Printf("[Node:%s] TTS: Routing wake reply through brain: \"%s\"\n", nodeCfg.NodeID, replyText)
-		if err := r.brain.Speak(ctx, nodeCfg.NodeID, replyText, 10); err != nil {
-			log.Printf("[Node:%s] TTS: Failed to play wake reply: %v\n", nodeCfg.NodeID, err)
-		}
+			// No AutoAsk: raise the device-only wake event, then optionally play the reply.
+			r.events.Publish(protocol.Response{
+				Event:     "wake",
+				NodeID:    pNode.NodeID,
+				Keyword:   keyword,
+				Timestamp: time.Now().Unix(),
+			})
+
+			if replyText == "" {
+				return
+			}
+			log.Printf("[Node:%s] TTS: Routing wake reply through brain: \"%s\"\n", nodeCfg.NodeID, replyText)
+			if err := r.brain.Speak(wakeCtx, nodeCfg.NodeID, replyText, nodeCfg.KWS.Priority); err != nil {
+				log.Printf("[Node:%s] TTS: Failed to play wake reply: %v\n", nodeCfg.NodeID, err)
+			}
+		}()
 	})
 	if err != nil {
 		log.Printf("[Node:%s] Failed to create Wake Word Stream: %v\n", nodeCfg.NodeID, err)
 		return
 	}
-	defer wakeStream.Close()
-
-
 
 	// Subscribe incoming audio: wake word runs on the continuous stream while
 	// speaker ID and ask/capture are routed through the VAD Gate.
 	halfDuplex := !nodeCfg.RTCStream.EchoCancellation
-	var dbgCalls, dbgDrops, dbgSegs, dbgSamples int64
 	wakeActive := false // whether the wake stream is currently being fed (node IDLE)
 	audioNode.OnAudio(func(samples []float32) {
-		dbgCalls++
-		dbgSamples += int64(len(samples))
 		state := pNode.GetState()
-		if dbgCalls == 1 || dbgCalls%200 == 0 {
-			log.Printf("[Node:%s] DBG audio call#%d state=%s totalSamples=%d drops=%d segs=%d",
-				nodeCfg.NodeID, dbgCalls, state, dbgSamples, dbgDrops, dbgSegs)
-		}
 		// Half-duplex gate: while the node is playing its own TTS, the microphone
 		// picks up that audio. Without acoustic echo cancellation, feeding it to the
 		// wake/speaker/barge-in/capture paths causes self-wake and self-barge-in.
 		// Drop incoming audio while SPEAKING unless the device declares echo
 		// cancellation (rtc_stream.echo_cancellation: true).
 		if halfDuplex && state == node.StateSpeaking {
-			dbgDrops++
 			return
 		}
 
@@ -317,7 +324,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		// overlapping AutoAsk sessions that abort each other (empty ASR results). On
 		// the transition back to IDLE the stream is reset so stale audio buffered
 		// during the previous turn cannot immediately re-trigger the wake word.
-		if state == node.StateIdle {
+		if state == node.StateIdle && !wakePending.Load() {
 			if !wakeActive {
 				wakeStream.Reset()
 				wakeActive = true
@@ -327,22 +334,16 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			wakeActive = false
 		}
 
-		if vadGate != nil {
-			vadGate.AcceptWaveform(samples)
-			for !vadGate.IsEmpty() {
-				segment := vadGate.Front()
-				dbgSegs++
-				log.Printf("[Node:%s] DBG VAD segment #%d -> speaker/ask (%d samples)", nodeCfg.NodeID, dbgSegs, len(segment.Samples))
+		vadGate.AcceptWaveform(samples)
+		for !vadGate.IsEmpty() {
+			segment := vadGate.Front()
 
-				// Fan the segment out to any active /ask or AutoAsk sessions
-				// (barge-in signaling + capture) on this node.
-				r.brain.FeedAudio(nodeCfg.NodeID, segment.Samples)
-				vadGate.Pop()
-			}
-		} else {
-			// Fan raw audio out to active sessions when VAD is unavailable.
-			r.brain.FeedAudio(nodeCfg.NodeID, samples)
+			// Fan the segment out to any active /ask or AutoAsk sessions
+			// (barge-in signaling + capture) on this node.
+			r.brain.FeedAudio(nodeCfg.NodeID, segment.Samples)
+			vadGate.Pop()
 		}
+
 	})
 
 	// Connect to the transport.

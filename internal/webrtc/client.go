@@ -18,6 +18,7 @@ import (
 
 	"gocalis/internal/audio"
 	"gocalis/internal/audionode"
+	"gocalis/internal/taskgroup"
 )
 
 // Client satisfies the audionode.AudioNode port.
@@ -53,6 +54,14 @@ type WSMessage struct {
 
 // Client represents the WebRTC client connection to go2rtc.
 type Client struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
+	tasks        *taskgroup.Group
+	closeOnce    sync.Once
+	closeErr     error
+	callbackMu   sync.Mutex
+	signalMu     sync.Mutex
+	signalConn   *websocket.Conn
 	signalingURL string
 	sendCodec    string // "pcmu" | "opus" | "opus-sendonly"
 	pc           *webrtc.PeerConnection
@@ -187,7 +196,9 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	client := &Client{
+		ctx: ctx, cancel: cancel, tasks: taskgroup.New(ctx, 32),
 		signalingURL:   cfg.SignalingURL,
 		sendCodec:      sendCodec,
 		pc:             pc,
@@ -232,7 +243,7 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 	// Register remote track reader
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("[WebRTC] Received remote track: MimeType=%s, PayloadType=%d\n", track.Codec().MimeType, track.PayloadType())
-		go client.readRemoteTrack(track)
+		_ = client.tasks.Go(func(context.Context) { client.readRemoteTrack(track) })
 	})
 
 	return client, nil
@@ -247,6 +258,11 @@ func (c *Client) OnAudio(callback func(samples []float32)) {
 
 // Connect establishes the WebSocket signaling connection and completes the SDP handshake.
 func (c *Client) Connect(ctx context.Context) error {
+	ctx, finish, err := c.tasks.Start(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	u, err := url.Parse(c.signalingURL)
 	if err != nil {
 		return err
@@ -258,9 +274,16 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
+	c.signalMu.Lock()
+	if c.signalConn != nil {
+		_ = c.signalConn.Close()
+	}
+	c.signalConn = wsConn
+	c.signalMu.Unlock()
 	writeWS := func(msgType int, data []byte) error {
 		c.wsWriteMutex.Lock()
 		defer c.wsWriteMutex.Unlock()
+		_ = wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		return wsConn.WriteMessage(msgType, data)
 	}
 
@@ -313,8 +336,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
-	// Read SDP Answer and start candidate loop
-	go func() {
+	// Read SDP Answer and start candidate loop. Its lifetime belongs to the client.
+	if err := c.tasks.Go(func(lifetime context.Context) {
+		stop := context.AfterFunc(lifetime, func() { _ = wsConn.Close() })
+		defer stop()
 		defer wsConn.Close()
 		for {
 			_, message, err := wsConn.ReadMessage()
@@ -359,13 +384,16 @@ func (c *Client) Connect(ctx context.Context) error {
 				log.Printf("[Signaling] UNHANDLED type=%q value=%v", wsMsg.Type, wsMsg.Value)
 			}
 		}
-	}()
+	}); err != nil {
+		_ = wsConn.Close()
+		return err
+	}
 
 	// Warm up the talkback backchannel now (WHIP producer + AAC-ELD route +
 	// continuous silence feed) so the first spoken utterance is not clipped by
 	// ffmpeg/route spin-up latency. Best-effort: failures are retried on Play.
 	if c.talkbackEnabled() {
-		if _, err := c.ensureTalkback(); err != nil {
+		if _, err := c.ensureTalkback(ctx); err != nil {
 			log.Printf("[Talkback] warm-up deferred: %v", err)
 		}
 	}
@@ -375,49 +403,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // Play plays out PCM16 samples over the WebRTC backchannel, executing a warmup silence pre-roll.
 func (c *Client) Play(ctx context.Context, pcm16 []int16, sourceSampleRate int) error {
-	if c.talkbackEnabled() {
-		tb, err := c.ensureTalkback()
-		if err != nil {
-			return err
-		}
-		tb.playMu.Lock()
-		defer tb.playMu.Unlock()
-		// go2rtc drops the idle AAC-ELD ffmpeg bridge over time, so re-assert the
-		// route before speaking. Use an independent context: the control-plane POST
-		// must not be aborted by a short-lived caller context. Synthesis/buffering
-		// latency covers ffmpeg spin-up.
-		routeCtx, routeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if rerr := tb.assertRoute(routeCtx); rerr != nil {
-			log.Printf("[Talkback] re-assert route: %v", rerr)
-		}
-		routeCancel()
-		log.Println("[WebRTC] Streaming real audio (talkback AAC-ELD)...")
-		tb.pushPCM(pcm16, sourceSampleRate)
-		tb.flushPCM()
-		err = tb.waitDrained(ctx)
-		if err == nil {
-			log.Println("[WebRTC] Finished audio transmission.")
-		}
-		return err
-	}
-
-	ticker := time.NewTicker(frameMs * time.Millisecond)
-	defer ticker.Stop()
-
-	if err := c.waitConnectedAndPreroll(ctx, ticker); err != nil {
-		return err
-	}
-
-	log.Printf("[WebRTC] Streaming real audio (%s)...", c.sendCodec)
-	s := c.newPlaySession(ticker)
-	if err := s.push(ctx, pcm16, sourceSampleRate); err != nil {
-		return err
-	}
-	if err := s.flush(ctx); err != nil {
-		return err
-	}
-	log.Println("[WebRTC] Finished audio transmission.")
-	return nil
+	return c.PlayStream(ctx, audionode.NewSliceSource(pcm16, sourceSampleRate))
 }
 
 // PlayStream plays PCM16 audio pulled incrementally from src, encoding and pacing
@@ -425,17 +411,16 @@ func (c *Client) Play(ctx context.Context, pcm16 []int16, sourceSampleRate int) 
 // whole utterance has been synthesized.
 func (c *Client) PlayStream(ctx context.Context, src audionode.PCM16Source) error {
 	if c.talkbackEnabled() {
-		tb, err := c.ensureTalkback()
+		tb, err := c.ensureTalkback(ctx)
 		if err != nil {
 			return err
 		}
 		tb.playMu.Lock()
 		defer tb.playMu.Unlock()
+		defer tb.clearPending()
 		// go2rtc drops the idle AAC-ELD ffmpeg bridge over time, so re-assert the
-		// route before speaking. Use an independent context: the control-plane POST
-		// must not be aborted by a short-lived caller context. Synthesis/buffering
-		// latency covers ffmpeg spin-up.
-		routeCtx, routeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// route before speaking, bounded by the playback lifetime.
+		routeCtx, routeCancel := context.WithTimeout(ctx, 5*time.Second)
 		if rerr := tb.assertRoute(routeCtx); rerr != nil {
 			log.Printf("[Talkback] re-assert route: %v", rerr)
 		}
@@ -443,9 +428,11 @@ func (c *Client) PlayStream(ctx context.Context, src audionode.PCM16Source) erro
 		log.Println("[WebRTC] Streaming real audio (chunked, talkback AAC-ELD)...")
 		rate := src.SampleRate()
 		for {
-			pcm, readErr := src.ReadPCM16(2048)
+			pcm, readErr := src.ReadPCM16(ctx, 2048)
 			if len(pcm) > 0 {
-				tb.pushPCM(pcm, rate)
+				if err := tb.pushPCM(ctx, pcm, rate); err != nil {
+					return err
+				}
 			}
 			if readErr == io.EOF {
 				break
@@ -454,7 +441,9 @@ func (c *Client) PlayStream(ctx context.Context, src audionode.PCM16Source) erro
 				return readErr
 			}
 		}
-		tb.flushPCM()
+		if err := tb.flushPCM(ctx); err != nil {
+			return err
+		}
 		err = tb.waitDrained(ctx)
 		if err == nil {
 			log.Println("[WebRTC] Finished audio transmission.")
@@ -474,7 +463,7 @@ func (c *Client) PlayStream(ctx context.Context, src audionode.PCM16Source) erro
 	s := c.newPlaySession(ticker)
 
 	for {
-		pcm, readErr := src.ReadPCM16(2048)
+		pcm, readErr := src.ReadPCM16(ctx, 2048)
 		if len(pcm) > 0 {
 			if err := s.push(ctx, pcm, sourceSampleRate); err != nil {
 				return err
@@ -643,24 +632,35 @@ func (c *Client) silenceFrame() []byte {
 
 // Close closes the PeerConnection.
 func (c *Client) Close() error {
-	c.reconnectMu.Lock()
-	c.closing = true
-	c.reconnectMu.Unlock()
-
-	c.tbMu.Lock()
-	if c.tbCancel != nil {
-		c.tbCancel()
-	}
-	tb := c.tb
-	c.tb = nil
-	c.tbMu.Unlock()
-	if tb != nil {
-		tb.close()
-	}
-	if c.pc != nil {
-		return c.pc.Close()
-	}
-	return nil
+	c.closeOnce.Do(func() {
+		c.reconnectMu.Lock()
+		c.closing = true
+		c.reconnectMu.Unlock()
+		c.cancel()
+		c.audioRxMutex.Lock()
+		c.onAudioRx = nil
+		c.audioRxMutex.Unlock()
+		c.signalMu.Lock()
+		if c.signalConn != nil {
+			_ = c.signalConn.Close()
+		}
+		c.signalMu.Unlock()
+		if c.pc != nil {
+			c.closeErr = c.pc.Close()
+		}
+		c.tasks.Close()
+		c.tbMu.Lock()
+		if c.tbCancel != nil {
+			c.tbCancel()
+		}
+		tb := c.tb
+		c.tb = nil
+		c.tbMu.Unlock()
+		if tb != nil {
+			tb.close()
+		}
+	})
+	return c.closeErr
 }
 
 // scheduleReconnect starts a best-effort reconnection loop for the receive
@@ -674,7 +674,7 @@ func (c *Client) scheduleReconnect(reason string) {
 	c.reconnecting = true
 	c.reconnectMu.Unlock()
 
-	go func() {
+	if err := c.tasks.Go(func(lifetime context.Context) {
 		defer func() {
 			c.reconnectMu.Lock()
 			c.reconnecting = false
@@ -695,7 +695,7 @@ func (c *Client) scheduleReconnect(reason string) {
 			}
 
 			log.Printf("[WebRTC] Reconnect attempt %d (%s); state=%s", attempt, reason, state)
-			rctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			rctx, cancel := context.WithTimeout(lifetime, 15*time.Second)
 			err := c.Connect(rctx)
 			cancel()
 			if err == nil {
@@ -704,11 +704,21 @@ func (c *Client) scheduleReconnect(reason string) {
 			}
 
 			log.Printf("[WebRTC] Reconnect attempt %d failed: %v", attempt, err)
-			time.Sleep(time.Duration(attempt) * time.Second)
+			timer := time.NewTimer(time.Duration(attempt) * time.Second)
+			select {
+			case <-lifetime.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 
 		log.Printf("[WebRTC] Reconnect attempts exhausted; manual restart may be required")
-	}()
+	}); err != nil {
+		c.reconnectMu.Lock()
+		c.reconnecting = false
+		c.reconnectMu.Unlock()
+	}
 }
 
 // talkbackEnabled reports whether outbound TTS should use the go2rtc AAC-ELD
@@ -720,7 +730,7 @@ func (c *Client) talkbackEnabled() bool {
 // ensureTalkback lazily establishes (and caches) the talkback sender. It retries
 // on each call until the WHIP producer + AAC-ELD route are up, so a transient
 // go2rtc hiccup at startup does not permanently disable the backchannel.
-func (c *Client) ensureTalkback() (*talkbackSender, error) {
+func (c *Client) ensureTalkback(parent context.Context) (*talkbackSender, error) {
 	c.tbMu.Lock()
 	defer c.tbMu.Unlock()
 	if c.tb != nil {
@@ -746,8 +756,10 @@ func (c *Client) ensureTalkback() (*talkbackSender, error) {
 		in = "talkback_in"
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	setupCtx, cancelSetup := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := context.WithCancel(c.ctx)
+	setupCtx, cancelSetup := context.WithTimeout(parent, 20*time.Second)
+	stop := context.AfterFunc(ctx, cancelSetup)
+	defer stop()
 	tb, err := newTalkbackSender(setupCtx, c.apiBaseURL, in, c.talkbackStream)
 	cancelSetup()
 	if err != nil {
@@ -799,23 +811,26 @@ func (c *Client) readRemoteTrack(track *webrtc.TrackRemote) {
 			log.Printf("[WebRTC] Received %d RTP packets so far\n", packetCount)
 		}
 
-		c.audioRxMutex.RLock()
-		callback := c.onAudioRx
-		c.audioRxMutex.RUnlock()
-		if callback == nil {
-			continue
-		}
-
 		if isOpus {
 			n, err := dec.Decode(rtpPacket.Payload, pcmBuf)
 			if err != nil {
 				continue // drop undecodable packet
 			}
-			callback(audio.PCM16ToFloat(pcmBuf[:n]))
+			c.deliver(audio.PCM16ToFloat(pcmBuf[:n]))
 		} else {
 			// PCMU (G.711 mu-law, 8000Hz) -> float32 -> upsample to 16000Hz.
 			floatSamples := audio.DecodeMuLawToFloat(rtpPacket.Payload)
-			callback(audio.ResampleFloat32(floatSamples, 8000, recvModelRate))
+			c.deliver(audio.ResampleFloat32(floatSamples, 8000, recvModelRate))
 		}
+	}
+}
+
+func (c *Client) deliver(samples []float32) {
+	c.callbackMu.Lock()
+	defer c.callbackMu.Unlock()
+	c.audioRxMutex.RLock()
+	defer c.audioRxMutex.RUnlock()
+	if c.onAudioRx != nil && c.ctx.Err() == nil {
+		c.onAudioRx(samples)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -19,11 +20,12 @@ import (
 	"time"
 
 	"gocalis/internal/ai"
-	"gocalis/internal/ask"
 	"gocalis/internal/audio"
 	"gocalis/internal/brain"
 	"gocalis/internal/httpsec"
 	"gocalis/internal/protocol"
+	"gocalis/internal/taskgroup"
+	"gocalis/internal/wshub"
 
 	"github.com/gorilla/websocket"
 )
@@ -40,16 +42,15 @@ type Server struct {
 	startTime     time.Time
 	authToken     string
 
-	clients      map[*websocket.Conn]*sync.Mutex
-	clientsMutex sync.Mutex
-	upgrader     websocket.Upgrader
+	hub      *wshub.Hub
+	upgrader websocket.Upgrader
 
 	httpMutex sync.Mutex
 	httpSrv   *http.Server
 }
 
 // NewServer creates a dashboard web server. authToken, when non-empty, is
-// required on control endpoints; allowedOrigins restricts which browser Origins
+// required on controls and the events socket; allowedOrigins restricts which browser Origins
 // may open the events WebSocket (empty => localhost/same-origin only).
 func NewServer(addr string, b *brain.Brain, executor *protocol.Executor, speakerEngine ai.SpeakerIdentifier, authToken string, allowedOrigins []string) *Server {
 	return &Server{
@@ -59,7 +60,7 @@ func NewServer(addr string, b *brain.Brain, executor *protocol.Executor, speaker
 		speakerEngine: speakerEngine,
 		startTime:     time.Now(),
 		authToken:     authToken,
-		clients:       make(map[*websocket.Conn]*sync.Mutex),
+		hub:           wshub.New(),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -77,10 +78,10 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/status", s.withCORS(s.handleStatus))
 	mux.HandleFunc("/api/nodes", s.withCORS(s.handleNodes))
 	mux.HandleFunc("/api/execute", s.withCORS(httpsec.RequireToken(s.authToken, s.handleExecute)))
-	mux.HandleFunc("/api/synthesize", s.withCORS(httpsec.RequireToken(s.authToken, s.handleSynthesize)))
-	mux.HandleFunc("/api/ask", s.withCORS(httpsec.RequireToken(s.authToken, s.handleAsk)))
-	mux.HandleFunc("/ask", s.withCORS(httpsec.RequireToken(s.authToken, s.handleAsk)))
-	mux.HandleFunc("/api/reload-speakers", s.withCORS(httpsec.RequireToken(s.authToken, s.handleReloadSpeakers)))
+	mux.HandleFunc("/api/synthesize", s.control(s.handleSynthesize))
+	mux.HandleFunc("/api/ask", s.control(s.handleAsk))
+	mux.HandleFunc("/ask", s.control(s.handleAsk))
+	mux.HandleFunc("/api/reload-speakers", s.control(s.handleReloadSpeakers))
 	mux.HandleFunc("/api/events", s.handleEvents)
 
 	// Static files from embedded React build
@@ -128,6 +129,7 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the HTTP server, waiting for in-flight requests to
 // drain until ctx is cancelled.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.hub.Close()
 	s.httpMutex.Lock()
 	srv := s.httpSrv
 	s.httpMutex.Unlock()
@@ -138,39 +140,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // Publish implements protocol.EventPublisher by broadcasting events to all dashboard clients.
-func (s *Server) Publish(event protocol.Response) {
-	s.clientsMutex.Lock()
-	clients := make(map[*websocket.Conn]*sync.Mutex, len(s.clients))
-	for c, m := range s.clients {
-		clients[c] = m
-	}
-	s.clientsMutex.Unlock()
-
-	data, err := json.Marshal(event)
-	if err != nil {
-		log.Printf("[WebServer] Failed to marshal event: %v\n", err)
-		return
-	}
-
-	for client, writeMutex := range clients {
-		writeMutex.Lock()
-		err := client.WriteMessage(websocket.TextMessage, data)
-		writeMutex.Unlock()
-		if err != nil {
-			log.Printf("[WebServer] Failed to write to client, closing: %v\n", err)
-			client.Close()
-			s.clientsMutex.Lock()
-			delete(s.clients, client)
-			s.clientsMutex.Unlock()
-		}
-	}
-}
+func (s *Server) Publish(event protocol.Response) { s.hub.Publish(event) }
 
 func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -209,20 +185,20 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req protocol.Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+	if !httpsec.DecodeJSON(w, r, &req) {
 		return
 	}
 
-	// Run detached: the HTTP handler returns immediately with an "accepted"
-	// ack, which cancels r.Context(). TTS synthesis + playback outlive this
-	// request, so give them a fresh, bounded background context instead —
-	// otherwise aplay/WebRTC playback dies with "context canceled".
-	execCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	go func() {
-		defer cancel()
-		s.executor.Execute(execCtx, req)
-	}()
+	if err := s.executor.Submit(req); err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, taskgroup.ErrBusy) || errors.Is(err, taskgroup.ErrClosed) {
+			code = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
 
 	s.writeJSON(w, protocol.Response{
 		Event:  req.Action + "_accepted",
@@ -267,17 +243,16 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req SynthesizeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+	if !httpsec.DecodeJSON(w, r, &req) {
 		return
 	}
 
-	if strings.TrimSpace(req.Text) == "" {
-		s.writeJSON(w, SynthesizeResponse{Status: "error", ErrorMessage: "missing 'text' parameter"})
+	if strings.TrimSpace(req.Text) == "" || len(req.Text) > ai.MaxTextBytes || len(req.Filename) > 200 {
+		http.Error(w, "text must contain 1-4000 bytes and filename at most 200 bytes", http.StatusBadRequest)
 		return
 	}
 
-	samples, sampleRate, err := s.brain.Synthesize(req.Text, req.Priority)
+	samples, sampleRate, err := s.brain.Synthesize(r.Context(), req.Text, req.Priority)
 	if err != nil {
 		s.writeJSON(w, SynthesizeResponse{Status: "error", ErrorMessage: err.Error()})
 		return
@@ -326,18 +301,6 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AskRequest matches the payload sent by the Node-RED gocalis-ask node.
-type AskRequest struct {
-	ContextID         string  `json:"context_id"`
-	NodeID            string  `json:"node_id"`
-	TTSText           string  `json:"tts_text"`
-	BargeIn           bool    `json:"barge_in"`
-	RequireSpeakerID  bool    `json:"require_speaker_id"`
-	OutputFormat      string  `json:"output_format"`
-	VADTimeoutSeconds float64 `json:"vad_timeout_seconds"`
-	Priority          int     `json:"priority"`
-}
-
 // AskResponse is the result returned to the Node-RED gocalis-ask node.
 type AskResponse struct {
 	ContextID      string `json:"context_id"`
@@ -355,67 +318,21 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req AskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+	var req protocol.Request
+	if !httpsec.DecodeJSON(w, r, &req) {
 		return
 	}
 
-	if req.NodeID == "" {
-		s.writeJSON(w, AskResponse{Status: "error", ErrorMessage: "missing node_id"})
+	req.Action = "ask"
+	if err := req.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	// Reserve the node's turn BEFORE synthesizing the prompt so a lower-priority
-	// speak cannot grab the free node during the synthesis window and jump ahead
-	// of this ask. Run is told the node is already held and will not re-acquire.
-	release, err := s.brain.AcquireNode(r.Context(), req.NodeID, req.Priority)
-	if err != nil {
-		s.writeJSON(w, AskResponse{
-			ContextID:    req.ContextID,
-			NodeID:       req.NodeID,
-			Status:       "error",
-			ErrorMessage: err.Error(),
-		})
-		return
-	}
-	defer release()
-
-	var promptSamples []int16
-	var promptSampleRate int
+	result := s.executor.AskEngine.Run(r.Context(), req.AskConfig())
 	var audioBase64 string
-
-	if req.TTSText != "" {
-		samples, sampleRate, err := s.brain.Synthesize(req.TTSText, req.Priority)
-		if err != nil {
-			s.writeJSON(w, AskResponse{
-				ContextID:    req.ContextID,
-				NodeID:       req.NodeID,
-				Status:       "error",
-				ErrorMessage: err.Error(),
-			})
-			return
-		}
-		promptSamples = samples
-		promptSampleRate = sampleRate
-
-		if req.OutputFormat == "audio" || req.OutputFormat == "both" {
-			audioBase64 = base64.StdEncoding.EncodeToString(audio.EncodeWAVPCM16(samples, sampleRate))
-		}
+	if (req.OutputFormat == "audio" || req.OutputFormat == "both") && len(result.Audio) > 0 {
+		audioBase64 = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, result.SampleRate))
 	}
-
-	result := s.executor.AskEngine.Run(r.Context(), ask.Config{
-		ContextID:           req.ContextID,
-		NodeID:              req.NodeID,
-		TTSText:             req.TTSText,
-		BargeIn:             req.BargeIn,
-		RequireSpeakerID:    req.RequireSpeakerID,
-		VADTimeoutSeconds:   req.VADTimeoutSeconds,
-		Priority:            req.Priority,
-		PromptSamples:       promptSamples,
-		PromptSampleRate:    promptSampleRate,
-		NodeAlreadyAcquired: true,
-	})
 
 	s.writeJSON(w, AskResponse{
 		ContextID:      req.ContextID,
@@ -450,33 +367,22 @@ func (s *Server) handleReloadSpeakers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if !httpsec.TokenValid(r, s.authToken) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[WebServer] WebSocket upgrade failed: %v\n", err)
 		return
 	}
 
-	writeMutex := &sync.Mutex{}
-	s.clientsMutex.Lock()
-	s.clients[conn] = writeMutex
-	s.clientsMutex.Unlock()
-
-	log.Printf("[WebServer] Dashboard client connected: %s\n", conn.RemoteAddr().String())
-
-	// Send current status immediately so the dashboard has initial data.
-	status := protocol.Response{
-		Event:  "status",
-		Status: "running",
+	client := s.hub.Add(conn)
+	if client == nil {
+		return
 	}
-	_ = s.writeWS(conn, writeMutex, status)
-
-	defer func() {
-		s.clientsMutex.Lock()
-		delete(s.clients, conn)
-		s.clientsMutex.Unlock()
-		conn.Close()
-		log.Printf("[WebServer] Dashboard client disconnected: %s\n", conn.RemoteAddr().String())
-	}()
+	defer client.Close()
+	client.Send(protocol.Response{Event: "status", Status: "running"})
 
 	// Keep connection open and read until client disconnects.
 	for {
@@ -494,12 +400,17 @@ func (s *Server) writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
-func (s *Server) writeWS(conn *websocket.Conn, writeMutex *sync.Mutex, event protocol.Response) error {
-	data, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	writeMutex.Lock()
-	defer writeMutex.Unlock()
-	return conn.WriteMessage(websocket.TextMessage, data)
+// control tracks synchronous API work alongside detached commands.
+func (s *Server) control(next http.HandlerFunc) http.HandlerFunc {
+	return s.withCORS(httpsec.RequireToken(s.authToken, func(w http.ResponseWriter, r *http.Request) {
+		ctx, finish, err := s.executor.Tasks.Start(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer finish()
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		next(w, r.WithContext(ctx))
+	}))
 }

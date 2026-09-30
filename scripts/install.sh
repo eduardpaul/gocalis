@@ -52,17 +52,14 @@ if ! run_as_user 'command -v go >/dev/null'; then
   exit 1
 fi
 
-# The Go binary embeds the React dashboard via go:embed, so dist must exist.
-if [[ ! -d "$APP_DIR/internal/webserver/dist" ]]; then
-  echo "==> Web dashboard (internal/webserver/dist) missing; building it..."
-  if run_as_user 'command -v npm >/dev/null'; then
-    run_as_user "cd '$APP_DIR/web' && npm install && npm run build"
-    run_as_user "rm -rf '$APP_DIR/internal/webserver/dist' && cp -r '$APP_DIR/web/dist' '$APP_DIR/internal/webserver/dist'"
-  else
-    echo "ERROR: dashboard not built and 'npm' not found in ${RUN_USER}'s PATH." >&2
-    echo "       Build it manually (see readme_install.md), then re-run this installer." >&2
-    exit 1
-  fi
+# Always rebuild embedded assets so installing an update cannot serve a stale UI.
+echo "==> Building web dashboard..."
+if run_as_user 'command -v npm >/dev/null'; then
+  run_as_user "cd '$APP_DIR/web' && npm ci && npm run build"
+  run_as_user "rm -rf '$APP_DIR/internal/webserver/dist' && cp -r '$APP_DIR/web/dist' '$APP_DIR/internal/webserver/dist'"
+else
+  echo "ERROR: 'npm' is required to build the embedded dashboard." >&2
+  exit 1
 fi
 
 echo "==> Building gocalis binary (this can take a few minutes on a Pi)..."

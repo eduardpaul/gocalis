@@ -1,14 +1,21 @@
-version: '3.8'
-
 services:
   app:
-    build: .
-    container_name: gocalis-app
+    build:
+      context: .
+      target: runtime
+    init: true
+    restart: unless-stopped
     volumes:
-      - .:/app
-      - /dev/snd:/dev/snd
+      - ./config.yaml:/app/config.yaml:ro
+      - ./models:/app/models
+    # Host networking also carries WebRTC's negotiated UDP media ports.
     network_mode: host
-    privileged: true
-    environment:
-      - ALSADEV=default
-    command: tail -f /dev/null
+    devices:
+      - /dev/snd:/dev/snd
+    stop_grace_period: 60s
+
+  test:
+    profiles: [test]
+    build:
+      context: .
+      target: test

@@ -48,7 +48,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
       } else if (activeTab === 'ask') {
         result = await onAsk({
           node_id: nodeId === 'all' ? '' : nodeId,
-          tts_text: text,
+          text,
           require_speaker_id: requireSpeakerId,
           vad_timeout_seconds: Number(vadTimeout),
           priority: Number(priority),

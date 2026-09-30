@@ -54,12 +54,15 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	if err := cfg.ValidateModelFiles(*channel, *nodeID); err != nil {
+		log.Fatalf("Invalid model paths: %v", err)
+	}
+
 	// Calculate dynamic division of thread allocation to match Pi 5 core limits.
-	// Only active (rtc_stream) nodes actually load models; local/unsupported nodes
-	// are skipped by the node runtime, so they must not dilute the thread budget.
+	// Capture models run per node for both local and WebRTC transports.
 	numNodes := 0
 	for _, n := range cfg.Nodes {
-		if n.Type == "rtc_stream" {
+		if n.Type == "rtc_stream" || n.Type == "local" {
 			numNodes++
 		}
 	}
@@ -133,7 +136,7 @@ func main() {
 		eventBus := protocol.NewMultiPublisher()
 
 		// Shared command executor used by all transports.
-		executor := protocol.NewExecutor(centralBrain, asrEngine, speakerEngine, eventBus, cfg.Models.SpeakerID)
+		executor := protocol.NewExecutor(ctx, centralBrain, asrEngine, speakerEngine, eventBus, cfg.Models.SpeakerID)
 
 		// Initialize global WebSocket API server for Node-RED integration.
 		log.Printf("Starting Global Node-RED WebSocket API Server on %s...\n", *wsAddr)
@@ -143,6 +146,7 @@ func main() {
 		go func() {
 			if err := wsServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("[Server] WebSocket Server failed: %v\n", err)
+				cancel()
 			}
 		}()
 
@@ -154,6 +158,7 @@ func main() {
 		go func() {
 			if err := webServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("[WebServer] HTTP Server failed: %v\n", err)
+				cancel()
 			}
 		}()
 
@@ -171,7 +176,7 @@ func main() {
 				AutoReconnect: cfg.MQTT.AutoReconnect,
 			}
 			var err error
-			mqttClient, err = mqtt.NewClient(mqttCfg, executor)
+			mqttClient, err = mqtt.NewClient(ctx, mqttCfg, executor)
 			if err != nil {
 				log.Fatalf("Failed to create MQTT client: %v", err)
 			}
@@ -182,15 +187,21 @@ func main() {
 			defer mqttClient.Close()
 		}
 
-		// Start configuration hot-reloading file watcher (speaker profiles only).
-		config.WatchSpeakers(*configPath, func() {
-			log.Println("[Main] Config changed; hot-reloading speaker profiles...")
-			if err := speakerEngine.ReloadSpeakers(); err != nil {
-				log.Printf("[Main] Failed to hot-reload speaker profiles: %v\n", err)
+		// Only profile WAVs reload; configuration changes require a restart.
+		stopWatcher := func() {}
+		if directory := cfg.Models.SpeakerID.EmbeddingsDir; directory != "" {
+			stop, err := config.WatchSpeakers(ctx, directory, func() {
+				if err := speakerEngine.ReloadSpeakers(); err != nil {
+					log.Printf("[Main] Reload speakers: %v", err)
+				}
+			})
+			if err != nil {
+				log.Printf("[Main] Speaker watcher unavailable: %v", err)
 			} else {
-				log.Println("[Main] Speaker profiles hot-reloaded successfully!")
+				stopWatcher = stop
 			}
-		})
+		}
+		defer stopWatcher()
 
 		// Spawn a runtime goroutine for each configured physical node. The
 		// WaitGroup lets shutdown wait for every runtime to release its models and
@@ -198,7 +209,7 @@ func main() {
 		var nodeWG sync.WaitGroup
 		for i := range cfg.Nodes {
 			nodeCfg := cfg.Nodes[i]
-			rt := runtime.New(nodeCfg, cfg, asrEngine, speakerEngine, eventBus, centralBrain, executor.AskEngine, threadsPerModel)
+			rt := runtime.New(nodeCfg, cfg, eventBus, centralBrain, executor.AskEngine, threadsPerModel)
 			nodeWG.Add(1)
 			go func() {
 				defer nodeWG.Done()
@@ -210,6 +221,7 @@ func main() {
 
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigChan)
 
 		select {
 		case <-sigChan:
@@ -218,34 +230,24 @@ func main() {
 			log.Println("Context closed. Draining...")
 		}
 
-		// Graceful shutdown, ordered so nothing uses an engine after it is closed:
-		//   1. Cancel the root context so node runtimes begin tearing down.
-		//   2. Stop the HTTP servers (drains in-flight control requests).
-		//   3. Wait for node runtimes to finish.
-		//   4. Deferred engine Close() calls then run as main returns.
+		// Cancel admissions and active work, then join every user of native models.
+		// HTTP shutdown has a deadline; model ownership never does.
 		cancel()
-
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
-
 		if err := wsServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[Server] WebSocket server shutdown error: %v\n", err)
+			log.Printf("[Server] shutdown: %v", err)
 		}
 		if err := webServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[WebServer] Dashboard server shutdown error: %v\n", err)
+			log.Printf("[WebServer] shutdown: %v", err)
 		}
-
-		drained := make(chan struct{})
-		go func() {
-			nodeWG.Wait()
-			close(drained)
-		}()
-		select {
-		case <-drained:
-			log.Println("All node runtimes drained. Shutting down engines...")
-		case <-shutdownCtx.Done():
-			log.Println("Timed out waiting for node runtimes to drain; shutting down anyway...")
+		executor.Tasks.Close()
+		stopWatcher()
+		nodeWG.Wait()
+		if mqttClient != nil {
+			mqttClient.Close()
 		}
+		log.Println("Commands and node runtimes joined. Shutting down engines...")
 
 	case "demo":
 		runDemoMode(asrEngine, ttsEngine, speakerEngine)
@@ -288,7 +290,7 @@ func runASRFileMode(cfg *config.Config, audioFile string, threadsPerModel int) {
 	}
 	defer asrEngine.Close()
 
-	transcription, err := asrEngine.TranscribeFile(audioFile, ai.JobOptions{})
+	transcription, err := asrEngine.TranscribeFile(context.Background(), audioFile, ai.JobOptions{})
 	if err != nil {
 		log.Fatalf("ASRFile: transcription failed: %v", err)
 	}
@@ -404,7 +406,6 @@ func runWakeFileVADMode(cfg *config.Config, nodeID, audioFile string, threadsPer
 		vadGate.Pop()
 	}
 
-	time.Sleep(300 * time.Millisecond) // let async onDetected callbacks land
 	log.Printf("WakeFileVAD: VAD produced %d speech segment(s); wake detections=%d", segments, atomic.LoadInt64(&detections))
 }
 
@@ -500,7 +501,7 @@ func runRTCSayMode(cfg *config.Config, nodeID, streamName, sendCodec, text strin
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("RTCSay: connect failed: %v", err)
 	}
-	audioStream, err := ttsEngine.SynthesizeToStream(text, ai.JobOptions{Priority: 10})
+	audioStream, err := ttsEngine.SynthesizeToStream(ctx, text, ai.JobOptions{Priority: 10})
 	if err != nil {
 		log.Fatalf("RTCSay: synthesis failed: %v", err)
 	}
@@ -602,7 +603,7 @@ func runDemoMode(asrEngine ai.Transcriber, ttsEngine ai.Synthesizer, speakerID a
 
 	// 1. File Mode: TTS Synthesize
 	log.Printf("TTS: Synthesizing to file '%s': \"%s\"\n", outputWav, spanishPhrase)
-	err := ttsEngine.SynthesizeToFile(spanishPhrase, outputWav, ai.JobOptions{})
+	err := ttsEngine.SynthesizeToFile(context.Background(), spanishPhrase, outputWav, ai.JobOptions{})
 	if err != nil {
 		log.Fatalf("Failed to synthesize to file: %v", err)
 	}
@@ -610,7 +611,7 @@ func runDemoMode(asrEngine ai.Transcriber, ttsEngine ai.Synthesizer, speakerID a
 
 	// 2. File Mode: ASR Transcribe
 	log.Printf("ASR: Transcribing WAV file '%s'...\n", outputWav)
-	transcription, err := asrEngine.TranscribeFile(outputWav, ai.JobOptions{})
+	transcription, err := asrEngine.TranscribeFile(context.Background(), outputWav, ai.JobOptions{})
 	if err != nil {
 		log.Fatalf("Failed to transcribe file: %v", err)
 	}
@@ -632,7 +633,7 @@ func runDemoMode(asrEngine ai.Transcriber, ttsEngine ai.Synthesizer, speakerID a
 
 	// 4. Streaming Mode: TTS & ASR Stream loop
 	log.Println("TTS/ASR: Testing Streaming Interface (Synthesizing -> Streaming -> Transcribing live)...")
-	audioStream, err := ttsEngine.SynthesizeToStream(spanishPhrase, ai.JobOptions{})
+	audioStream, err := ttsEngine.SynthesizeToStream(context.Background(), spanishPhrase, ai.JobOptions{})
 	if err != nil {
 		log.Fatalf("Failed to synthesize to stream: %v", err)
 	}
@@ -647,7 +648,7 @@ func runDemoMode(asrEngine ai.Transcriber, ttsEngine ai.Synthesizer, speakerID a
 	totalSamples := 0
 
 	for {
-		pcmChunk, err := audioStream.ReadPCM16(chunkSize)
+		pcmChunk, err := audioStream.ReadPCM16(context.Background(), chunkSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -667,7 +668,8 @@ func runDemoMode(asrEngine ai.Transcriber, ttsEngine ai.Synthesizer, speakerID a
 	log.Printf("TTS/ASR: Streamed %d samples successfully!\n", totalSamples)
 	log.Println("ASR Streaming Results:")
 	log.Println("==================================================")
-	log.Printf("Spanish Text: %s\n", transcriptionStream.Result(ai.JobOptions{}))
+	text, err := transcriptionStream.Result(context.Background(), ai.JobOptions{})
+	log.Printf("Spanish Text: %s (error: %v)\n", text, err)
 	log.Println("==================================================")
 
 	// 5. Local Playback

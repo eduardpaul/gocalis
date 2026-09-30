@@ -99,3 +99,29 @@ func TestRegistryFanOut(t *testing.T) {
 		t.Fatalf("remaining session count = %d, want 3", b.CapturedCount())
 	}
 }
+
+func TestBargeInCapturesTriggerAndDoesNotSignalTwice(t *testing.T) {
+	s := New("barge", "room")
+	ch := s.ArmBargeIn()
+	s.Feed(nil)
+	select {
+	case <-ch:
+		t.Fatal("empty audio signaled barge-in")
+	default:
+	}
+	s.Feed([]float32{0.1, 0.2})
+	<-ch
+	s.Feed([]float32{0.3})
+	select {
+	case <-ch:
+		t.Fatal("barge-in was signaled twice")
+	default:
+	}
+	if !s.DisarmBargeIn() {
+		t.Fatal("barge-in was not recorded")
+	}
+	got := s.StopCapture()
+	if len(got) != 3 || got[0] != 0.1 || got[2] != 0.3 {
+		t.Fatalf("captured = %v", got)
+	}
+}

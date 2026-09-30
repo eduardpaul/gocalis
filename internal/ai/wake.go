@@ -159,7 +159,13 @@ type sherpaONNXWakeStream struct {
 
 func (ws *sherpaONNXWakeStream) AcceptAudio(samples []float32) {
 	ws.mutex.Lock()
-	defer ws.mutex.Unlock()
+	keyword := ""
+	defer func() {
+		ws.mutex.Unlock()
+		if keyword != "" {
+			ws.onDetected(keyword)
+		}
+	}()
 
 	if ws.stream == nil || ws.spotter == nil {
 		return
@@ -188,7 +194,7 @@ func (ws *sherpaONNXWakeStream) AcceptAudio(samples []float32) {
 
 	result := ws.spotter.GetResult(ws.stream)
 	if result != nil && result.Keyword != "" {
-		go ws.onDetected(result.Keyword)
+		keyword = result.Keyword
 		ws.spotter.Reset(ws.stream)
 	}
 }
