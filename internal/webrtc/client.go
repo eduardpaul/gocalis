@@ -9,9 +9,11 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	opus "gopkg.in/hraban/opus.v2"
@@ -55,6 +57,8 @@ type WSMessage struct {
 
 // Client represents the WebRTC client connection to go2rtc.
 type Client struct {
+	stats        transportCounters
+	captureEpoch atomic.Uint64
 	ctx          context.Context
 	cancel       context.CancelFunc
 	tasks        *taskgroup.Group
@@ -417,11 +421,17 @@ func (c *Client) PlayStream(ctx context.Context, src audionode.PCM16Source) erro
 		tb.playMu.Lock()
 		defer tb.playMu.Unlock()
 		defer tb.clearPending()
+		tb.mu.Lock()
+		tb.playing = true
+		tb.firstAudioSent = false
+		tb.playbackStarted = time.Now()
+		tb.mu.Unlock()
 		// go2rtc drops the idle AAC-ELD ffmpeg bridge over time, so re-assert the
 		// route before speaking, bounded by the playback lifetime.
 		routeCtx, routeCancel := context.WithTimeout(ctx, 5*time.Second)
 		if rerr := tb.assertRoute(routeCtx); rerr != nil {
-			log.Printf("[Talkback] re-assert route: %v", rerr)
+			routeCancel()
+			return fmt.Errorf("talkback route: %w", rerr)
 		}
 		routeCancel()
 		log.Println("[WebRTC] Streaming real audio (chunked, talkback AAC-ELD)...")
@@ -734,6 +744,11 @@ func (c *Client) ensureTalkback(parent context.Context) (*talkbackSender, error)
 	defer c.tbMu.Unlock()
 	if c.tb != nil {
 		state := c.tb.pc.ConnectionState()
+		c.tb.mu.Lock()
+		if c.tb.closed {
+			state = webrtc.PeerConnectionStateClosed
+		}
+		c.tb.mu.Unlock()
 		switch state {
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateDisconnected,
@@ -793,43 +808,147 @@ func (c *Client) readRemoteTrack(track *webrtc.TrackRemote) {
 	// Max Opus frame is 120ms; at 16kHz mono that is 1920 samples. Pad for safety.
 	pcmBuf := make([]int16, recvModelRate/1000*120)
 
-	packetCount := 0
+	// Packet ingestion never waits on model inference. Overflow drops the oldest
+	// queued packet, bounding latency rather than accumulating stale microphone PCM.
+	type receivedPacket struct {
+		packet *rtp.Packet
+		epoch  uint64
+	}
+	packets := make(chan receivedPacket, 32)
+	done := make(chan struct{})
+	defer close(done)
+	if err := c.tasks.Go(func(ctx context.Context) {
+		var window packetWindow
+		epoch := c.captureEpoch.Load()
+		var timestamp uint32
+		previousSamples := 0
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		process := func(batch []*rtp.Packet) {
+			for _, p := range batch {
+				started := time.Now()
+				if previousSamples > 0 {
+					clockRate := uint32(track.Codec().ClockRate)
+					expected := timestamp + uint32(previousSamples)*clockRate/recvModelRate
+					gap := int32(p.Timestamp - expected)
+					// Conceal at most 120ms per gap. Large discontinuities recover at the
+					// current packet rather than synthesizing minutes of stale audio.
+					missing := int64(gap) * recvModelRate / int64(clockRate)
+					if missing > 0 && missing <= recvModelRate*120/1000 {
+						if isOpus {
+							// PLC requires multiples of 2.5ms. Never claim FEC without source data.
+							n := int(missing) / 40 * 40
+							if n > 0 && dec.DecodePLC(pcmBuf[:n]) == nil {
+								c.deliverEpoch(audio.PCM16ToFloat(pcmBuf[:n]), epoch)
+								c.stats.concealed.Add(uint64(n))
+							}
+						} else {
+							c.deliverEpoch(make([]float32, int(missing)), epoch)
+							c.stats.concealed.Add(uint64(missing))
+						}
+					}
+				}
+				if isOpus {
+					n, err := dec.Decode(p.Payload, pcmBuf)
+					if err != nil {
+						c.stats.decodeErrors.Add(1)
+						continue
+					}
+					c.deliverEpoch(audio.PCM16ToFloat(pcmBuf[:n]), epoch)
+					previousSamples = n
+				} else {
+					samples := audio.ResampleFloat32(audio.DecodeMuLawToFloat(p.Payload), 8000, recvModelRate)
+					c.deliverEpoch(samples, epoch)
+					previousSamples = len(samples)
+				}
+				timestamp = p.Timestamp
+				maxCounter(&c.stats.maxProcessing, time.Since(started).Nanoseconds())
+			}
+		}
+		update := func() {
+			c.stats.lost.Add(window.lost)
+			window.lost = 0
+			c.stats.reordered.Add(window.reordered)
+			window.reordered = 0
+			c.stats.rejected.Add(window.rejected)
+			window.rejected = 0
+		}
+		for {
+			if current := c.captureEpoch.Load(); current != epoch {
+				epoch = current
+				window = packetWindow{}
+				previousSamples = 0
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case received := <-packets:
+				if received.epoch != c.captureEpoch.Load() {
+					window = packetWindow{}
+					previousSamples = 0
+					continue
+				}
+				if epoch != received.epoch {
+					epoch = received.epoch
+					window = packetWindow{}
+					previousSamples = 0
+				}
+				process(window.push(received.packet, time.Now()))
+				update()
+			case now := <-ticker.C:
+				if current := c.captureEpoch.Load(); current != epoch {
+					epoch = current
+					window = packetWindow{}
+					previousSamples = 0
+				}
+				process(window.drain(now, false))
+				update()
+			}
+		}
+	}); err != nil {
+		return
+	}
+	var lastArrival time.Time
 	for {
-		rtpPacket, _, err := track.ReadRTP()
+		packet, _, err := track.ReadRTP()
 		if err != nil {
-			log.Printf("[WebRTC] readRemoteTrack error reading RTP: %v\n", err)
 			c.scheduleReconnect("remote RTP read failed")
 			return
 		}
-
-		packetCount++
-		if packetCount == 1 {
-			log.Printf("[WebRTC] First incoming RTP packet received! Size: %d\n", len(rtpPacket.Payload))
+		now := time.Now()
+		if !lastArrival.IsZero() {
+			maxCounter(&c.stats.maxArrivalGap, now.Sub(lastArrival).Nanoseconds())
 		}
-		if packetCount%250 == 0 { // approx every 5 seconds (50 packets per second)
-			log.Printf("[WebRTC] Received %d RTP packets so far\n", packetCount)
-		}
-
-		if isOpus {
-			n, err := dec.Decode(rtpPacket.Payload, pcmBuf)
-			if err != nil {
-				continue // drop undecodable packet
+		lastArrival = now
+		c.stats.packets.Add(1)
+		select {
+		case packets <- receivedPacket{packet, c.captureEpoch.Load()}:
+		default:
+			select {
+			case <-packets:
+				c.stats.overflow.Add(1)
+			default:
 			}
-			c.deliver(audio.PCM16ToFloat(pcmBuf[:n]))
-		} else {
-			// PCMU (G.711 mu-law, 8000Hz) -> float32 -> upsample to 16000Hz.
-			floatSamples := audio.DecodeMuLawToFloat(rtpPacket.Payload)
-			c.deliver(audio.ResampleFloat32(floatSamples, 8000, recvModelRate))
+			select {
+			case packets <- receivedPacket{packet, c.captureEpoch.Load()}:
+			case <-c.ctx.Done():
+				return
+			}
 		}
 	}
+
 }
 
-func (c *Client) deliver(samples []float32) {
+func (c *Client) deliver(samples []float32) { c.deliverEpoch(samples, c.captureEpoch.Load()) }
+
+func (c *Client) deliverEpoch(samples []float32, epoch uint64) {
 	c.callbackMu.Lock()
 	defer c.callbackMu.Unlock()
 	c.audioRxMutex.RLock()
 	defer c.audioRxMutex.RUnlock()
-	if c.onAudioRx != nil && c.ctx.Err() == nil {
+	if c.onAudioRx != nil && c.ctx.Err() == nil && epoch == c.captureEpoch.Load() {
 		c.onAudioRx(samples)
 	}
 }
@@ -843,4 +962,11 @@ func iceServers(servers []config.ICEServer) []webrtc.ICEServer {
 		result[i] = webrtc.ICEServer{URLs: server.URLs, Username: server.Username, Credential: server.Credential}
 	}
 	return result
+}
+
+// ResetCapture discards queued pre-turn PCM while joining any active callback.
+func (c *Client) ResetCapture() {
+	c.callbackMu.Lock()
+	c.captureEpoch.Add(1)
+	c.callbackMu.Unlock()
 }

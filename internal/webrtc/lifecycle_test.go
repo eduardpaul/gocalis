@@ -73,3 +73,32 @@ func TestTalkbackWaitIncludesInFlightFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTalkbackFailureReachesWaiters(t *testing.T) {
+	failure := errors.New("write failed")
+	sender := &talkbackSender{closed: true, failure: failure}
+	sender.cond = sync.NewCond(&sender.mu)
+	if err := sender.enqueue(context.Background(), []byte{1}); !errors.Is(err, failure) {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := sender.waitDrained(context.Background()); !errors.Is(err, failure) {
+		t.Fatalf("drain: %v", err)
+	}
+}
+
+func TestCaptureResetRejectsPreviousTurnAudio(t *testing.T) {
+	c, err := NewClientWithConfig(Config{SignalingURL: "ws://localhost/api/ws"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	count := 0
+	c.OnAudio(func([]float32) { count++ })
+	old := c.captureEpoch.Load()
+	c.ResetCapture()
+	c.deliverEpoch([]float32{1}, old)
+	c.deliver([]float32{2})
+	if count != 1 {
+		t.Fatalf("stale capture delivered: %d", count)
+	}
+}

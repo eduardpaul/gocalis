@@ -170,3 +170,8 @@ Gocalis RTC configuration now accepts `ice_servers`, including TURN `urls`,
 `username`, and string `credential`. Omission preserves the receive connection's
 existing public STUN default and talkback's existing empty ICE configuration;
 explicit `ice_servers: []` disables public STUN for both connections.
+
+Deterministic microphone packet loss, reordering, and burst delays can be set in
+per-device `faults` fields. See
+[the doorbell measurement record](../../docs/doorbell-audio-reliability.md) for
+configuration, limits, and the distinction between simulator and physical results.

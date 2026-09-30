@@ -279,6 +279,7 @@ func (d *Device) run(ctx context.Context) {
 	defer ticker.Stop()
 	var seq uint16
 	var ts uint32
+	faults := faultInjector{spec: d.status.Faults}
 	for {
 		select {
 		case <-ctx.Done():
@@ -293,8 +294,10 @@ func (d *Device) run(ctx context.Context) {
 		}
 		packet := &rtp.Packet{Header: rtp.Header{Version: 2, Marker: true, PayloadType: 96, SequenceNumber: seq, Timestamp: ts, SSRC: 1}, Payload: b[:n]}
 		d.mu.Lock()
-		for source := range d.sources {
-			source.WriteRTP(packet)
+		for _, ready := range faults.push(packet) {
+			for source := range d.sources {
+				source.WriteRTP(ready)
+			}
 		}
 		d.mu.Unlock()
 		seq++

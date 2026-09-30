@@ -7,6 +7,7 @@ package session
 
 import (
 	"sync"
+	"time"
 )
 
 // State is a stage in a turn's lifecycle.
@@ -34,6 +35,9 @@ type Session struct {
 	state         State
 	captureActive bool
 	captured      []float32
+	preRoll       []float32
+	speechStarted time.Time
+	lastSpeech    time.Time
 
 	barged     bool
 	bargeArmed bool
@@ -93,6 +97,9 @@ func (s *Session) StartCapture() {
 	defer s.mu.Unlock()
 	s.captureActive = true
 	s.captured = nil
+	s.preRoll = nil
+	s.speechStarted = time.Time{}
+	s.lastSpeech = time.Time{}
 }
 
 // StopCapture stops accumulating samples and returns what was captured.
@@ -112,14 +119,24 @@ func (s *Session) CapturedCount() int {
 
 // Feed delivers a detected-speech segment to the session. It signals barge-in
 // (when armed) and appends to the capture buffer (when capturing).
-func (s *Session) Feed(samples []float32) {
+func (s *Session) Feed(samples []float32) { s.FeedPCM(samples, true) }
+
+// SpeechActivity reports live speech timing independently of PCM accumulation.
+func (s *Session) SpeechActivity() (time.Time, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.speechStarted, s.lastSpeech
+}
+
+// FeedPCM preserves onset pre-roll and pauses, while live VAD controls endpointing.
+func (s *Session) FeedPCM(samples []float32, speech bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(samples) == 0 {
 		return
 	}
-	if s.bargeArmed && !s.barged {
+	if speech && s.bargeArmed && !s.barged {
 		s.barged = true
 		s.captureActive = true
 		s.captured = nil
@@ -128,6 +145,21 @@ func (s *Session) Feed(samples []float32) {
 	}
 
 	if s.captureActive {
+		if speech {
+			if s.speechStarted.IsZero() {
+				s.speechStarted = time.Now()
+				s.captured = append(s.captured, s.preRoll...)
+				s.preRoll = nil
+			}
+			s.lastSpeech = time.Now()
+		}
+		if s.speechStarted.IsZero() {
+			s.preRoll = append(s.preRoll, samples...)
+			if len(s.preRoll) > 16000/4 {
+				s.preRoll = append([]float32(nil), s.preRoll[len(s.preRoll)-16000/4:]...)
+			}
+			return
+		}
 		remaining := 16000*120 - len(s.captured)
 		if len(samples) > remaining {
 			samples = samples[:remaining]

@@ -15,15 +15,17 @@ import (
 	"gocalis/internal/audio"
 	"gocalis/internal/audionode"
 	"gocalis/internal/config"
+	"gocalis/internal/diagnostics"
 	"gocalis/internal/node"
 	"gocalis/internal/session"
 )
 
 // NodeHandle bundles everything the brain needs to control a single physical audio node.
 type NodeHandle struct {
-	Node   *node.PhysicalNode
-	Audio  audionode.AudioNode
-	Config config.NodeConfig
+	Recorder *diagnostics.Recorder
+	Node     *node.PhysicalNode
+	Audio    audionode.AudioNode
+	Config   config.NodeConfig
 	// queue serializes turns (speak utterances and full ask flows) on this node
 	// so a lower-priority speak waits for an in-progress higher-priority ask
 	// instead of cutting into it. Assigned by RegisterNode.
@@ -32,9 +34,10 @@ type NodeHandle struct {
 
 // NodeInfo is a read-only snapshot of a registered node for dashboards/APIs.
 type NodeInfo struct {
-	NodeID string `json:"node_id"`
-	Type   string `json:"type"`
-	State  string `json:"state"`
+	NodeID      string `json:"node_id"`
+	Type        string `json:"type"`
+	State       string `json:"state"`
+	Diagnostics any    `json:"diagnostics,omitempty"`
 }
 
 // Brain is the central orchestrator for all audio streams / physical devices.
@@ -107,10 +110,15 @@ func (b *Brain) ListNodes() []NodeInfo {
 
 	infos := make([]NodeInfo, 0, len(b.nodes))
 	for _, h := range b.nodes {
+		var diagnostics any
+		if provider, ok := h.Audio.(interface{ Diagnostics() any }); ok && h.Config.Diagnostics.Enabled {
+			diagnostics = provider.Diagnostics()
+		}
 		infos = append(infos, NodeInfo{
-			NodeID: h.Node.NodeID,
-			Type:   h.Node.Type,
-			State:  string(h.Node.GetState()),
+			NodeID:      h.Node.NodeID,
+			Type:        h.Node.Type,
+			State:       string(h.Node.GetState()),
+			Diagnostics: diagnostics,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].NodeID < infos[j].NodeID })
@@ -384,4 +392,23 @@ func (g *gainSource) ReadPCM16(ctx context.Context, chunkSize int) ([]int16, err
 		chunk = audio.ApplyGainPCM16(chunk, g.gainDb)
 	}
 	return chunk, err
+}
+
+// SynthesisStream begins synthesis without buffering the complete prompt.
+func (b *Brain) SynthesisStream(ctx context.Context, text string, priority int) (ai.AudioStream, error) {
+	return b.ttsEngine.SynthesizeToStream(ctx, text, ai.JobOptions{Priority: priority})
+}
+
+// PlayStream preserves turn ownership and output gain during incremental playback.
+func (t *Turn) PlayStream(ctx context.Context, src audionode.PCM16Source) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if src.SampleRate() <= 0 {
+		return fmt.Errorf("invalid sample rate")
+	}
+	if gain := t.Handle.Config.RTCStream.OutputGainDb; gain != 0 {
+		src = &gainSource{src: src, gainDb: gain}
+	}
+	return t.Handle.Audio.PlayStream(ctx, src)
 }

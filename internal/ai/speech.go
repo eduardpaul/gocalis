@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"gocalis/internal/audio"
 	"gocalis/internal/audionode"
@@ -75,6 +76,8 @@ const MaxAudioSeconds = 120
 // --- Whisper/Moonshine ASR Implementation with Priority Queue ---
 
 type asrJob struct {
+	queued     time.Time
+	timing     func(time.Duration, time.Duration)
 	ctx        context.Context
 	samples    []float32
 	resultChan chan asrResult
@@ -151,7 +154,11 @@ func (t *whisperTranscriber) workerLoop() {
 		if t.ctx.Err() != nil {
 			return
 		}
+		started := time.Now()
 		text, err := t.decodeSync(job.samples)
+		if job.timing != nil {
+			job.timing(started.Sub(job.queued), time.Since(started))
+		}
 		job.resultChan <- asrResult{text: text, err: err}
 	}
 }
@@ -193,7 +200,7 @@ func (t *whisperTranscriber) TranscribeSamples(ctx context.Context, samples []fl
 		samples = audio.ResampleFloat32(samples, sampleRate, 16000)
 	}
 	result := make(chan asrResult, 1)
-	if err := t.pq.Push(ctx, &asrJob{ctx: ctx, samples: append([]float32(nil), samples...), resultChan: result}, opts.Priority); err != nil {
+	if err := t.pq.Push(ctx, &asrJob{queued: time.Now(), timing: opts.OnTiming, ctx: ctx, samples: append([]float32(nil), samples...), resultChan: result}, opts.Priority); err != nil {
 		return "", err
 	}
 	select {

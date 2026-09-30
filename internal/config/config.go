@@ -108,12 +108,19 @@ type CacheConfig struct {
 }
 
 // NodeConfig holds configuration for a specific audio node/channel.
+// DiagnosticsConfig is opt-in; recording_dir retains two bounded WAVs per node.
+type DiagnosticsConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	RecordingDir string `yaml:"recording_dir"`
+}
+
 type NodeConfig struct {
-	NodeID    string          `yaml:"node_id"`
-	Type      string          `yaml:"type"` // "local" or "rtc_stream"
-	Audio     AudioConfig     `yaml:"audio"`
-	RTCStream RTCStreamConfig `yaml:"rtc_stream"`
-	KWS       KWSConfig       `yaml:"kws"`
+	Diagnostics DiagnosticsConfig `yaml:"diagnostics"`
+	NodeID      string            `yaml:"node_id"`
+	Type        string            `yaml:"type"` // "local" or "rtc_stream"
+	Audio       AudioConfig       `yaml:"audio"`
+	RTCStream   RTCStreamConfig   `yaml:"rtc_stream"`
+	KWS         KWSConfig         `yaml:"kws"`
 }
 
 // AudioConfig holds settings for local audio hardware.

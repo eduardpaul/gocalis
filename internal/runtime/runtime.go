@@ -22,6 +22,7 @@ import (
 	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
+	"gocalis/internal/diagnostics"
 	"gocalis/internal/localaudio"
 	"gocalis/internal/node"
 	"gocalis/internal/protocol"
@@ -133,10 +134,10 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		SileroVad: sherpa.SileroVadModelConfig{
 			Model:              r.global.Models.VAD.SileroOnnxPath,
 			Threshold:          r.global.Models.VAD.Threshold,
-			MinSilenceDuration: float32(r.global.Models.VAD.MinSilenceDurationMs) / 1000.0,
+			MinSilenceDuration: 0.032, // one VAD window; ask owns the turn endpoint
 			MinSpeechDuration:  0.25,
 			WindowSize:         512,
-			MaxSpeechDuration:  20.0,
+			MaxSpeechDuration:  ai.MaxAudioSeconds,
 		},
 		SampleRate: 16000,
 		NumThreads: r.threads,
@@ -187,6 +188,9 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		Node:   pNode,
 		Audio:  audioNode,
 		Config: nodeCfg,
+	}
+	if nodeCfg.Diagnostics.Enabled {
+		handle.Recorder = diagnostics.NewRecorder(nodeCfg.Diagnostics.RecordingDir, nodeCfg.NodeID)
 	}
 	r.brain.RegisterNode(nodeCfg.NodeID, handle)
 	defer r.brain.UnregisterNode(nodeCfg.NodeID)
@@ -299,9 +303,18 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	// Subscribe incoming audio: wake word runs on the continuous stream while
 	// speaker ID and ask/capture are routed through the VAD Gate.
 	halfDuplex := !nodeCfg.RTCStream.EchoCancellation
+	previousState := node.StateIdle
 	wakeActive := false // whether the wake stream is currently being fed (node IDLE)
 	audioNode.OnAudio(func(samples []float32) {
+		handle.Recorder.Add(samples)
+		if len(samples) == 0 {
+			return
+		}
 		state := pNode.GetState()
+		if state != previousState {
+			vadGate.Reset()
+			previousState = state
+		}
 		// Half-duplex gate: while the node is playing its own TTS, the microphone
 		// picks up that audio. Without acoustic echo cancellation, feeding it to the
 		// wake/speaker/barge-in/capture paths causes self-wake and self-barge-in.
@@ -336,12 +349,8 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		}
 
 		vadGate.AcceptWaveform(samples)
+		r.brain.Sessions().FeedPCM(nodeCfg.NodeID, samples, vadGate.IsSpeech())
 		for !vadGate.IsEmpty() {
-			segment := vadGate.Front()
-
-			// Fan the segment out to any active /ask or AutoAsk sessions
-			// (barge-in signaling + capture) on this node.
-			r.brain.FeedAudio(nodeCfg.NodeID, segment.Samples)
 			vadGate.Pop()
 		}
 

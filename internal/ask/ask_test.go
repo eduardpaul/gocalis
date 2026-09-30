@@ -11,6 +11,7 @@ import (
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 	"gocalis/internal/node"
+	"gocalis/internal/session"
 )
 
 type testTTS struct{ err error }
@@ -118,5 +119,37 @@ func TestParentCancellationDoesNotTranscribe(t *testing.T) {
 	result := e.Run(ctx, Config{NodeID: "test"})
 	if result.Status != "error" || len(asr.samples) != 0 {
 		t.Fatalf("cancelled turn = %+v", result)
+	}
+}
+
+func (a *interruptedAudio) PlayStream(ctx context.Context, src audionode.PCM16Source) error {
+	pcm, err := src.ReadPCM16(ctx, 2048)
+	if err != nil {
+		return err
+	}
+	return a.Play(ctx, pcm, src.SampleRate())
+}
+
+func TestLiveSpeechOutlastsOnsetTimeout(t *testing.T) {
+	sess := session.New("turn", "node")
+	sess.StartCapture()
+	sess.FeedPCM([]float32{1}, true)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { waitForEndpoint(ctx, sess, 20*time.Millisecond, 80*time.Millisecond); close(done) }()
+	for i := 0; i < 8; i++ {
+		time.Sleep(10 * time.Millisecond)
+		sess.FeedPCM([]float32{1}, true)
+	}
+	select {
+	case <-done:
+		t.Fatal("onset timeout cut active speech")
+	default:
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("endpoint never closed")
 	}
 }

@@ -52,15 +52,26 @@ type talkbackSender struct {
 	scratch []byte  // reusable opus encode buffer (play goroutine only)
 	pcmIn   []int16 // leftover resampled-to-48k samples not yet framed (play goroutine only)
 
-	playMu sync.Mutex // serializes whole utterances (push+flush+drain)
+	resampler *audio.PCMResampler
+	playMu    sync.Mutex // serializes whole utterances (push+flush+drain)
 
-	mu        sync.Mutex
-	cond      *sync.Cond
-	queue     [][]byte // encoded frames awaiting isochronous pacing
-	closed    bool
-	inFlight  bool
-	done      chan struct{}
-	closeOnce sync.Once
+	mu              sync.Mutex
+	cond            *sync.Cond
+	queue           [][]byte // encoded frames awaiting isochronous pacing
+	closed          bool
+	failure         error
+	writeFailures   uint64
+	routeFailures   uint64
+	maxLateness     int64
+	queueHighWater  int
+	underruns       uint64
+	playing         bool
+	playbackStarted time.Time
+	firstAudioDelay int64
+	firstAudioSent  bool
+	inFlight        bool
+	done            chan struct{}
+	closeOnce       sync.Once
 }
 
 // newTalkbackSender establishes the WHIP producer connection to inStream and the
@@ -135,6 +146,16 @@ func newTalkbackSender(setupCtx context.Context, apiBaseURL, inStream, dstStream
 	connected := make(chan struct{})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("[Talkback] peer connection state: %s", state)
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
+			t.mu.Lock()
+			if !t.closed {
+				t.failure = fmt.Errorf("talkback peer connection: %s", state)
+				t.closed = true
+				t.queue = nil
+				t.cond.Broadcast()
+			}
+			t.mu.Unlock()
+		}
 		if state == webrtc.PeerConnectionStateConnected {
 			select {
 			case <-connected:
@@ -189,7 +210,13 @@ func (t *talkbackSender) assertRoute(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return postStreams(ctx, routeURL)
+	err = postStreams(ctx, routeURL)
+	if err != nil {
+		t.mu.Lock()
+		t.routeFailures++
+		t.mu.Unlock()
+	}
+	return err
 }
 
 // run paces the encoded queue (or silence) onto the WebRTC track at 20ms until ctx
@@ -207,7 +234,12 @@ func (t *talkbackSender) run(ctx context.Context) {
 			t.cond.Broadcast()
 			t.mu.Unlock()
 			return
-		case <-ticker.C:
+		case scheduled := <-ticker.C:
+			t.mu.Lock()
+			if late := time.Since(scheduled).Nanoseconds(); late > t.maxLateness {
+				t.maxLateness = late
+			}
+			t.mu.Unlock()
 		}
 
 		t.mu.Lock()
@@ -216,7 +248,14 @@ func (t *talkbackSender) run(ctx context.Context) {
 			return
 		}
 		frame := t.silence
+		if t.playing && t.firstAudioSent && len(t.queue) == 0 {
+			t.underruns++
+		}
 		if len(t.queue) > 0 {
+			if t.playing && !t.firstAudioSent {
+				t.firstAudioDelay = time.Since(t.playbackStarted).Nanoseconds()
+				t.firstAudioSent = true
+			}
 			frame = t.queue[0]
 			t.queue[0] = nil
 			t.queue = t.queue[1:]
@@ -229,9 +268,15 @@ func (t *talkbackSender) run(ctx context.Context) {
 			Data:     frame,
 			Duration: frameMs * time.Millisecond,
 		}); err != nil {
-			if !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("[Talkback] write sample: %v", err)
-			}
+			t.mu.Lock()
+			t.writeFailures++
+			t.failure = fmt.Errorf("talkback write: %w", err)
+			t.closed = true
+			t.queue = nil
+			t.inFlight = false
+			t.cond.Broadcast()
+			t.mu.Unlock()
+			return
 		}
 		t.mu.Lock()
 		t.inFlight = false
@@ -247,7 +292,10 @@ func (t *talkbackSender) pushPCM(ctx context.Context, pcm16 []int16, srcRate int
 	if srcRate <= 0 {
 		return fmt.Errorf("invalid sample rate")
 	}
-	t.pcmIn = append(t.pcmIn, audio.ResampleInt16(pcm16, srcRate, opusRate)...)
+	if t.resampler == nil {
+		t.resampler = audio.NewPCMResampler(srcRate, opusRate)
+	}
+	t.pcmIn = append(t.pcmIn, t.resampler.Push(pcm16)...)
 	for len(t.pcmIn) >= opusFrameSize {
 		n, err := t.enc.Encode(t.pcmIn[:opusFrameSize], t.scratch)
 		t.pcmIn = t.pcmIn[opusFrameSize:]
@@ -262,6 +310,23 @@ func (t *talkbackSender) pushPCM(ctx context.Context, pcm16 []int16, srcRate int
 }
 
 func (t *talkbackSender) flushPCM(ctx context.Context) error {
+	if t.resampler != nil {
+		t.pcmIn = append(t.pcmIn, t.resampler.Flush()...)
+		t.resampler = nil
+	}
+	if len(t.pcmIn) == 0 {
+		return nil
+	}
+	for len(t.pcmIn) >= opusFrameSize {
+		n, err := t.enc.Encode(t.pcmIn[:opusFrameSize], t.scratch)
+		t.pcmIn = t.pcmIn[opusFrameSize:]
+		if err != nil {
+			return err
+		}
+		if err := t.enqueue(ctx, append([]byte(nil), t.scratch[:n]...)); err != nil {
+			return err
+		}
+	}
 	if len(t.pcmIn) == 0 {
 		return nil
 	}
@@ -287,16 +352,24 @@ func (t *talkbackSender) enqueue(ctx context.Context, frame []byte) error {
 		return err
 	}
 	if t.closed {
+		if t.failure != nil {
+			return t.failure
+		}
 		return io.ErrClosedPipe
 	}
 	t.queue = append(t.queue, frame)
+	if len(t.queue) > t.queueHighWater {
+		t.queueHighWater = len(t.queue)
+	}
 	return nil
 }
 
 func (t *talkbackSender) clearPending() {
 	t.mu.Lock()
 	t.queue = nil
+	t.playing = false
 	t.pcmIn = nil
+	t.resampler = nil
 	t.cond.Broadcast()
 	t.mu.Unlock()
 }
@@ -313,6 +386,9 @@ func (t *talkbackSender) waitDrained(ctx context.Context) error {
 		return err
 	}
 	if t.closed {
+		if t.failure != nil {
+			return t.failure
+		}
 		return io.ErrClosedPipe
 	}
 	return nil

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"gocalis/internal/ai"
+	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 	"gocalis/internal/node"
@@ -79,7 +80,9 @@ func NewEngine(b *brain.Brain, asr ai.Transcriber, speakerID ai.SpeakerIdentifie
 }
 
 // Run executes the ask flow for the given configuration.
-func (e *Engine) Run(ctx context.Context, cfg Config) Result {
+func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
+	startedAt := time.Now()
+	timings := make(map[string]time.Duration)
 	if err := cfg.Validate(); err != nil {
 		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
 	}
@@ -89,6 +92,11 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 	}
 	defer turn.Release()
 	handle := turn.Handle
+	if handle.Config.Diagnostics.Enabled {
+		defer func() {
+			log.Printf("[Ask:%s] diagnostics status=%s total=%s stages=%v", cfg.NodeID, result.Status, time.Since(startedAt), timings)
+		}()
+	}
 	defer handle.Node.SetState(node.StateIdle)
 	handle.Node.SetState(node.StateProcessing)
 
@@ -110,7 +118,11 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 	barged := false
 	startChimeSpoken := false
 	if strings.TrimSpace(cfg.TTSText) != "" {
-		samples, sampleRate, err := e.Brain.Synthesize(ctx, cfg.TTSText, cfg.Priority)
+		promptCtx, cancelPrompt := context.WithCancel(ctx)
+		defer cancelPrompt()
+		synthesisAt := time.Now()
+		prompt, err := e.Brain.SynthesisStream(promptCtx, cfg.TTSText, cfg.Priority)
+		timings["prompt_synthesis"] = time.Since(synthesisAt)
 		if err != nil {
 			return Result{
 				ContextID:    cfg.ContextID,
@@ -120,10 +132,10 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 			}
 		}
 
-		// Only speak when synthesis actually produced audio. Blank/empty text
-		// yields no prompt, in which case just the listening chime is played
-		// below (the TTS pipeline is never run for empty text).
-		if len(samples) > 0 && sampleRate > 0 {
+		// Stream the prompt, then append the listening chime in the same route.
+		if prompt.SampleRate() > 0 {
+			sampleRate := prompt.SampleRate()
+			var samples []int16
 			padForRTC := handle.Config.Type == "rtc_stream"
 			// Concatenate the "start listening" chime onto the prompt so both play
 			// in a single, gapless transmission. Playing the chime as a separate
@@ -141,7 +153,7 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 			}
 			startChimeSpoken = true
 
-			promptCtx, cancelPrompt := context.WithCancel(ctx)
+			source := &promptSource{prompt: prompt, tail: audionode.NewSliceSource(samples, sampleRate)}
 			bargeDone := make(chan struct{})
 			bargeCh := (<-chan struct{})(nil)
 			if cfg.BargeIn {
@@ -164,7 +176,9 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 			// does not emit its own PROCESSING/SPEAKING/IDLE churn — the flow
 			// transitions straight to LISTENING next.
 			handle.Node.SetState(node.StateSpeaking)
-			err := turn.Play(promptCtx, samples, sampleRate)
+			playbackAt := time.Now()
+			err := turn.PlayStream(promptCtx, source)
+			timings["prompt_playback"] = time.Since(playbackAt)
 			cancelPrompt()
 			<-bargeDone
 			barged = sess.DisarmBargeIn()
@@ -198,49 +212,29 @@ func (e *Engine) Run(ctx context.Context, cfg Config) Result {
 
 	// Phase 2: Capture user response until VAD timeout or post-speech silence.
 	sess.ToListening()
-	handle.Node.SetState(node.StateListening)
 	if !barged {
+		if reset, ok := handle.Audio.(interface{ ResetCapture() }); ok {
+			reset.ResetCapture()
+		}
 		sess.StartCapture()
 	}
+	handle.Node.SetState(node.StateListening)
 
+	timings["capture_open_offset"] = time.Since(startedAt)
+	captureAt := time.Now()
 	timeout := time.Duration(cfg.VADTimeoutSeconds * float64(time.Second))
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	deadline := time.After(timeout)
-
-	hadSpeech := false
-	lastCount := 0
-	lastSpeechTime := time.Now()
-
-	pollTicker := time.NewTicker(50 * time.Millisecond)
-	defer pollTicker.Stop()
 
 	postSpeechSilence := cfg.PostSpeechSilenceSeconds
 	if postSpeechSilence <= 0 {
 		postSpeechSilence = handle.Config.GetPostSpeechSilenceSeconds(1.5)
 	}
-
-listenLoop:
-	for {
-		select {
-		case <-ctx.Done():
-			break listenLoop
-		case <-deadline:
-			break listenLoop
-		case <-pollTicker.C:
-			count := sess.CapturedCount()
-			if count > lastCount {
-				hadSpeech = true
-				lastCount = count
-				lastSpeechTime = time.Now()
-			} else if hadSpeech && time.Since(lastSpeechTime) > time.Duration(postSpeechSilence*float64(time.Second)) {
-				break listenLoop
-			}
-		}
-	}
+	waitForEndpoint(ctx, sess, timeout, time.Duration(postSpeechSilence*float64(time.Second)))
 
 	captured := sess.StopCapture()
+	timings["capture"] = time.Since(captureAt)
 	if ctx.Err() != nil {
 		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: ctx.Err().Error()}
 	}
@@ -257,7 +251,16 @@ listenLoop:
 		}
 	}
 
-	transcription, err := e.ASR.TranscribeSamples(ctx, captured, 16000, ai.JobOptions{Priority: cfg.Priority})
+	if err := handle.Recorder.Save(captured); err != nil {
+		log.Printf("[Ask:%s] recording: %v", cfg.NodeID, err)
+	}
+	asrAt := time.Now()
+	transcription, err := e.ASR.TranscribeSamples(ctx, captured, 16000, ai.JobOptions{Priority: cfg.Priority, OnTiming: func(wait, inference time.Duration) {
+		if handle.Config.Diagnostics.Enabled {
+			log.Printf("[Ask:%s] ASR queue=%s inference=%s", cfg.NodeID, wait, inference)
+		}
+	}})
+	timings["asr_total"] = time.Since(asrAt)
 	if err != nil {
 		return Result{
 			ContextID:    cfg.ContextID,
@@ -337,35 +340,13 @@ listenLoop:
 			}
 
 			sess.ToListening()
-			handle.Node.SetState(node.StateListening)
-			sess.StartCapture()
-
-			deadlineSec := time.After(timeout)
-			hadSpeechSec := false
-			lastCountSec := 0
-			lastSpeechTimeSec := time.Now()
-
-			pollTickerSec := time.NewTicker(50 * time.Millisecond)
-			defer pollTickerSec.Stop()
-
-		listenLoopSec:
-			for {
-				select {
-				case <-ctx.Done():
-					break listenLoopSec
-				case <-deadlineSec:
-					break listenLoopSec
-				case <-pollTickerSec.C:
-					count := sess.CapturedCount()
-					if count > lastCountSec {
-						hadSpeechSec = true
-						lastCountSec = count
-						lastSpeechTimeSec = time.Now()
-					} else if hadSpeechSec && time.Since(lastSpeechTimeSec) > time.Duration(postSpeechSilence*float64(time.Second)) {
-						break listenLoopSec
-					}
-				}
+			if reset, ok := handle.Audio.(interface{ ResetCapture() }); ok {
+				reset.ResetCapture()
 			}
+			sess.StartCapture()
+			handle.Node.SetState(node.StateListening)
+
+			waitForEndpoint(ctx, sess, timeout, time.Duration(postSpeechSilence*float64(time.Second)))
 
 			secondaryCaptured := sess.StopCapture()
 			if ctx.Err() != nil {
@@ -477,4 +458,28 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Wait for onset separately from the bounded spoken turn. PCM arrival is not
+// speech activity: natural pauses remain in the waveform without stacking waits.
+func waitForEndpoint(ctx context.Context, sess *session.Session, onsetTimeout, silence time.Duration) {
+	opened := time.Now()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		started, last := sess.SpeechActivity()
+		now := time.Now()
+		if started.IsZero() {
+			if now.Sub(opened) >= onsetTimeout {
+				return
+			}
+		} else if now.Sub(last) >= silence || now.Sub(started) >= ai.MaxAudioSeconds*time.Second {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }

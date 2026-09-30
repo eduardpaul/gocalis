@@ -14,6 +14,7 @@ import (
 )
 
 type DeviceSpec struct {
+	Faults           FaultSpec      `yaml:"faults,omitempty" json:"faults,omitempty"`
 	KWS              map[string]any `yaml:"kws,omitempty" json:"-"`
 	EchoCancellation *bool          `yaml:"echo_cancellation,omitempty" json:"-"`
 	ID               string         `yaml:"id" json:"id"`
@@ -51,6 +52,9 @@ func loadManifest(path string) (Manifest, error) {
 	for _, v := range m.Devices {
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]{1,40}$`).MatchString(v.ID) || seen[v.ID] || (v.Profile != "bidirectional" && v.Profile != "doorbell") {
 			return m, fmt.Errorf("invalid or duplicate device: %+v", v)
+		}
+		if v.Faults.DropEvery < 0 || v.Faults.ReorderEvery < 0 || v.Faults.BurstEvery < 0 || v.Faults.BurstFrames < 0 || v.Faults.BurstFrames > 50 || (v.Faults.BurstEvery > 0 && v.Faults.BurstEvery <= v.Faults.BurstFrames) {
+			return m, fmt.Errorf("invalid transport faults for %s", v.ID)
 		}
 		seen[v.ID] = true
 	}

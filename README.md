@@ -277,3 +277,7 @@ Shutdown cancels commands, closes event connections, joins command/wake/capture/
 speaker capture beside a pinned go2rtc instance, a localhost browser UI, YAML
 scenarios, and container transport checks using Gocalis's real WebRTC client.
 It supports bidirectional Opus and the existing WHIP → AAC-ELD doorbell route.
+
+Doorbell capture/transport behavior, opt-in diagnostics, simulator faults, and
+physical measurement steps are documented in
+[Doorbell audio reliability](docs/doorbell-audio-reliability.md).

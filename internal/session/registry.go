@@ -60,3 +60,12 @@ func (r *Registry) ActiveCount(nodeID string) int {
 	defer r.mu.RUnlock()
 	return len(r.byNode[nodeID])
 }
+
+// FeedPCM fans continuous microphone PCM and live VAD activity to active turns.
+func (r *Registry) FeedPCM(nodeID string, samples []float32, speech bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.byNode[nodeID] {
+		s.FeedPCM(samples, speech)
+	}
+}
