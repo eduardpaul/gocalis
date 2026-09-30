@@ -1,0 +1,19 @@
+name: simultaneous-asks
+requires: [../fixtures/question.wav, ../fixtures/office-question.wav]
+sequences:
+  kitchen:
+    - action: command
+      timeout: 5s
+      command: {action: ask, text: 'Kitchen question?', vad_timeout_seconds: 8, capture_delay_seconds: 0, post_speech_silence_seconds: 0.5}
+    - {action: wait_activity, timeout: 10s}
+    - {action: replay, replay: ../fixtures/question.wav}
+    - {action: wait_event, event: ask_completed, contains: 'hello', timeout: 20s}
+    - {action: assert_output, min_active_seconds: 0.2, max_seconds: 30}
+  office:
+    - action: command
+      timeout: 5s
+      command: {action: ask, text: 'Office question?', vad_timeout_seconds: 8, capture_delay_seconds: 0, post_speech_silence_seconds: 0.5}
+    - {action: wait_activity, timeout: 10s}
+    - {action: replay, replay: ../fixtures/office-question.wav}
+    - {action: wait_event, event: ask_completed, contains: 'office', timeout: 20s}
+    - {action: assert_output, min_active_seconds: 0.2, max_seconds: 30}

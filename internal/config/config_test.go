@@ -1,6 +1,7 @@
 package config
 
 import (
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,5 +94,23 @@ func TestDiagnosticModeValidatesOnlyItsModelFiles(t *testing.T) {
 	}
 	if err := cfg.ValidateModelFiles("asr-file", "room"); err == nil {
 		t.Fatal("missing ASR model was not reported")
+	}
+}
+
+func TestICEConfigurationPresence(t *testing.T) {
+	for _, tc := range []struct {
+		text  string
+		empty bool
+	}{
+		{"api_url: http://localhost:11984\nstream_name: kitchen\n", false},
+		{"api_url: http://localhost:11984\nstream_name: kitchen\nice_servers: []\n", true},
+	} {
+		var cfg RTCStreamConfig
+		if err := yaml.Unmarshal([]byte(tc.text), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if (cfg.ICEServers != nil) != tc.empty {
+			t.Fatalf("ICE presence lost: %+v", cfg)
+		}
 	}
 }

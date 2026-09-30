@@ -432,7 +432,7 @@ func runRTCRecordMode(cfg *config.Config, nodeID, streamName, outputFile string,
 	if err != nil {
 		log.Fatalf("RTCRecord: failed to build signaling URL: %v", err)
 	}
-	client, err := webrtc.NewClient(signaling)
+	client, err := webrtc.NewClientWithConfig(webrtc.Config{SignalingURL: signaling, ICEServers: nodeCfg.RTCStream.ICEServers})
 	if err != nil {
 		log.Fatalf("RTCRecord: failed to create WebRTC client: %v", err)
 	}
@@ -482,7 +482,7 @@ func runRTCSayMode(cfg *config.Config, nodeID, streamName, sendCodec, text strin
 	if err != nil {
 		log.Fatalf("RTCSay: failed to build signaling URL: %v", err)
 	}
-	client, err := webrtc.NewClientWithSendCodec(signaling, sendCodec)
+	client, err := webrtc.NewClientWithConfig(webrtc.Config{SignalingURL: signaling, SendCodec: sendCodec, ICEServers: nodeCfg.RTCStream.ICEServers})
 	if err != nil {
 		log.Fatalf("RTCSay: failed to create WebRTC client: %v", err)
 	}
@@ -525,7 +525,7 @@ func runRTCLoopbackMode(cfg *config.Config, nodeID, streamName, sendCodec string
 	if err != nil {
 		log.Fatalf("RTCLoopback: failed to build signaling URL: %v", err)
 	}
-	client, err := webrtc.NewClientWithSendCodec(signaling, sendCodec)
+	client, err := webrtc.NewClientWithConfig(webrtc.Config{SignalingURL: signaling, SendCodec: sendCodec, ICEServers: nodeCfg.RTCStream.ICEServers})
 	if err != nil {
 		log.Fatalf("RTCLoopback: failed to create WebRTC client: %v", err)
 	}

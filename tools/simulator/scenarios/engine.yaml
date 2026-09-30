@@ -1,0 +1,18 @@
+name: concurrent-input-and-reconnect
+sequences:
+  kitchen:
+    - {action: tone, hz: 600, seconds: 0.5}
+    - {action: wait_activity, direction: input, min_rms: 0.1, timeout: 2s}
+    - {action: wait_input_idle, timeout: 2s}
+    - {action: disconnect}
+    - {action: wait, seconds: 0.1, timeout: 1s}
+    - {action: reconnect}
+  office:
+    - {action: tone, hz: 800, seconds: 0.5}
+    - {action: wait_activity, direction: input, min_rms: 0.1, timeout: 2s}
+    - {action: stop}
+    - {action: wait_input_idle, timeout: 1s}
+  doorbell:
+    - {action: tone, hz: 1000, seconds: 0.5}
+    - {action: wait_activity, direction: input, min_rms: 0.1, timeout: 2s}
+    - {action: wait_input_idle, timeout: 2s}

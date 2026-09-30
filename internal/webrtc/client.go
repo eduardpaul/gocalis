@@ -18,6 +18,7 @@ import (
 
 	"gocalis/internal/audio"
 	"gocalis/internal/audionode"
+	"gocalis/internal/config"
 	"gocalis/internal/taskgroup"
 )
 
@@ -88,12 +89,14 @@ type Client struct {
 	reconnectMu  sync.Mutex
 	reconnecting bool
 	closing      bool
+	iceServers   []config.ICEServer
 }
 
 // Config configures a WebRTC Client. SignalingURL and SendCodec drive the receive
 // PeerConnection (WebSocket signaling to go2rtc); the remaining fields enable the
 // HomeKit doorbell talkback backchannel.
 type Config struct {
+	ICEServers []config.ICEServer
 	// SignalingURL is the go2rtc WebSocket signaling URL (ws://.../api/ws?src=...).
 	SignalingURL string
 	// SendCodec is "opus" (default), "opus-sendonly", or "pcmu".
@@ -167,12 +170,7 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
-	config := webrtc.Configuration{
-		BundlePolicy: webrtc.BundlePolicyMaxBundle,
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	}
+	config := webrtc.Configuration{BundlePolicy: webrtc.BundlePolicyMaxBundle, ICEServers: iceServers(cfg.ICEServers)}
 
 	pc, err := api.NewPeerConnection(config)
 	if err != nil {
@@ -200,6 +198,7 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 	client := &Client{
 		ctx: ctx, cancel: cancel, tasks: taskgroup.New(ctx, 32),
 		signalingURL:   cfg.SignalingURL,
+		iceServers:     cfg.ICEServers,
 		sendCodec:      sendCodec,
 		pc:             pc,
 		localTrack:     localTrack,
@@ -760,7 +759,7 @@ func (c *Client) ensureTalkback(parent context.Context) (*talkbackSender, error)
 	setupCtx, cancelSetup := context.WithTimeout(parent, 20*time.Second)
 	stop := context.AfterFunc(ctx, cancelSetup)
 	defer stop()
-	tb, err := newTalkbackSender(setupCtx, c.apiBaseURL, in, c.talkbackStream)
+	tb, err := newTalkbackSender(setupCtx, c.apiBaseURL, in, c.talkbackStream, c.iceServers)
 	cancelSetup()
 	if err != nil {
 		cancel()
@@ -833,4 +832,15 @@ func (c *Client) deliver(samples []float32) {
 	if c.onAudioRx != nil && c.ctx.Err() == nil {
 		c.onAudioRx(samples)
 	}
+}
+
+func iceServers(servers []config.ICEServer) []webrtc.ICEServer {
+	if servers == nil {
+		return []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
+	}
+	result := make([]webrtc.ICEServer, len(servers))
+	for i, server := range servers {
+		result[i] = webrtc.ICEServer{URLs: server.URLs, Username: server.Username, Credential: server.Credential}
+	}
+	return result
 }

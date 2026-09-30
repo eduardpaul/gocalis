@@ -1,0 +1,4 @@
+generated/
+runs/
+simulator
+fixtures/*.wav

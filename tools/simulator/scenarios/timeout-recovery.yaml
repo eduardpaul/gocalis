@@ -1,0 +1,14 @@
+name: timeout-recovery
+requires: [../fixtures/question.wav]
+sequences:
+  kitchen:
+    - action: command
+      timeout: 5s
+      command: {action: ask, text: '', vad_timeout_seconds: 1, capture_delay_seconds: 0}
+    - {action: wait_event, event: ask_completed, field: status, contains: silence_timeout, timeout: 8s}
+    - action: command
+      timeout: 5s
+      command: {action: ask, text: '', vad_timeout_seconds: 8, capture_delay_seconds: 0, post_speech_silence_seconds: 0.5}
+    - {action: wait, seconds: 0.3, timeout: 2s}
+    - {action: replay, replay: ../fixtures/question.wav}
+    - {action: wait_event, event: ask_completed, contains: 'hello', timeout: 20s}

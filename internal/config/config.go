@@ -125,10 +125,18 @@ type AudioConfig struct {
 }
 
 // RTCStreamConfig holds settings for WebRTC connections.
+type ICEServer struct {
+	URLs       []string `yaml:"urls"`
+	Username   string   `yaml:"username"`
+	Credential string   `yaml:"credential"`
+}
+
 type RTCStreamConfig struct {
-	ApiURL       string  `yaml:"api_url"`
-	StreamName   string  `yaml:"stream_name"`
-	OutputGainDb float32 `yaml:"output_gain_db"`
+	// Nil preserves the default STUN server; an explicit empty list disables it.
+	ICEServers   []ICEServer `yaml:"ice_servers"`
+	ApiURL       string      `yaml:"api_url"`
+	StreamName   string      `yaml:"stream_name"`
+	OutputGainDb float32     `yaml:"output_gain_db"`
 
 	// TalkbackStream, when set, routes outbound TTS to a HomeKit doorbell
 	// backchannel via the go2rtc streams API (an ffmpeg "#audio=eld" producer

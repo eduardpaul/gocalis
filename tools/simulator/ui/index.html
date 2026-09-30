@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gocalis audio simulator</title>
+<style>
+:root{font:16px system-ui;color:#e8edf4;background:#101722;color-scheme:dark}body{max-width:1160px;margin:40px auto;padding:0 24px}h1{font-size:28px;margin-bottom:8px}p{color:#acbacb}#devices{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}article,section{background:#192333;border:1px solid #33445c;border-radius:12px;padding:20px;margin:16px 0}h2{font-size:20px;margin:0 0 10px}button,input,textarea{font:inherit}button{padding:8px 12px;margin:4px 3px 4px 0;border:1px solid #476381;border-radius:6px;background:#263c55;cursor:pointer}button:disabled{opacity:.45}input{max-width:100%}meter{width:100%;height:18px}label{display:block;margin:10px 0}small{color:#acbacb}.stats{white-space:pre-wrap;font:13px ui-monospace;line-height:1.6}audio{width:100%;margin-top:12px}#message{min-height:24px;color:#f3c480}textarea{width:100%;box-sizing:border-box;min-height:180px;background:#101722;border:1px solid #476381;padding:12px;border-radius:6px}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>
+<h1>Gocalis audio simulator</h1><p>Virtual microphones and speakers · localhost · Opus and AAC-ELD</p><div id="message" role="status"></div><main id="devices"></main>
+<section><h2>Run a scenario</h2><p>Device sequences run concurrently. Replay paths refer to mounted simulator fixtures; all waits require a timeout.</p><textarea id="scenario" aria-label="Scenario YAML">name: quick-input
+sequences:
+  kitchen:
+    - action: tone
+      hz: 600
+      seconds: 1
+    - action: wait_input_idle
+      timeout: 3s
+</textarea><button id="run">Run scenario</button><pre id="report"></pre></section>
+<script type="module" src="/app.js"></script></html>

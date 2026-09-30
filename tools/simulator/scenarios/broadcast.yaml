@@ -1,0 +1,16 @@
+name: broadcast
+sequences:
+  kitchen:
+    - action: command
+      timeout: 5s
+      command: {action: tts, node_id: all, text: 'This is a simulator broadcast.'}
+    - {action: wait_event, event: tts_completed, timeout: 30s}
+    - {action: assert_output, min_active_seconds: 0.5, max_seconds: 40}
+  office:
+    - {action: wait_activity, timeout: 30s}
+    - {action: wait, seconds: 5, timeout: 10s}
+    - {action: assert_output, min_active_seconds: 0.5, max_seconds: 40}
+  doorbell:
+    - {action: wait_activity, timeout: 30s}
+    - {action: wait, seconds: 5, timeout: 10s}
+    - {action: assert_output, min_active_seconds: 0.5, max_seconds: 40}

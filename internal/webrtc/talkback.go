@@ -18,6 +18,7 @@ import (
 	opus "gopkg.in/hraban/opus.v2"
 
 	"gocalis/internal/audio"
+	"gocalis/internal/config"
 )
 
 // talkbackBitrate is the Opus bitrate for the WHIP producer feeding go2rtc. It is
@@ -65,13 +66,17 @@ type talkbackSender struct {
 // newTalkbackSender establishes the WHIP producer connection to inStream and the
 // AAC-ELD route into dstStream. setupCtx bounds the handshake; the caller starts
 // run() with a long-lived context afterwards.
-func newTalkbackSender(setupCtx context.Context, apiBaseURL, inStream, dstStream string) (*talkbackSender, error) {
+func newTalkbackSender(setupCtx context.Context, apiBaseURL, inStream, dstStream string, servers []config.ICEServer) (*talkbackSender, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("talkback register codecs: %w", err)
 	}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
-	pc, err := api.NewPeerConnection(webrtc.Configuration{})
+	var configuredICE []webrtc.ICEServer
+	if servers != nil {
+		configuredICE = iceServers(servers)
+	}
+	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: configuredICE})
 	if err != nil {
 		return nil, fmt.Errorf("talkback peer connection: %w", err)
 	}

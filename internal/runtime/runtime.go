@@ -116,6 +116,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		}
 		rtcCfg = webrtc.Config{
 			SignalingURL:   sigURL,
+			ICEServers:     nodeCfg.RTCStream.ICEServers,
 			SendCodec:      "opus",
 			APIBaseURL:     nodeCfg.RTCStream.ApiURL,
 			TalkbackStream: nodeCfg.RTCStream.TalkbackStream,

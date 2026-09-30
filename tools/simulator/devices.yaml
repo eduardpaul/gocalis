@@ -1,0 +1,8 @@
+http: 127.0.0.1:18080
+rtsp: 127.0.0.1:18554
+go2rtc: http://127.0.0.1:11984
+app: http://127.0.0.1:18081
+devices:
+  - {id: kitchen, profile: bidirectional}
+  - {id: office, profile: bidirectional}
+  - {id: doorbell, profile: doorbell}

@@ -1,0 +1,12 @@
+# Enable kws.auto_ask and provide KWS model paths in this device's manifest entry.
+name: wake-autoask
+requires: [../fixtures/wake.wav, ../fixtures/question.wav]
+sequences:
+  kitchen:
+    - {action: replay, replay: ../fixtures/wake.wav}
+    - {action: wait_input_idle, timeout: 5s}
+    - {action: wait_activity, timeout: 10s}
+    - {action: wait, seconds: 2, timeout: 4s}
+    - {action: replay, replay: ../fixtures/question.wav}
+    - {action: wait_event, event: wake, contains: 'hello', timeout: 20s}
+    - {action: assert_output, min_active_seconds: 0.2, max_seconds: 30}

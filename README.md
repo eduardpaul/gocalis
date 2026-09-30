@@ -270,3 +270,10 @@ HTTP `/api/ask` and `/ask` use the same fields as an `action: ask` command: `tex
 Each service admits at most 32 concurrent commands. Model and per-node queues hold at most 32 pending jobs/turns. Text is limited to 4,000 bytes; audio and capture to 120 seconds; HTTP and WebSocket command messages to 8 MiB. Each WebSocket server admits at most 64 clients with 32 queued outbound events per client and a five-second write deadline. Slow consumers are disconnected. Talkback buffers at most 100 encoded frames and discards pending playback on cancellation.
 
 Shutdown cancels commands, closes event connections, joins command/wake/capture/reload work, and only then closes inference engines. An engine waits for any active native call before deleting its model. The review and rationale are in [docs/architecture-performance-review.md](docs/architecture-performance-review.md).
+
+### Local multi-device audio simulator
+
+[tools/simulator](tools/simulator/README.md) provides virtual RTSP microphones and
+speaker capture beside a pinned go2rtc instance, a localhost browser UI, YAML
+scenarios, and container transport checks using Gocalis's real WebRTC client.
+It supports bidirectional Opus and the existing WHIP → AAC-ELD doorbell route.

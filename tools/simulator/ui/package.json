@@ -1,0 +1,1 @@
+{"private":true,"type":"module","scripts":{"test":"node --check app.js && node --check worklet.js && node --test *.test.js"}}

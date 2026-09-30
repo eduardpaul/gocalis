@@ -1,0 +1,82 @@
+name: gocalis-simulator
+services:
+  generate:
+    build: {context: ../.., dockerfile: tools/simulator/Dockerfile, target: runtime}
+    image: gocalis-simulator:local
+    network_mode: host
+    command: [-mode, generate, -manifest, /config/devices.yaml, -base-config, /config/base.yaml, -out, /generated]
+    volumes:
+      - ./devices.yaml:/config/devices.yaml:ro
+      - ../../config.yaml:/config/base.yaml:ro
+      - ./generated:/generated
+  simulator:
+    image: gocalis-simulator:local
+    network_mode: host
+    command: [-manifest, /config/devices.yaml, -out, /runs]
+    volumes:
+      - ./devices.yaml:/config/devices.yaml:ro
+      - ./runs:/runs
+      - ./fixtures:/src/fixtures:ro
+    healthcheck:
+      test: [CMD, curl, -f, http://127.0.0.1:18080/api/devices]
+      interval: 2s
+      timeout: 1s
+      retries: 20
+  go2rtc:
+    image: gocalis-simulator:local
+    network_mode: host
+    entrypoint: [/go/bin/go2rtc]
+    command: [-config, /config/go2rtc.yaml]
+    volumes: [./generated:/config:ro]
+    depends_on:
+      simulator: {condition: service_healthy}
+  gocalis:
+    profiles: [full-app]
+    build: {context: ../.., target: runtime}
+    network_mode: host
+    command: [-config, /config/gocalis.yaml, -http-addr, '127.0.0.1:18081', -ws-addr, '127.0.0.1:19090']
+    volumes:
+      - ./generated:/config:ro
+      - ${GOCALIS_MODELS:-../../models}:/app/models:ro
+    depends_on: [go2rtc]
+  engine-tests:
+    profiles: [checks]
+    build: {context: ../.., dockerfile: tools/simulator/Dockerfile, target: test}
+    image: gocalis-simulator-checks:local
+    network_mode: host
+    entrypoint: [go]
+    command: [test, -race, -timeout=2m, ./...]
+  transport-tests:
+    profiles: [checks]
+    build: {context: ../.., target: test}
+    image: gocalis-simulator-app-checks:local
+    network_mode: host
+    environment: {GOCALIS_SIMULATOR: 'http://127.0.0.1:18080'}
+    command: [go, test, -race, -v, -timeout=2m, ./internal/webrtc, -run, TestSimulatorTransport]
+    depends_on: [go2rtc]
+  frontend-checks:
+    profiles: [checks]
+    image: node:24.15.0-bookworm-slim
+    working_dir: /ui
+    volumes: [./ui:/ui:ro]
+    command: [npm, test]
+  scenario:
+    profiles: [scenarios]
+    image: gocalis-simulator:local
+    network_mode: host
+    working_dir: /sim
+    command: [-mode, scenario, -scenario, /scenarios/engine.yaml, -out, /runs/cli]
+    volumes:
+      - ./scenarios:/scenarios:ro
+      - ./fixtures:/fixtures:ro
+      - ./runs:/runs
+    depends_on: [go2rtc]
+  browser-checks:
+    profiles: [checks]
+    image: mcr.microsoft.com/playwright:v1.51.1-noble
+    network_mode: host
+    ipc: host
+    volumes: [./ui:/tests:ro]
+    entrypoint: [bash, -c]
+    command: ['npm install --prefix /tmp/check playwright@1.51.1 >/dev/null && NODE_PATH=/tmp/check/node_modules node /tests/browser.cjs']
+    depends_on: [simulator]
