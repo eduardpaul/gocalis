@@ -10,7 +10,11 @@ const API_URL = `${window.location.protocol}//${window.location.host}/api`
 
 function App() {
   const [connected, setConnected] = useState(false)
-  const [token, setToken] = useState(() => sessionStorage.getItem('gocalis-token') || '')
+  // A ?token= query parameter (e.g. a bookmarked or kiosk URL) takes precedence
+  // over the token remembered for this browser session.
+  const [token, setToken] = useState(() =>
+    new URLSearchParams(window.location.search).get('token') ||
+    sessionStorage.getItem('gocalis-token') || '')
   const [tokenDraft, setTokenDraft] = useState(token)
   const [status, setStatus] = useState(null)
   const [nodes, setNodes] = useState([])
