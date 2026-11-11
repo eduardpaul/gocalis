@@ -3,6 +3,7 @@ package webrtc
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -471,6 +472,52 @@ func webrtcInputURL(baseURL, stream string) (string, error) {
 	q.Set("dst", stream)
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// routeActive reports whether go2rtc currently lists the AAC-ELD bridge as a
+// producer of the HomeKit backchannel stream. go2rtc accepts a route POST even
+// when the bridge dies right after (e.g. while the HomeKit session is still
+// coming up after a restart), so the POST result alone proves nothing.
+func (t *talkbackSender) routeActive(ctx context.Context) (bool, error) {
+	u, err := url.Parse(t.apiBaseURL)
+	if err != nil {
+		return false, err
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/api/streams"
+	u.RawQuery = url.Values{"src": {t.dstStream}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("go2rtc returned %s", res.Status)
+	}
+	var stream struct {
+		Producers []struct {
+			URL string `json:"url"`
+		} `json:"producers"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&stream); err != nil {
+		return false, err
+	}
+	// A bridge added via ?dst= is listed as an rtsp producer whose url is its
+	// input, e.g. rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld;
+	// a bridge declared in go2rtc.yaml is listed with the ffmpeg: url itself.
+	source := "ffmpeg:" + t.inStream + "#audio=eld"
+	for _, p := range stream.Producers {
+		if p.URL == source {
+			return true, nil
+		}
+		if pu, err := url.Parse(p.URL); err == nil && pu.Query().Get("source") == source {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func streamsURL(baseURL, dst, src string) (string, error) {

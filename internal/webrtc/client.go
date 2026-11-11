@@ -331,7 +331,12 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err := c.connect(ctx, pc, gen); err != nil {
 		return err
 	}
-	c.watchdog.Do(func() { _ = c.tasks.Go(c.rxWatchdog) })
+	c.watchdog.Do(func() {
+		_ = c.tasks.Go(c.rxWatchdog)
+		if c.talkbackEnabled() {
+			_ = c.tasks.Go(c.talkbackWatchdog)
+		}
+	})
 	c.warmTalkback(ctx)
 	return nil
 }
@@ -857,6 +862,72 @@ func (c *Client) rxWatchdog(lifetime context.Context) {
 			c.scheduleReconnect(gen, fmt.Sprintf("no audio for %v", idle.Round(time.Second)))
 		}
 	}
+}
+
+// talkbackWatchdog keeps the talkback backchannel warm: when the cached sender
+// has failed (e.g. go2rtc restarted, which kills the WHIP producer and the
+// AAC-ELD route) or was never established, it is re-created right away so the
+// next spoken reply does not pay the producer + route setup latency.
+func (c *Client) talkbackWatchdog(lifetime context.Context) {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-lifetime.Done():
+			return
+		case <-t.C:
+		}
+		if c.talkbackHealthy() {
+			c.ensureTalkbackRoute(lifetime)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(lifetime, 20*time.Second)
+		if _, err := c.ensureTalkback(ctx); err != nil {
+			log.Printf("[Talkback] re-warm failed: %v", err)
+		} else {
+			log.Printf("[Talkback] backchannel re-established")
+		}
+		cancel()
+	}
+}
+
+// ensureTalkbackRoute re-asserts the AAC-ELD bridge when go2rtc no longer lists
+// it (it dies silently if posted while the HomeKit session is still starting).
+func (c *Client) ensureTalkbackRoute(lifetime context.Context) {
+	c.tbMu.Lock()
+	tb := c.tb
+	c.tbMu.Unlock()
+	if tb == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(lifetime, 5*time.Second)
+	defer cancel()
+	active, err := tb.routeActive(ctx)
+	if err != nil || active {
+		return
+	}
+	if err := tb.assertRoute(ctx); err != nil {
+		log.Printf("[Talkback] AAC-ELD route missing; re-assert failed: %v", err)
+		return
+	}
+	log.Printf("[Talkback] AAC-ELD route was missing; re-asserted")
+}
+
+// talkbackHealthy reports whether a cached talkback sender exists and is usable.
+func (c *Client) talkbackHealthy() bool {
+	c.tbMu.Lock()
+	defer c.tbMu.Unlock()
+	if c.tb == nil {
+		return false
+	}
+	c.tb.mu.Lock()
+	closed := c.tb.closed
+	c.tb.mu.Unlock()
+	switch c.tb.pc.ConnectionState() {
+	case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateClosed:
+		return false
+	}
+	return !closed
 }
 
 // talkbackEnabled reports whether outbound TTS should use the go2rtc AAC-ELD
