@@ -18,13 +18,15 @@ type Request struct {
 	AudioWavBase64 string `json:"audio_wav_base64,omitempty"`
 
 	// Ask-specific fields (used when action == "ask").
-	ContextID                string  `json:"context_id,omitempty"`
-	BargeIn                  bool    `json:"barge_in,omitempty"`
-	RequireSpeakerID         bool    `json:"require_speaker_id,omitempty"`
-	OutputFormat             string  `json:"output_format,omitempty"`
-	VADTimeoutSeconds        float64 `json:"vad_timeout_seconds,omitempty"`
-	CaptureDelaySeconds      float64 `json:"capture_delay_seconds,omitempty"`
-	PostSpeechSilenceSeconds float64 `json:"post_speech_silence_seconds,omitempty"`
+	ContextID         string  `json:"context_id,omitempty"`
+	BargeIn           bool    `json:"barge_in,omitempty"`
+	RequireSpeakerID  bool    `json:"require_speaker_id,omitempty"`
+	OutputFormat      string  `json:"output_format,omitempty"`
+	VADTimeoutSeconds float64 `json:"vad_timeout_seconds,omitempty"`
+	// CaptureDelaySeconds is a pointer so an explicit 0 (no delay) can be told
+	// apart from "omitted" (use the node's auto_ask_capture_delay_seconds).
+	CaptureDelaySeconds      *float64 `json:"capture_delay_seconds,omitempty"`
+	PostSpeechSilenceSeconds float64  `json:"post_speech_silence_seconds,omitempty"`
 
 	// Intercom fields. For action == "intercom", the participants are NodeIDs
 	// (two or more); as a convenience for two-node calls NodeID + PeerNodeID may

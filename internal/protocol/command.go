@@ -250,9 +250,10 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 		return
 	}
 
-	log.Printf("[Executor] Ask on node '%s' (barge_in=%v)\n", req.NodeID, req.BargeIn)
+	cfg := e.AskConfig(req)
+	log.Printf("[Executor] Ask on node '%s' (barge_in=%v, capture_delay=%.2fs)\n", req.NodeID, req.BargeIn, cfg.CaptureDelaySeconds)
 
-	result := e.AskEngine.Run(ctx, req.AskConfig())
+	result := e.AskEngine.Run(ctx, cfg)
 
 	resp := Response{
 		Event:   "ask_completed",
@@ -339,8 +340,30 @@ func (e *Executor) Submit(req Request) error {
 	})
 }
 
+// AskConfig converts the request into an ask configuration. An omitted
+// capture_delay_seconds yields 0 here; use Executor.AskConfig to apply the
+// node's configured default.
 func (r Request) AskConfig() ask.Config {
-	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: r.CaptureDelaySeconds, Priority: r.Priority}
+	var captureDelay float64
+	if r.CaptureDelaySeconds != nil {
+		captureDelay = *r.CaptureDelaySeconds
+	}
+	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: captureDelay, Priority: r.Priority}
+}
+
+// AskConfig resolves an ask request for execution. When the request omits
+// capture_delay_seconds, the node's auto_ask_capture_delay_seconds applies, so
+// API asks get the same post-prompt guard as wake-triggered asks (it keeps a
+// half-duplex device from re-capturing its own prompt/chime tail). An explicit
+// value, including 0, always wins.
+func (e *Executor) AskConfig(req Request) ask.Config {
+	cfg := req.AskConfig()
+	if req.CaptureDelaySeconds == nil && e.Brain != nil {
+		if h := e.Brain.GetNodeHandle(req.NodeID); h != nil {
+			cfg.CaptureDelaySeconds = h.Config.GetAutoAskCaptureDelaySeconds(1.5)
+		}
+	}
+	return cfg
 }
 
 // maxIntercomNodes bounds the participants of one intercom call; each one costs

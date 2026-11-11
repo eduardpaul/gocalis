@@ -13,6 +13,7 @@
             requireSpeakerId: { value: false },
             outputFormat: { value: "both" },
             vadTimeout: { value: 10.0, validate: RED.validators.number() },
+            captureDelay: { value: "", validate: function(v) { return v === "" || !isNaN(parseFloat(v)); } },
             priority: { value: 0, validate: RED.validators.number() }
         },
         inputs: 1,
@@ -78,6 +79,10 @@
     <div class="form-row">
         <label for="node-input-vadTimeout"><i class="fa fa-clock-o"></i> VAD Timeout</label>
         <input type="number" id="node-input-vadTimeout" placeholder="10.0" step="0.5" min="1">
+    </div>
+    <div class="form-row">
+        <label for="node-input-captureDelay"><i class="fa fa-hourglass-start"></i> Capture Delay</label>
+        <input type="number" id="node-input-captureDelay" placeholder="node default (auto_ask_capture_delay_seconds)" step="0.1" min="0">
     </div>
     <div class="form-row">
         <label for="node-input-priority"><i class="fa fa-sort-amount-desc"></i> Priority</label>

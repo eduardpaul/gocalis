@@ -3,6 +3,11 @@ package protocol
 import (
 	"path/filepath"
 	"testing"
+
+	"gocalis/internal/audionode"
+	"gocalis/internal/brain"
+	"gocalis/internal/config"
+	"gocalis/internal/node"
 )
 
 func TestResolveAudioFile(t *testing.T) {
@@ -64,6 +69,35 @@ func TestValidateIntercomActions(t *testing.T) {
 			err := tc.req.Validate()
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// An omitted capture_delay_seconds takes the node's configured default; an
+// explicit value (including 0) always wins.
+func TestExecutorAskConfigCaptureDelay(t *testing.T) {
+	b := brain.New(nil)
+	cfg := config.NodeConfig{NodeID: "door"}
+	cfg.KWS.AutoAskCaptureDelaySeconds = 0.8
+	b.RegisterNode("door", &brain.NodeHandle{Node: node.NewPhysicalNode("door", "rtc_stream"), Audio: &audionode.Stub{}, Config: cfg})
+	e := &Executor{Brain: b}
+
+	zero, one := 0.0, 1.0
+	tests := []struct {
+		name string
+		req  Request
+		want float64
+	}{
+		{"omitted uses node default", Request{NodeID: "door"}, 0.8},
+		{"explicit zero wins", Request{NodeID: "door", CaptureDelaySeconds: &zero}, 0},
+		{"explicit value wins", Request{NodeID: "door", CaptureDelaySeconds: &one}, 1},
+		{"unknown node", Request{NodeID: "nope"}, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := e.AskConfig(tc.req).CaptureDelaySeconds; got != tc.want {
+				t.Fatalf("CaptureDelaySeconds = %v, want %v", got, tc.want)
 			}
 		})
 	}

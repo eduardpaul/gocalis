@@ -328,7 +328,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	result := s.executor.AskEngine.Run(r.Context(), req.AskConfig())
+	result := s.executor.AskEngine.Run(r.Context(), s.executor.AskConfig(req))
 	var audioBase64 string
 	if (req.OutputFormat == "audio" || req.OutputFormat == "both") && len(result.Audio) > 0 {
 		audioBase64 = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, result.SampleRate))
