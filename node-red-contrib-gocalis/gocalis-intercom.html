@@ -1,0 +1,88 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-intercom',{
+        category: 'Gocalis Voice',
+        color: '#a78bfa',
+        defaults: {
+            name: { value: "" },
+            server: { value: "", type: "gocalis-config", required: true },
+            nodeIds: { value: "" },
+            nodeIdsType: { value: "str" },
+            duration: { value: 0, validate: RED.validators.number() }
+        },
+        inputs: 1,
+        outputs: 2,
+        outputLabels: ["started / stopping", "call ended"],
+        icon: "font-awesome/fa-phone",
+        label: function() {
+            return this.name || "Gocalis Intercom";
+        },
+        paletteLabel: "gocalis intercom",
+        oneditprepare: function() {
+            $("#node-input-nodeIds").typedInput({
+                default: 'str',
+                typeField: $("#node-input-nodeIdsType"),
+                types: ['str', 'msg', 'flow', 'global', 'env', 'jsonata']
+            });
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-intercom">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-server"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+    <div class="form-row">
+        <label for="node-input-nodeIds"><i class="fa fa-users"></i> Participants</label>
+        <input type="text" id="node-input-nodeIds" placeholder="e.g. kitchen, bedroom" style="width: 70%;">
+        <input type="hidden" id="node-input-nodeIdsType">
+    </div>
+    <div class="form-row">
+        <label for="node-input-duration"><i class="fa fa-clock-o"></i> Timeout (s)</label>
+        <input type="number" id="node-input-duration" placeholder="0 = server default" min="0" step="1">
+    </div>
+</script>
+
+<script type="text/html" data-help-name="gocalis-intercom">
+    <p>Opens a live two-way (or N-way) audio intercom bridge between two or more
+    Gocalis nodes. While a call is active, any <b>say</b>/<b>ask</b>/<b>play</b>
+    targeting a participant is queued until the call ends.</p>
+
+    <h3>Starting a call</h3>
+    <p>Send any message to start a call between the configured
+    <b>Participants</b>. The participant list can be overridden per-message.</p>
+    <dl class="message-properties">
+        <dt class="optional">node_ids <span class="property-type">array | string</span></dt>
+        <dd>Participants for this call (two or more). Overrides the configured
+        list. A comma-separated string (<code>"kitchen, bedroom"</code>) is also
+        accepted.</dd>
+        <dt class="optional">node_id + peer_node_id <span class="property-type">string</span></dt>
+        <dd>Convenience form for a two-node call.</dd>
+        <dt class="optional">duration_seconds <span class="property-type">number</span></dt>
+        <dd>Overrides the call timeout for this call. <code>0</code> uses the
+        server default (<code>intercom.default_timeout_seconds</code>).</dd>
+    </dl>
+
+    <h3>Stopping a call</h3>
+    <p>Send a message with <code>msg.payload = "stop"</code> (or
+    <code>msg.action = "intercom_stop"</code>, or <code>msg.stop = true</code>) to
+    end the call. Set <code>msg.node_id</code> to any participant of the call to
+    end; otherwise the first configured participant is used.</p>
+
+    <h3>Outputs</h3>
+    <ol class="node-ports">
+        <li>Started / stopping — emits once the call is accepted by the engine (or
+        when a stop has been sent). <code>msg.payload</code> carries the engine
+        response.</li>
+        <li>Call ended — emits when the call ends for any reason.
+        <code>msg.payload.reason</code> is one of <code>timeout</code>,
+        <code>stopped</code>, <code>shutdown</code>, or <code>error</code>, and
+        <code>msg.payload.duration_seconds</code> is the call length. This fires
+        for matching calls even when they were started or stopped elsewhere (web
+        UI, timeout, another flow).</li>
+    </ol>
+</script>
