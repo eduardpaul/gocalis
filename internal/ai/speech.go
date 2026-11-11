@@ -179,9 +179,12 @@ func (t *whisperTranscriber) decodeSync(samples []float32) (string, error) {
 	// Whisper expects 16000Hz.
 	stream.AcceptWaveform(16000, samples)
 	recognizer.Decode(stream)
+	// sherpa returns a nil result when the recognizer emitted no tokens (the
+	// clip held no intelligible speech). That is an empty transcription, not an
+	// engine failure: report "" so callers treat it as "heard nothing".
 	res := stream.GetResult()
 	if res == nil {
-		return "", errors.New("ASR recognizer unavailable")
+		return "", nil
 	}
 	return res.Text, nil
 }
