@@ -3,6 +3,7 @@ package webrtc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -69,8 +70,24 @@ type Client struct {
 	signalConn   *websocket.Conn
 	signalingURL string
 	sendCodec    string // "pcmu" | "opus" | "opus-sendonly"
-	pc           *webrtc.PeerConnection
 	localTrack   *webrtc.TrackLocalStaticSample
+
+	// The receive PeerConnection is rebuilt from scratch on every reconnect:
+	// go2rtc answers each signaling session with a brand-new peer (new DTLS
+	// keys), which an existing PeerConnection cannot re-key to (an ICE restart
+	// reports "connected" but no media ever decrypts). gen identifies the
+	// current one so callbacks from replaced connections are ignored. pcMu
+	// guards pc, gen and genStart; signalConn stays under signalMu.
+	api          *webrtc.API
+	pcConfig     webrtc.Configuration
+	direction    webrtc.RTPTransceiverDirection
+	pcMu         sync.Mutex
+	pc           *webrtc.PeerConnection
+	gen          uint64
+	genStart     time.Time    // when the current generation started signaling
+	lastRTP      atomic.Int64 // unix nanos of the last RTP packet on the current generation
+	rtpGen       atomic.Uint64
+	watchdog     sync.Once
 	opusEnc      *opus.Encoder // nil for pcmu
 	connected    chan struct{}
 	onceConnect  sync.Once
@@ -176,26 +193,14 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 
 	config := webrtc.Configuration{BundlePolicy: webrtc.BundlePolicyMaxBundle, ICEServers: iceServers(cfg.ICEServers)}
 
-	pc, err := api.NewPeerConnection(config)
-	if err != nil {
-		return nil, err
-	}
-
 	localTrack, err := webrtc.NewTrackLocalStaticSample(capability, "audio", "pion")
 	if err != nil {
-		pc.Close()
 		return nil, err
 	}
 
 	direction := webrtc.RTPTransceiverDirectionSendrecv
 	if sendCodec == "opus-sendonly" {
 		direction = webrtc.RTPTransceiverDirectionSendonly
-	}
-	if _, err = pc.AddTransceiverFromTrack(localTrack, webrtc.RTPTransceiverInit{
-		Direction: direction,
-	}); err != nil {
-		pc.Close()
-		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -204,8 +209,10 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 		signalingURL:   cfg.SignalingURL,
 		iceServers:     cfg.ICEServers,
 		sendCodec:      sendCodec,
-		pc:             pc,
 		localTrack:     localTrack,
+		api:            api,
+		pcConfig:       config,
+		direction:      direction,
 		connected:      make(chan struct{}),
 		apiBaseURL:     cfg.APIBaseURL,
 		talkbackStream: cfg.TalkbackStream,
@@ -215,27 +222,67 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 	if sendCodec != "pcmu" {
 		enc, err := opus.NewEncoder(opusRate, opusChannels, opus.AppVoIP)
 		if err != nil {
-			pc.Close()
+			cancel()
 			return nil, fmt.Errorf("create opus encoder: %w", err)
 		}
 		if err := enc.SetBitrate(opusBitrate); err != nil {
-			pc.Close()
+			cancel()
 			return nil, fmt.Errorf("set opus bitrate: %w", err)
 		}
 		client.opusEnc = enc
 	}
 
-	// Configure PeerConnection state hooks
+	if _, _, err := client.newPeerConnection(); err != nil {
+		cancel()
+		return nil, err
+	}
+	return client, nil
+}
+
+// rxStallTimeout: go2rtc streams the doorbell microphone continuously (silence
+// included), so this long without a single RTP packet means the session is
+// dead even if ICE/DTLS still report "connected".
+const rxStallTimeout = 10 * time.Second
+
+// newPeerConnection builds a fresh receive PeerConnection, makes it current and
+// closes the previous one. Its callbacks only act while it is still current.
+func (c *Client) newPeerConnection() (*webrtc.PeerConnection, uint64, error) {
+	pc, err := c.api.NewPeerConnection(c.pcConfig)
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, err = pc.AddTransceiverFromTrack(c.localTrack, webrtc.RTPTransceiverInit{
+		Direction: c.direction,
+	}); err != nil {
+		pc.Close()
+		return nil, 0, err
+	}
+
+	c.pcMu.Lock()
+	c.gen++
+	gen := c.gen
+	old := c.pc
+	c.pc = pc
+	c.genStart = time.Now()
+	c.pcMu.Unlock()
+
+	if old != nil {
+		go old.Close() // its state/track callbacks are now stale and ignored
+	}
+
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		log.Printf("[WebRTC] PeerConnection State: %s\n", s.String())
+		if !c.isCurrent(gen) {
+			return
+		}
 		if s == webrtc.PeerConnectionStateConnected {
-			client.onceConnect.Do(func() {
-				close(client.connected)
+			c.onceConnect.Do(func() {
+				close(c.connected)
 			})
 			return
 		}
 		if s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateFailed {
-			client.scheduleReconnect("peer connection state " + s.String())
+			c.scheduleReconnect(gen, "peer connection state "+s.String())
 		}
 	})
 
@@ -246,10 +293,22 @@ func NewClientWithConfig(cfg Config) (*Client, error) {
 	// Register remote track reader
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("[WebRTC] Received remote track: MimeType=%s, PayloadType=%d\n", track.Codec().MimeType, track.PayloadType())
-		_ = client.tasks.Go(func(context.Context) { client.readRemoteTrack(track) })
+		_ = c.tasks.Go(func(context.Context) { c.readRemoteTrack(track, gen) })
 	})
 
-	return client, nil
+	return pc, gen, nil
+}
+
+func (c *Client) current() (*webrtc.PeerConnection, uint64) {
+	c.pcMu.Lock()
+	defer c.pcMu.Unlock()
+	return c.pc, c.gen
+}
+
+func (c *Client) isCurrent(gen uint64) bool {
+	c.pcMu.Lock()
+	defer c.pcMu.Unlock()
+	return c.gen == gen
 }
 
 // OnAudio registers a callback to process incoming audio samples (converted to float32).
@@ -259,13 +318,37 @@ func (c *Client) OnAudio(callback func(samples []float32)) {
 	c.onAudioRx = callback
 }
 
-// Connect establishes the WebSocket signaling connection and completes the SDP handshake.
+// Connect establishes the WebSocket signaling connection and completes the SDP
+// handshake. After that the client keeps itself connected: any loss of the
+// signaling socket, the PeerConnection or the audio itself triggers a rebuild.
 func (c *Client) Connect(ctx context.Context) error {
 	ctx, finish, err := c.tasks.Start(ctx)
 	if err != nil {
 		return err
 	}
 	defer finish()
+	pc, gen := c.current()
+	if err := c.connect(ctx, pc, gen); err != nil {
+		return err
+	}
+	c.watchdog.Do(func() { _ = c.tasks.Go(c.rxWatchdog) })
+	c.warmTalkback(ctx)
+	return nil
+}
+
+// warmTalkback brings the talkback backchannel up ahead of time (WHIP producer +
+// AAC-ELD route + continuous silence feed) so the first spoken utterance is not
+// clipped by ffmpeg/route spin-up latency. Best-effort: failures are retried on Play.
+func (c *Client) warmTalkback(ctx context.Context) {
+	if c.talkbackEnabled() {
+		if _, err := c.ensureTalkback(ctx); err != nil {
+			log.Printf("[Talkback] warm-up deferred: %v", err)
+		}
+	}
+}
+
+// connect runs the signaling handshake for one PeerConnection generation.
+func (c *Client) connect(ctx context.Context, pc *webrtc.PeerConnection, gen uint64) error {
 	u, err := url.Parse(c.signalingURL)
 	if err != nil {
 		return err
@@ -277,6 +360,13 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
+	if !c.isCurrent(gen) {
+		_ = wsConn.Close()
+		return errors.New("signaling: peer connection was replaced")
+	}
+	c.pcMu.Lock()
+	c.genStart = time.Now()
+	c.pcMu.Unlock()
 	c.signalMu.Lock()
 	if c.signalConn != nil {
 		_ = c.signalConn.Close()
@@ -291,7 +381,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	// Handle ICE Candidate trickling
-	c.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
 			return
 		}
@@ -306,19 +396,14 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	})
 
-	// Create and set local Offer. When reconnecting an existing PeerConnection,
-	// force ICE restart so media can recover after network/signaling dropouts.
-	offerOpts := &webrtc.OfferOptions{}
-	if c.pc.RemoteDescription() != nil {
-		offerOpts.ICERestart = true
-	}
-	offer, err := c.pc.CreateOffer(offerOpts)
+	// Every generation is a fresh PeerConnection, so this is always a first offer.
+	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		wsConn.Close()
 		return err
 	}
 
-	if err := c.pc.SetLocalDescription(offer); err != nil {
+	if err := pc.SetLocalDescription(offer); err != nil {
 		wsConn.Close()
 		return err
 	}
@@ -347,8 +432,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		for {
 			_, message, err := wsConn.ReadMessage()
 			if err != nil {
-				log.Printf("[Signaling] WebSocket read loop exited: %v\n", err)
-				c.scheduleReconnect("signaling read loop exited")
+				if c.isCurrent(gen) {
+					log.Printf("[Signaling] WebSocket read loop exited: %v\n", err)
+					c.scheduleReconnect(gen, "signaling read loop exited")
+				}
 				return
 			}
 
@@ -364,7 +451,7 @@ func (c *Client) Connect(ctx context.Context) error {
 					continue
 				}
 				log.Println("[Signaling] Setting remote WebRTC Answer description...")
-				err = c.pc.SetRemoteDescription(webrtc.SessionDescription{
+				err = pc.SetRemoteDescription(webrtc.SessionDescription{
 					Type: webrtc.SDPTypeAnswer,
 					SDP:  sdpStr,
 				})
@@ -377,12 +464,15 @@ func (c *Client) Connect(ctx context.Context) error {
 				if !ok {
 					continue
 				}
-				err = c.pc.AddICECandidate(webrtc.ICECandidateInit{
+				err = pc.AddICECandidate(webrtc.ICECandidateInit{
 					Candidate: candStr,
 				})
 				if err != nil {
 					log.Printf("[Signaling] Failed to add remote candidate: %v\n", err)
 				}
+			case "error":
+				// e.g. "webrtc/offer: stream not found"; the rx watchdog retries
+				log.Printf("[Signaling] go2rtc error: %v", wsMsg.Value)
 			default:
 				log.Printf("[Signaling] UNHANDLED type=%q value=%v", wsMsg.Type, wsMsg.Value)
 			}
@@ -390,15 +480,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	}); err != nil {
 		_ = wsConn.Close()
 		return err
-	}
-
-	// Warm up the talkback backchannel now (WHIP producer + AAC-ELD route +
-	// continuous silence feed) so the first spoken utterance is not clipped by
-	// ffmpeg/route spin-up latency. Best-effort: failures are retried on Play.
-	if c.talkbackEnabled() {
-		if _, err := c.ensureTalkback(ctx); err != nil {
-			log.Printf("[Talkback] warm-up deferred: %v", err)
-		}
 	}
 
 	return nil
@@ -654,8 +735,8 @@ func (c *Client) Close() error {
 			_ = c.signalConn.Close()
 		}
 		c.signalMu.Unlock()
-		if c.pc != nil {
-			c.closeErr = c.pc.Close()
+		if pc, _ := c.current(); pc != nil {
+			c.closeErr = pc.Close()
 		}
 		c.tasks.Close()
 		c.tbMu.Lock()
@@ -672,11 +753,13 @@ func (c *Client) Close() error {
 	return c.closeErr
 }
 
-// scheduleReconnect starts a best-effort reconnection loop for the receive
-// PeerConnection. It is idempotent while a reconnect attempt is in flight.
-func (c *Client) scheduleReconnect(reason string) {
+// scheduleReconnect replaces the receive PeerConnection until audio flows again.
+// Only the current generation can trigger it, and only one loop runs at a time,
+// so the several symptoms of one outage (state change, RTP EOF, socket close)
+// produce a single reconnect. It never gives up while the client is open.
+func (c *Client) scheduleReconnect(gen uint64, reason string) {
 	c.reconnectMu.Lock()
-	if c.closing || c.reconnecting {
+	if c.closing || c.reconnecting || !c.isCurrent(gen) {
 		c.reconnectMu.Unlock()
 		return
 	}
@@ -690,30 +773,20 @@ func (c *Client) scheduleReconnect(reason string) {
 			c.reconnectMu.Unlock()
 		}()
 
-		for attempt := 1; attempt <= 12; attempt++ {
-			c.reconnectMu.Lock()
-			if c.closing {
-				c.reconnectMu.Unlock()
+		for attempt := 1; ; attempt++ {
+			if lifetime.Err() != nil || c.isClosing() {
 				return
 			}
-			c.reconnectMu.Unlock()
-
-			state := c.pc.ConnectionState()
-			if state == webrtc.PeerConnectionStateConnected {
-				return
-			}
-
-			log.Printf("[WebRTC] Reconnect attempt %d (%s); state=%s", attempt, reason, state)
-			rctx, cancel := context.WithTimeout(lifetime, 15*time.Second)
-			err := c.Connect(rctx)
-			cancel()
+			log.Printf("[WebRTC] Reconnect attempt %d (%s)", attempt, reason)
+			err := c.reconnectOnce(lifetime)
 			if err == nil {
-				log.Printf("[WebRTC] Reconnect succeeded on attempt %d", attempt)
+				log.Printf("[WebRTC] Reconnected on attempt %d: audio is flowing again", attempt)
+				c.warmTalkback(lifetime)
 				return
 			}
-
-			log.Printf("[WebRTC] Reconnect attempt %d failed: %v", attempt, err)
-			timer := time.NewTimer(time.Duration(attempt) * time.Second)
+			backoff := time.Duration(min(attempt, 15)) * time.Second
+			log.Printf("[WebRTC] Reconnect attempt %d failed: %v (retrying in %v)", attempt, err, backoff)
+			timer := time.NewTimer(backoff)
 			select {
 			case <-lifetime.Done():
 				timer.Stop()
@@ -721,12 +794,68 @@ func (c *Client) scheduleReconnect(reason string) {
 			case <-timer.C:
 			}
 		}
-
-		log.Printf("[WebRTC] Reconnect attempts exhausted; manual restart may be required")
 	}); err != nil {
 		c.reconnectMu.Lock()
 		c.reconnecting = false
 		c.reconnectMu.Unlock()
+	}
+}
+
+// reconnectOnce builds a new PeerConnection, signals it, and succeeds only once
+// RTP actually arrives on it (an answered offer alone proves nothing).
+func (c *Client) reconnectOnce(lifetime context.Context) error {
+	pc, gen, err := c.newPeerConnection()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(lifetime, 15*time.Second)
+	defer cancel()
+	if err := c.connect(ctx, pc, gen); err != nil {
+		return err
+	}
+	deadline := time.NewTimer(rxStallTimeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	for c.rtpGen.Load() != gen {
+		select {
+		case <-lifetime.Done():
+			return lifetime.Err()
+		case <-deadline.C:
+			return fmt.Errorf("no audio within %v (peer state %s)", rxStallTimeout, pc.ConnectionState())
+		case <-poll.C:
+		}
+	}
+	return nil
+}
+
+func (c *Client) isClosing() bool {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+	return c.closing
+}
+
+// rxWatchdog reconnects when the current connection delivers no audio for
+// rxStallTimeout, whatever the cause (zombie session, go2rtc restart that left
+// ICE "connected", stream missing at startup, ...).
+func (c *Client) rxWatchdog(lifetime context.Context) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-lifetime.Done():
+			return
+		case <-t.C:
+		}
+		c.pcMu.Lock()
+		gen, since := c.gen, c.genStart
+		c.pcMu.Unlock()
+		if c.rtpGen.Load() == gen {
+			since = time.Unix(0, c.lastRTP.Load())
+		}
+		if idle := time.Since(since); idle > rxStallTimeout {
+			c.scheduleReconnect(gen, fmt.Sprintf("no audio for %v", idle.Round(time.Second)))
+		}
 	}
 }
 
@@ -789,7 +918,7 @@ func (c *Client) ensureTalkback(parent context.Context) (*talkbackSender, error)
 // readRemoteTrack reads incoming RTP packets, decodes them to float32 mono at the
 // model rate (16000Hz), and publishes them. It adapts to whichever codec go2rtc
 // negotiated on the return path (Opus wideband or legacy PCMU).
-func (c *Client) readRemoteTrack(track *webrtc.TrackRemote) {
+func (c *Client) readRemoteTrack(track *webrtc.TrackRemote, gen uint64) {
 	mime := track.Codec().MimeType
 	log.Printf("[WebRTC] readRemoteTrack started for track ID: %s, Mime: %s\n", track.ID(), mime)
 
@@ -914,10 +1043,18 @@ func (c *Client) readRemoteTrack(track *webrtc.TrackRemote) {
 	for {
 		packet, _, err := track.ReadRTP()
 		if err != nil {
-			c.scheduleReconnect("remote RTP read failed")
+			if c.isCurrent(gen) {
+				log.Printf("[WebRTC] readRemoteTrack error reading RTP: %v\n", err)
+				c.scheduleReconnect(gen, "remote RTP read failed")
+			}
 			return
 		}
+		if !c.isCurrent(gen) {
+			return // replaced connection; the new one has its own reader
+		}
 		now := time.Now()
+		c.lastRTP.Store(now.UnixNano())
+		c.rtpGen.Store(gen)
 		if !lastArrival.IsZero() {
 			maxCounter(&c.stats.maxArrivalGap, now.Sub(lastArrival).Nanoseconds())
 		}
