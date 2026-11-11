@@ -31,6 +31,10 @@ const intercomPriority = 100
 // model/capture rate produced by the transports' OnAudio path.
 const bridgeRate = 16000
 
+// drainGrace bounds how long teardown waits for each node's StreamOut to play
+// out its buffered tail after the mixer closes the outputs, before cancelling.
+const drainGrace = 3 * time.Second
+
 // EchoCanceller removes the acoustic echo of a node's own speaker output from
 // its microphone. Playback feeds the far-end reference (what is being played on
 // the node); Capture returns the near-end mic with that echo removed. It is fed
@@ -79,10 +83,14 @@ type Engine struct {
 type call struct {
 	nodes   []string
 	started time.Time
-	cancel  context.CancelFunc
+	// ctx/cancel are created in Start, before the call is registered, so Stop can
+	// always cancel it (even before run has been scheduled).
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	mu     sync.Mutex
-	reason string // set by whoever ends the call before cancelling
+	mu      sync.Mutex
+	reason  string // set by whoever ends the call before cancelling
+	failure string // first stream error, reported as the ended event's message
 }
 
 // NewEngine creates an intercom engine backed by the brain, emitting lifecycle
@@ -133,7 +141,8 @@ func (e *Engine) Start(nodes []string, duration time.Duration) error {
 			return fmt.Errorf("node '%s' is already in an intercom call (%s)", n, strings.Join(c.nodes, ", "))
 		}
 	}
-	c := &call{nodes: uniq, started: time.Now()}
+	ctx, cancel := context.WithCancel(e.baseCtx)
+	c := &call{nodes: uniq, started: time.Now(), ctx: ctx, cancel: cancel}
 	for _, n := range uniq {
 		e.calls[n] = c
 	}
@@ -169,8 +178,7 @@ func (e *Engine) Stop(nodeID string) bool {
 // mix-minus mixer across all participants, wait for the deadline or an early
 // stop, then tear everything down and announce the end.
 func (e *Engine) run(c *call, duration time.Duration) {
-	ctx, cancel := context.WithCancel(e.baseCtx)
-	c.cancel = cancel
+	ctx, cancel := c.ctx, c.cancel
 	defer cancel()
 
 	// Acquire all node slots in a deterministic (sorted) order so overlapping
@@ -189,6 +197,13 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		t, err := e.brain.AcquireNode(ctx, n, intercomPriority)
 		if err != nil {
 			releaseAll()
+			if ctx.Err() != nil {
+				// Stopped or shut down while still waiting for a node slot: that is
+				// a normal end, not an acquisition failure.
+				c.setReasonIfEmpty("shutdown")
+				e.finish(c, "success", "")
+				return
+			}
 			e.finish(c, "error", "could not acquire node '"+n+"': "+err.Error())
 			return
 		}
@@ -246,8 +261,10 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := turn.StreamOut(ctx, out, far); err != nil {
-				c.setReasonIfEmpty("error")
+			if err := turn.StreamOut(ctx, out, far); err != nil && ctx.Err() == nil {
+				// A genuine stream failure (not a side effect of stop/shutdown/
+				// drain cancellation) ends the call as an error.
+				c.setFailure(err.Error())
 				cancel()
 			}
 		}()
@@ -275,9 +292,26 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		e.brain.ClearRawAudioTap(n)
 	}
 	mix.stop()
-	wg.Wait()
+	// Bound the drain: a StreamOut blocked on something other than its source
+	// (e.g. an rtc_stream node still waiting to connect) only unwinds on ctx, so
+	// cancel after a grace period instead of holding every node slot forever.
+	streamsDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(streamsDone)
+	}()
+	select {
+	case <-streamsDone:
+	case <-time.After(drainGrace):
+		cancel()
+		<-streamsDone
+	}
 	releaseAll()
 
+	if msg := c.getFailure(); msg != "" {
+		e.finish(c, "error", msg)
+		return
+	}
 	e.finish(c, "success", "")
 }
 
@@ -367,6 +401,25 @@ func (c *call) setReasonIfEmpty(r string) {
 		c.reason = r
 	}
 	c.mu.Unlock()
+}
+
+// setFailure records a stream error: the first one wins and marks the call as
+// ended by "error" unless an explicit reason (e.g. "stopped") was already set.
+func (c *call) setFailure(msg string) {
+	c.mu.Lock()
+	if c.reason == "" {
+		c.reason = "error"
+	}
+	if c.failure == "" {
+		c.failure = msg
+	}
+	c.mu.Unlock()
+}
+
+func (c *call) getFailure() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failure
 }
 
 func (c *call) getReason() string {

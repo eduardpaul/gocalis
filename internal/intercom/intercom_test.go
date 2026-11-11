@@ -180,6 +180,23 @@ func TestIntercomStop(t *testing.T) {
 	}
 }
 
+// TestIntercomStopImmediatelyAfterStart verifies Stop is safe before the call's
+// background goroutine has run (the cancel func must already exist).
+func TestIntercomStopImmediatelyAfterStart(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+
+	if err := rig.engine.Start([]string{"A", "B"}, 30*time.Second); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if !rig.engine.Stop("A") {
+		t.Fatal("Stop returned false for a just-started call")
+	}
+	ended := waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	if ended.Reason != "stopped" || ended.Status != "success" {
+		t.Fatalf("expected stopped/success, got %q/%q", ended.Reason, ended.Status)
+	}
+}
+
 // TestIntercomRejectsBusyNode verifies a node already in a call cannot join another.
 func TestIntercomRejectsBusyNode(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
