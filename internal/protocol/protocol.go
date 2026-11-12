@@ -60,11 +60,13 @@ type Response struct {
 	Timestamp  int64  `json:"timestamp,omitempty"`   // unix seconds when the event was raised
 
 	// Intercom event fields (event == "intercom_started" / "intercom_ended").
-	// NodeIDs lists every participant; NodeID/PeerNodeID mirror the first two for
+	// NodeIDs lists every node participant (RemoteIDs the intercom page
+	// microphones); NodeID/PeerNodeID mirror the first two nodes for
 	// two-node clients. Reason is why the call ended ("timeout", "stopped",
 	// "shutdown", "error"); DurationSeconds is the call length on
 	// "intercom_ended".
 	NodeIDs         []string `json:"node_ids,omitempty"`
+	RemoteIDs       []string `json:"remote_ids,omitempty"` // intercom page microphones in the call
 	PeerNodeID      string   `json:"peer_node_id,omitempty"`
 	Reason          string   `json:"reason,omitempty"`
 	DurationSeconds float64  `json:"duration_seconds,omitempty"`

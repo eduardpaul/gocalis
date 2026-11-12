@@ -1,6 +1,7 @@
 package intercom
 
 import (
+	"sort"
 	"time"
 )
 
@@ -8,48 +9,57 @@ import (
 // of this length from each input and emits one to each output.
 const mixFrameMs = 20
 
-// mixer implements N-way mix-minus for a group intercom call. Each participant
-// pushes its (echo-cancelled) mic into a per-node input buffer; on a fixed
-// wall-clock cadence the mixer pulls one frame from every input and, for each
-// participant, sums every OTHER participant's frame (so a node never hears
-// itself) with hard clamping, then pushes the result to that node's output
-// buffer, which its StreamOut drains to the device.
+// mixer implements N-way mix-minus for a group intercom call. Each talker pushes
+// its (echo-cancelled) mic into an input buffer; on a fixed wall-clock cadence
+// the mixer pulls one frame from every input and, for each listener, sums every
+// OTHER talker's frame (so a participant never hears itself) with hard clamping,
+// then pushes the result to that listener's output buffer, which its StreamOut
+// drains to the device.
+//
+// Talkers and listeners are separate sets: a node participant is both, while a
+// remote talker (the intercom page's microphone) only talks, because the page
+// plays the doorbell straight from go2rtc and gocalis has nothing to send it.
 //
 // A single mix clock is what keeps N independent, drifting capture streams time
 // aligned: inputs are read non-blocking with silence substituted on underrun,
 // and the drop-oldest input buffers bound any overrun.
 type mixer struct {
-	frame   int
-	nodes   []string
-	inputs  map[string]*bridge
-	outputs map[string]*bridge
-	quit    chan struct{}
-	done    chan struct{}
+	frame     int
+	talkers   []string
+	listeners []string
+	inputs    map[string]*bridge
+	outputs   map[string]*bridge
+	quit      chan struct{}
+	done      chan struct{}
 }
 
-// newMixer builds a mixer for the given participants. outputCapSamples bounds
-// each output buffer (drop-oldest) so end-to-end latency stays bounded.
-func newMixer(rate int, nodes []string, outputCapSamples int) *mixer {
+// newMixer builds a mixer over the given talker inputs and listener ids.
+// outputCapSamples bounds each output buffer (drop-oldest) so end-to-end latency
+// stays bounded.
+func newMixer(rate int, inputs map[string]*bridge, listeners []string, outputCapSamples int) *mixer {
 	m := &mixer{
-		frame:   rate * mixFrameMs / 1000,
-		nodes:   append([]string(nil), nodes...),
-		inputs:  make(map[string]*bridge, len(nodes)),
-		outputs: make(map[string]*bridge, len(nodes)),
-		quit:    make(chan struct{}),
-		done:    make(chan struct{}),
+		frame:     rate * mixFrameMs / 1000,
+		listeners: append([]string(nil), listeners...),
+		inputs:    inputs,
+		outputs:   make(map[string]*bridge, len(listeners)),
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
-	for _, n := range nodes {
-		m.inputs[n] = newBridgeBuffer(rate, rate/2)
+	for id := range inputs {
+		m.talkers = append(m.talkers, id)
+	}
+	sort.Strings(m.talkers)
+	for _, n := range listeners {
 		m.outputs[n] = newBridgeBuffer(rate, outputCapSamples)
 	}
 	return m
 }
 
-// input returns the mic buffer a node's tap pushes into.
-func (m *mixer) input(node string) *bridge { return m.inputs[node] }
+// input returns the mic buffer a talker pushes into (nil if not a talker).
+func (m *mixer) input(id string) *bridge { return m.inputs[id] }
 
-// output returns the mix-minus source a node's StreamOut consumes.
-func (m *mixer) output(node string) *bridge { return m.outputs[node] }
+// output returns the mix-minus source a listener's StreamOut consumes.
+func (m *mixer) output(id string) *bridge { return m.outputs[id] }
 
 // run mixes on a fixed cadence until stop is called.
 func (m *mixer) run() {
@@ -57,20 +67,20 @@ func (m *mixer) run() {
 	ticker := time.NewTicker(mixFrameMs * time.Millisecond)
 	defer ticker.Stop()
 
-	frames := make(map[string][]int16, len(m.nodes))
+	frames := make(map[string][]int16, len(m.talkers))
 	for {
 		select {
 		case <-m.quit:
 			return
 		case <-ticker.C:
-			for _, n := range m.nodes {
+			for _, n := range m.talkers {
 				frames[n] = m.inputs[n].takeFrame(m.frame)
 			}
-			for _, out := range m.nodes {
+			for _, out := range m.listeners {
 				mixed := make([]int16, m.frame)
-				for _, in := range m.nodes {
+				for _, in := range m.talkers {
 					if in == out {
-						continue // mix-minus: a node never hears itself
+						continue // mix-minus: a participant never hears itself
 					}
 					src := frames[in]
 					for i := 0; i < m.frame; i++ {

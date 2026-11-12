@@ -40,8 +40,9 @@ func (b *Brain) ForwardRawAudio(nodeID string, samples []float32) {
 }
 
 // StreamOut plays a live PCM16 source on the turn's node for the duration of an
-// intercom call. Holding the Turn (from AcquireNode) is what makes this
-// exclusive: queued speak/ask work waits until the call releases it. StreamOut
+// intercom call. Holding the Turn (from AcquireNodeIntercom) is what makes this
+// exclusive: other speak/ask/play requests for the node fail with
+// ErrIntercomActive until the call releases it. StreamOut
 // drives the node's state (INTERCOM while streaming, back to IDLE on return).
 //
 // onPlayed, when non-nil, is invoked with each chunk of PCM16 actually pushed to

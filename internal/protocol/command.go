@@ -53,6 +53,7 @@ func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, sp
 			Event:           ev.Event,
 			NodeID:          ev.NodeID,
 			NodeIDs:         ev.NodeIDs,
+			RemoteIDs:       ev.RemoteIDs,
 			PeerNodeID:      ev.PeerNodeID,
 			Status:          ev.Status,
 			Reason:          ev.Reason,

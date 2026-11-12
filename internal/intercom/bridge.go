@@ -20,6 +20,13 @@ type bridge struct {
 	maxLen int
 	rate   int
 	closed bool
+
+	// prime, when > 0, makes takeFrame hold back (emit silence) until that many
+	// samples are buffered, and again after every underrun. It absorbs the
+	// arrival jitter of a network talker (the intercom page's microphone) at the
+	// cost of that much latency, instead of chopping its speech into fragments.
+	prime  int
+	primed bool
 }
 
 var _ audionode.PCM16Source = (*bridge)(nil)
@@ -104,9 +111,16 @@ func (b *bridge) takeFrame(n int) []int16 {
 	out := make([]int16, n)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.prime > 0 && !b.primed {
+		if len(b.buf) < b.prime {
+			return out
+		}
+		b.primed = true
+	}
 	m := n
 	if m > len(b.buf) {
 		m = len(b.buf)
+		b.primed = false // underrun: rebuild the jitter cushion
 	}
 	copy(out, b.buf[:m])
 	b.buf = b.buf[m:]

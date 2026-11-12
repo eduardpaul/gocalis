@@ -86,3 +86,27 @@ func TestBridgeReadBlocksUntilPush(t *testing.T) {
 		t.Fatal("ReadPCM16 did not wake after push")
 	}
 }
+
+// TestBridgeTakeFramePrimes checks the jitter cushion of a network talker: no
+// audio is released until prime samples are buffered, and the cushion is rebuilt
+// after an underrun.
+func TestBridgeTakeFramePrimes(t *testing.T) {
+	b := newBridgeBuffer(16000, 1000)
+	b.prime = 6
+	b.push([]int16{1, 2, 3, 4})
+	if got := b.takeFrame(2); got[0] != 0 || got[1] != 0 {
+		t.Fatalf("released audio before priming: %v", got)
+	}
+	b.push([]int16{5, 6})
+	if got := b.takeFrame(4); got[0] != 1 || got[3] != 4 {
+		t.Fatalf("primed frame = %v, want 1..4", got)
+	}
+	// Two samples left: an underrun frame plays them, then re-primes.
+	if got := b.takeFrame(4); got[0] != 5 || got[1] != 6 || got[2] != 0 {
+		t.Fatalf("underrun frame = %v", got)
+	}
+	b.push([]int16{7})
+	if got := b.takeFrame(1); got[0] != 0 {
+		t.Fatalf("released audio while re-priming: %v", got)
+	}
+}

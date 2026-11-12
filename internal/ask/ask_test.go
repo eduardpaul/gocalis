@@ -153,3 +153,48 @@ func TestLiveSpeechOutlastsOnsetTimeout(t *testing.T) {
 		t.Fatal("endpoint never closed")
 	}
 }
+
+// TestIntercomEndsAskCleanly verifies an intercom call that takes the node over
+// while the ask is listening ends the ask with a clear reason, without running
+// ASR on what the intercom carries, and that the ask gives the node up.
+func TestIntercomEndsAskCleanly(t *testing.T) {
+	b := brain.New(testTTS{})
+	p := node.NewPhysicalNode("test", "local")
+	defer p.Close()
+	b.RegisterNode("test", &brain.NodeHandle{Node: p, Audio: &audionode.Stub{}})
+	defer b.UnregisterNode("test")
+	asr := &testASR{}
+	e := NewEngine(b, asr, nil, config.SpeakerIDConfig{})
+
+	done := make(chan Result, 1)
+	go func() {
+		done <- e.Run(context.Background(), Config{NodeID: "test", VADTimeoutSeconds: 5})
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for p.GetState() != node.StateListening {
+		if time.Now().After(deadline) {
+			t.Fatalf("ask never started listening (state %s)", p.GetState())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	turn, err := b.AcquireNodeIntercom(ctx, "test")
+	if err != nil {
+		t.Fatalf("intercom could not take the node over: %v", err)
+	}
+	defer turn.Release()
+
+	select {
+	case result := <-done:
+		if result.Status != "error" || result.ErrorMessage != brain.ErrPreempted.Error() {
+			t.Fatalf("result = %+v, want the preemption error", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask did not end when the intercom took the node over")
+	}
+	if len(asr.samples) != 0 {
+		t.Fatal("ASR ran on audio captured during the takeover")
+	}
+}

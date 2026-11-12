@@ -1,9 +1,14 @@
-// Package intercom implements a live N-node audio bridge: it connects two or
-// more registered audio nodes so people at each device can talk to one another.
-// Each participant hears a mix of every OTHER participant (mix-minus), so no one
-// hears themselves. For the duration of a call every participant's turn slot is
-// held on the brain, so any tts/ask/play targeting a participant queues until
-// the call ends. A call always ends by a deadline (config default or per-request
+// Package intercom implements live audio calls through gocalis's nodes.
+//
+// A call has node participants (registered audio nodes: the doorbell, a local
+// speakerphone) and optionally remote talkers (the intercom web page's
+// microphone, streamed to gocalis). Every node participant is taken over for the
+// whole call with brain.AcquireNodeIntercom, which preempts the TTS or ask turn
+// in progress and rejects any other turn until the call ends: the call's mix is
+// the only audio sent to that node's speaker, through the node's normal output
+// path (for the doorbell, the one WHIP talkback track and AAC-ELD bridge). Each
+// listener hears a mix of every OTHER talker (mix-minus), so no one hears
+// themselves. A call always ends by a deadline (config default or per-request
 // override) and can also be ended early by an external stop. The end is
 // announced as an event.
 package intercom
@@ -21,11 +26,6 @@ import (
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 )
-
-// intercomPriority is the turn-queue priority used to hold each participating
-// node for the whole call. It is above the wake/ask priority (10) so a call
-// preempts queued speak/ask work; while held, the slot blocks all of them.
-const intercomPriority = 100
 
 // bridgeRate is the PCM sample rate carried between nodes. It matches the
 // model/capture rate produced by the transports' OnAudio path.
@@ -45,13 +45,36 @@ type EchoCanceller interface {
 	Close()
 }
 
+// remotePrimeMs is the jitter cushion held for a remote talker's microphone
+// before its audio is mixed (and rebuilt after an underrun).
+const remotePrimeMs = 60
+
+// remoteMaxMs bounds a remote talker's buffered audio (drop-oldest), so a
+// network stall followed by a burst cannot build up lasting latency.
+const remoteMaxMs = 250
+
+// Remote is a talker outside gocalis: the microphone of the intercom web page.
+// It only talks; the page plays the doorbell straight from go2rtc, so gocalis
+// sends it nothing. The page's transport pushes 16 kHz mono PCM16 with Push.
+type Remote struct {
+	ID  string
+	mic *bridge
+}
+
+// RemoteSampleRate is the PCM16 rate a Remote expects in Push.
+const RemoteSampleRate = bridgeRate
+
+// Push queues microphone audio (16 kHz mono PCM16) from the remote talker.
+func (r *Remote) Push(pcm []int16) { r.mic.push(pcm) }
+
 // Event is an intercom lifecycle notification emitted to the transport layer.
 // It is transport-neutral so this package does not depend on protocol.
 type Event struct {
 	Event           string   // "intercom_started" | "intercom_ended"
-	NodeIDs         []string // all participants
-	NodeID          string   // first participant (compatibility with 2-node clients)
-	PeerNodeID      string   // second participant (compatibility with 2-node clients)
+	NodeIDs         []string // all node participants
+	RemoteIDs       []string // remote talkers (intercom page microphones)
+	NodeID          string   // first node participant (compatibility with 2-node clients)
+	PeerNodeID      string   // second node participant, if any (compatibility with 2-node clients)
 	Status          string   // "success" | "error"
 	Reason          string   // end reason: "timeout" | "stopped" | "shutdown" | "error"
 	Message         string   // error detail, when Status == "error"
@@ -75,14 +98,18 @@ type Engine struct {
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
 
-	mu    sync.Mutex
-	calls map[string]*call // nodeID -> active call (every participant maps to it)
+	mu        sync.Mutex
+	calls     map[string]*call // participant id -> active call (every participant maps to it)
+	remoteSeq int
 }
 
 // call is a single in-progress intercom session.
 type call struct {
 	nodes   []string
+	remotes []*Remote
 	started time.Time
+	done    chan struct{} // closed once the call has ended and its event is out
+	ended   Event
 	// ctx/cancel are created in Start, before the call is registered, so Stop can
 	// always cancel it (even before run has been scheduled).
 	ctx    context.Context
@@ -118,16 +145,76 @@ func (e *Engine) Shutdown() { e.baseCancel() }
 // requests (fewer than two distinct nodes, an unknown node, or a node already in
 // a call).
 func (e *Engine) Start(nodes []string, duration time.Duration) error {
-	if err := e.baseCtx.Err(); err != nil {
-		return fmt.Errorf("intercom engine is shutting down")
-	}
-	uniq, err := validateNodes(nodes)
+	uniq, err := validateNodes(nodes, 2)
 	if err != nil {
 		return err
 	}
+	_, err = e.start(uniq, nil, duration)
+	return err
+}
+
+// NewRemote creates a remote talker (an intercom page microphone) with an id
+// unique within this engine, ready to be passed to StartRemote.
+func (e *Engine) NewRemote() *Remote {
+	e.mu.Lock()
+	e.remoteSeq++
+	id := fmt.Sprintf("web-%d", e.remoteSeq)
+	e.mu.Unlock()
+	mic := newBridgeBuffer(bridgeRate, bridgeRate*remoteMaxMs/1000)
+	mic.prime = bridgeRate * remotePrimeMs / 1000
+	return &Remote{ID: id, mic: mic}
+}
+
+// StartRemote begins a call in which remote talks to the given nodes (usually a
+// single doorbell). The nodes are taken over exactly like in Start; their own
+// microphones are only bridged when another node participant can hear them.
+// The returned Call reports the end and lets the remote's transport stop it.
+func (e *Engine) StartRemote(remote *Remote, nodes []string, duration time.Duration) (*Call, error) {
+	if remote == nil {
+		return nil, fmt.Errorf("intercom: no remote talker")
+	}
+	uniq, err := validateNodes(nodes, 1)
+	if err != nil {
+		return nil, err
+	}
+	c, err := e.start(uniq, []*Remote{remote}, duration)
+	if err != nil {
+		return nil, err
+	}
+	return &Call{c: c}, nil
+}
+
+// Call is a handle on a running call, for the transport that started it.
+type Call struct{ c *call }
+
+// Done is closed once the call has ended and its "intercom_ended" event has been
+// emitted.
+func (h *Call) Done() <-chan struct{} { return h.c.done }
+
+// Ended returns the call's "intercom_ended" event; valid after Done is closed.
+func (h *Call) Ended() Event {
+	<-h.c.done
+	return h.c.ended
+}
+
+// Stop ends the call (reason "stopped") if it is still running.
+func (h *Call) Stop() {
+	h.c.setReasonIfEmpty("stopped")
+	h.c.cancel()
+}
+
+func (e *Engine) start(uniq []string, remotes []*Remote, duration time.Duration) (*call, error) {
+	if err := e.baseCtx.Err(); err != nil {
+		return nil, fmt.Errorf("intercom engine is shutting down")
+	}
 	for _, n := range uniq {
 		if e.brain.GetNodeHandle(n) == nil {
-			return fmt.Errorf("node '%s' not registered", n)
+			return nil, fmt.Errorf("node '%s' not registered", n)
+		}
+	}
+	for _, r := range remotes {
+		if e.brain.GetNodeHandle(r.ID) != nil {
+			return nil, fmt.Errorf("remote talker id '%s' clashes with a node", r.ID)
 		}
 	}
 	if duration <= 0 {
@@ -135,29 +222,27 @@ func (e *Engine) Start(nodes []string, duration time.Duration) error {
 	}
 
 	e.mu.Lock()
-	for _, n := range uniq {
-		if c, ok := e.calls[n]; ok {
+	ids := append([]string(nil), uniq...)
+	for _, r := range remotes {
+		ids = append(ids, r.ID)
+	}
+	for _, id := range ids {
+		if c, ok := e.calls[id]; ok {
 			e.mu.Unlock()
-			return fmt.Errorf("node '%s' is already in an intercom call (%s)", n, strings.Join(c.nodes, ", "))
+			return nil, fmt.Errorf("node '%s' is already in an intercom call (%s)", id, strings.Join(c.participantIDs(), ", "))
 		}
 	}
 	ctx, cancel := context.WithCancel(e.baseCtx)
-	c := &call{nodes: uniq, started: time.Now(), ctx: ctx, cancel: cancel}
-	for _, n := range uniq {
-		e.calls[n] = c
+	c := &call{nodes: uniq, remotes: remotes, started: time.Now(), ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	for _, id := range ids {
+		e.calls[id] = c
 	}
 	e.mu.Unlock()
 
-	e.emit(Event{
-		Event:      "intercom_started",
-		NodeIDs:    uniq,
-		NodeID:     uniq[0],
-		PeerNodeID: uniq[1],
-		Status:     "success",
-	})
+	e.emit(c.event("intercom_started", "success", "", "", 0))
 
 	go e.run(c, duration)
-	return nil
+	return c, nil
 }
 
 // Stop ends the active call that nodeID participates in, if any. It ends the
@@ -194,7 +279,7 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		}
 	}
 	for _, n := range order {
-		t, err := e.brain.AcquireNode(ctx, n, intercomPriority)
+		t, err := e.brain.AcquireNodeIntercom(ctx, n)
 		if err != nil {
 			releaseAll()
 			if ctx.Err() != nil {
@@ -210,26 +295,42 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		turns[n] = t
 	}
 
+	// A node's microphone is bridged only when another node participant can
+	// hear it. In a call between the intercom page and the doorbell nobody in
+	// gocalis listens to the doorbell (the page plays it from go2rtc), so its mic
+	// is not tapped at all; the runtime drops it while the node is INTERCOM.
+	tapped := c.nodes
+	if len(c.nodes) < 2 {
+		tapped = nil
+	}
+
 	// Per-node echo cancellers (optional). Each node's canceller removes the echo
 	// of what that node plays (its mix-minus output) from its mic. When echo
 	// cancellation is disabled in config, buildCancellers returns nil and nothing
 	// below touches the audio: mics are mixed verbatim.
-	aec := e.buildCancellers(c.nodes)
+	aec := e.buildCancellers(tapped)
 	defer func() {
 		for _, cc := range aec {
 			cc.Close()
 		}
 	}()
 	if aec != nil {
-		log.Printf("[Intercom] %s started (echo cancellation ON)\n", strings.Join(c.nodes, ", "))
+		log.Printf("[Intercom] %s started (echo cancellation ON)\n", strings.Join(c.participantIDs(), ", "))
 	} else {
-		log.Printf("[Intercom] %s started (echo cancellation OFF)\n", strings.Join(c.nodes, ", "))
+		log.Printf("[Intercom] %s started (echo cancellation OFF)\n", strings.Join(c.participantIDs(), ", "))
 	}
 
-	mix := newMixer(bridgeRate, c.nodes, bridgeRate/2)
+	inputs := make(map[string]*bridge, len(tapped)+len(c.remotes))
+	for _, n := range tapped {
+		inputs[n] = newBridgeBuffer(bridgeRate, bridgeRate/2)
+	}
+	for _, r := range c.remotes {
+		inputs[r.ID] = r.mic
+	}
+	mix := newMixer(bridgeRate, inputs, c.nodes, bridgeRate/2)
 
-	// Install a mic tap per node: mic -> (echo-cancel) -> that node's mixer input.
-	for _, n := range c.nodes {
+	// Install a mic tap per bridged node: mic -> (echo-cancel) -> its mixer input.
+	for _, n := range tapped {
 		node := n
 		var ac EchoCanceller
 		if aec != nil {
@@ -261,7 +362,7 @@ func (e *Engine) run(c *call, duration time.Duration) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := turn.StreamOut(ctx, out, far); err != nil && ctx.Err() == nil {
+			if err := turn.StreamOut(turn.Context(), out, far); err != nil && ctx.Err() == nil {
 				// A genuine stream failure (not a side effect of stop/shutdown/
 				// drain cancellation) ends the call as an error.
 				c.setFailure(err.Error())
@@ -288,7 +389,7 @@ func (e *Engine) run(c *call, duration time.Duration) {
 	// speak/ask work can proceed. The deferred cancel() then tears down the
 	// context; on stop/shutdown it is already cancelled, which also unblocks
 	// StreamOut.
-	for _, n := range c.nodes {
+	for _, n := range tapped {
 		e.brain.ClearRawAudioTap(n)
 	}
 	mix.stop()
@@ -316,10 +417,10 @@ func (e *Engine) run(c *call, duration time.Duration) {
 }
 
 // buildCancellers builds one echo canceller per node, or nil when AEC is
-// disabled/unavailable. A construction failure degrades the whole call to no AEC
+// disabled/unavailable or no node is bridged. A construction failure degrades the whole call to no AEC
 // rather than failing it.
 func (e *Engine) buildCancellers(nodes []string) map[string]EchoCanceller {
-	if !e.cfg.EchoCancellation.Enabled || e.newAEC == nil {
+	if !e.cfg.EchoCancellation.Enabled || e.newAEC == nil || len(nodes) == 0 {
 		return nil
 	}
 	frame := bridgeRate * e.cfg.EchoCancellation.GetFrameMs() / 1000
@@ -341,9 +442,9 @@ func (e *Engine) buildCancellers(nodes []string) map[string]EchoCanceller {
 // finish removes the call from the registry and emits the ended event.
 func (e *Engine) finish(c *call, status, message string) {
 	e.mu.Lock()
-	for _, n := range c.nodes {
-		if e.calls[n] == c {
-			delete(e.calls, n)
+	for _, id := range c.participantIDs() {
+		if e.calls[id] == c {
+			delete(e.calls, id)
 		}
 	}
 	e.mu.Unlock()
@@ -352,25 +453,44 @@ func (e *Engine) finish(c *call, status, message string) {
 	if status == "error" && reason == "" {
 		reason = "error"
 	}
-	peer := ""
-	if len(c.nodes) > 1 {
-		peer = c.nodes[1]
-	}
-	e.emit(Event{
-		Event:           "intercom_ended",
+	c.ended = c.event("intercom_ended", status, reason, message, time.Since(c.started).Seconds())
+	e.emit(c.ended)
+	close(c.done)
+}
+
+// event builds a lifecycle event for the call.
+func (c *call) event(name, status, reason, message string, duration float64) Event {
+	ev := Event{
+		Event:           name,
 		NodeIDs:         c.nodes,
 		NodeID:          c.nodes[0],
-		PeerNodeID:      peer,
 		Status:          status,
 		Reason:          reason,
 		Message:         message,
-		DurationSeconds: time.Since(c.started).Seconds(),
-	})
+		DurationSeconds: duration,
+	}
+	if len(c.nodes) > 1 {
+		ev.PeerNodeID = c.nodes[1]
+	}
+	for _, r := range c.remotes {
+		ev.RemoteIDs = append(ev.RemoteIDs, r.ID)
+	}
+	return ev
 }
 
-// validateNodes de-duplicates and validates a participant list: it requires at
-// least two distinct, non-empty node ids and rejects repeats.
-func validateNodes(nodes []string) ([]string, error) {
+// participantIDs lists the ids the call is registered under: its nodes, then
+// its remote talkers.
+func (c *call) participantIDs() []string {
+	ids := append([]string(nil), c.nodes...)
+	for _, r := range c.remotes {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
+// validateNodes de-duplicates and validates a node list: it requires at least
+// min distinct, non-empty node ids and rejects repeats.
+func validateNodes(nodes []string, min int) ([]string, error) {
 	seen := make(map[string]bool, len(nodes))
 	uniq := make([]string, 0, len(nodes))
 	for _, n := range nodes {
@@ -383,7 +503,10 @@ func validateNodes(nodes []string) ([]string, error) {
 		seen[n] = true
 		uniq = append(uniq, n)
 	}
-	if len(uniq) < 2 {
+	if len(uniq) < min {
+		if min == 1 {
+			return nil, fmt.Errorf("intercom requires a node to talk to")
+		}
 		return nil, fmt.Errorf("intercom requires at least two distinct nodes")
 	}
 	return uniq, nil

@@ -91,6 +91,18 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
 	}
 	defer turn.Release()
+	// Run the whole flow on the turn's context: an intercom call that takes the
+	// node over cancels it, ending the ask cleanly with a clear reason instead of
+	// letting it listen to (or answer) the people talking on the intercom.
+	ctx = turn.Context()
+	defer func() {
+		if turn.Preempted() && result.Status != "success" {
+			result.Status = "error"
+			result.ErrorMessage = brain.ErrPreempted.Error()
+			result.Transcription = ""
+			result.Audio = nil
+		}
+	}()
 	handle := turn.Handle
 	if handle.Config.Diagnostics.Enabled {
 		defer func() {

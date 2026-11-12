@@ -2,6 +2,7 @@ package intercom
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -126,9 +127,10 @@ func TestIntercomBridgesMicToPeer(t *testing.T) {
 	waitForState(t, rig.nodeB, node.StateIdle, time.Second)
 }
 
-// TestIntercomGatesSpeak verifies a speak/play on a participating node is queued
-// until the intercom call ends.
-func TestIntercomGatesSpeak(t *testing.T) {
+// TestIntercomRejectsSpeak verifies a speak/play on a participating node fails
+// right away with ErrIntercomActive while the call holds it, and works again
+// once the call is over.
+func TestIntercomRejectsSpeak(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 5})
 
 	if err := rig.engine.Start([]string{"A", "B"}, 250*time.Millisecond); err != nil {
@@ -136,28 +138,122 @@ func TestIntercomGatesSpeak(t *testing.T) {
 	}
 	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
 
-	// PlaySamples acquires node A's turn slot, which the intercom call holds.
-	played := make(chan error, 1)
-	go func() {
-		played <- rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0)
-	}()
-
-	select {
-	case <-played:
-		t.Fatal("PlaySamples completed while intercom held node A")
-	case <-time.After(120 * time.Millisecond):
-		// Still blocked — correct.
+	err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0)
+	if !errors.Is(err, brain.ErrIntercomActive) {
+		t.Fatalf("PlaySamples during the call = %v, want ErrIntercomActive", err)
+	}
+	if _, err := rig.brain.AcquireNode(context.Background(), "B", 1000); !errors.Is(err, brain.ErrIntercomActive) {
+		t.Fatalf("AcquireNode during the call = %v, want ErrIntercomActive", err)
 	}
 
-	// After the call times out and releases the slot, the play proceeds.
 	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0); err != nil {
+		t.Fatalf("PlaySamples after the call: %v", err)
+	}
+}
+
+// TestIntercomPreemptsTurn verifies a call cuts off the turn in progress (TTS
+// or an ask flow) instead of waiting for it: the human voice wins.
+func TestIntercomPreemptsTurn(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 5})
+
+	turn, err := rig.brain.AcquireNode(context.Background(), "A", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endless := newBridgeBuffer(16000, 16000) // a TTS stream that never ends
+	turnDone := make(chan error, 1)
+	go func() {
+		defer turn.Release()
+		turnDone <- turn.PlayStream(turn.Context(), endless)
+	}()
+
+	if err := rig.engine.Start([]string{"A", "B"}, 300*time.Millisecond); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	select {
-	case err := <-played:
-		if err != nil {
-			t.Fatalf("queued PlaySamples failed: %v", err)
+	case <-turnDone:
+	case <-time.After(time.Second):
+		t.Fatal("the turn in progress was not preempted")
+	}
+	if !turn.Preempted() {
+		t.Fatal("turn not marked preempted")
+	}
+	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
+	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+}
+
+// TestIntercomRemoteTalksToNode verifies the intercom page's microphone reaches
+// the node through its normal output (the single talkback path) and that the
+// node's own microphone is not tapped (nobody in gocalis listens to it).
+func TestIntercomRemoteTalksToNode(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+
+	remote := rig.engine.NewRemote()
+	call, err := rig.engine.StartRemote(remote, []string{"A"}, 400*time.Millisecond)
+	if err != nil {
+		t.Fatalf("StartRemote failed: %v", err)
+	}
+	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
+	if rig.nodeB.GetState() != node.StateIdle {
+		t.Fatalf("node B was drawn into the call: %s", rig.nodeB.GetState())
+	}
+
+	// A's own microphone: no tap may be installed, so this must reach nothing.
+	leak := audio.FloatToPCM16([]float32{0.9})[0]
+	rig.brain.ForwardRawAudio("A", []float32{0.9, 0.9, 0.9})
+
+	voice := make([]int16, 1600) // 100 ms, above the jitter cushion
+	for i := range voice {
+		voice[i] = int16(1000 + i%7)
+	}
+	remote.Push(voice)
+
+	// A second caller cannot take the same node.
+	if _, err := rig.engine.StartRemote(rig.engine.NewRemote(), []string{"A"}, 0); err == nil {
+		t.Fatal("a second remote call took a node already in a call")
+	}
+
+	select {
+	case <-call.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("call did not end on its deadline")
+	}
+	ended := call.Ended()
+	if ended.Reason != "timeout" || len(ended.RemoteIDs) != 1 || ended.RemoteIDs[0] != remote.ID || ended.NodeID != "A" || ended.PeerNodeID != "" {
+		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+	if !stubPlayedContains(rig.stubA, voice[:320]) {
+		t.Fatalf("node A did not play the remote voice")
+	}
+	for _, v := range flatten(rig.stubA) {
+		if v == leak {
+			t.Fatal("node A's own microphone leaked into its speaker")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("queued PlaySamples did not proceed after intercom ended")
+	}
+	waitForState(t, rig.nodeA, node.StateIdle, time.Second)
+}
+
+// TestIntercomRemoteStop verifies the page's transport can end its call through
+// the handle, and that the node is free again afterwards.
+func TestIntercomRemoteStop(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+	call, err := rig.engine.StartRemote(rig.engine.NewRemote(), []string{"A"}, 0)
+	if err != nil {
+		t.Fatalf("StartRemote failed: %v", err)
+	}
+	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
+	call.Stop()
+	select {
+	case <-call.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("call did not end after Stop")
+	}
+	if r := call.Ended().Reason; r != "stopped" {
+		t.Fatalf("reason = %q, want stopped", r)
+	}
+	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0); err != nil {
+		t.Fatalf("PlaySamples after the call: %v", err)
 	}
 }
 
