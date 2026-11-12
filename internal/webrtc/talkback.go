@@ -201,10 +201,11 @@ func newTalkbackSender(setupCtx context.Context, apiBaseURL, inStream, dstStream
 }
 
 // assertRoute (re)establishes the go2rtc AAC-ELD bridge that transcodes inStream
-// (Opus) into the doorbell's HomeKit backchannel. go2rtc tears down the idle
-// ffmpeg transcoder over time, so this must be called before each utterance to
-// guarantee the bridge is live when speech is paced. Re-POSTing is idempotent:
-// go2rtc dedups producers by source URL, so an already-live bridge is untouched.
+// (Opus) into the doorbell's HomeKit backchannel. It is NOT idempotent: go2rtc's
+// Stream.Play (internal/streams/play.go) first stops every internal producer of
+// the dst stream and then starts a fresh ffmpeg bridge, so each POST tears down a
+// live bridge and pays a new ffmpeg start. Call it only when the bridge is known
+// to be missing (see ensureRoute) or right after a new WHIP producer came up.
 func (t *talkbackSender) assertRoute(ctx context.Context) error {
 	source := "ffmpeg:" + t.inStream + "#audio=eld"
 	routeURL, err := streamsURL(t.apiBaseURL, t.dstStream, source)
@@ -218,6 +219,19 @@ func (t *talkbackSender) assertRoute(ctx context.Context) error {
 		t.mu.Unlock()
 	}
 	return err
+}
+
+// ensureRoute makes sure the AAC-ELD bridge is live before speech is paced. go2rtc
+// tears down an idle ffmpeg bridge over time, but re-POSTing a live one would
+// restart it (see assertRoute), so the route is re-asserted only when go2rtc no
+// longer lists it, or when the listing cannot be read.
+func (t *talkbackSender) ensureRoute(ctx context.Context) error {
+	if active, err := t.routeActive(ctx); err == nil && active {
+		return nil
+	} else if err != nil {
+		log.Printf("[Talkback] route check failed (%v); re-asserting the AAC-ELD route", err)
+	}
+	return t.assertRoute(ctx)
 }
 
 // run paces the encoded queue (or silence) onto the WebRTC track at 20ms until ctx

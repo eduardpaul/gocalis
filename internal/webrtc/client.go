@@ -512,10 +512,11 @@ func (c *Client) PlayStream(ctx context.Context, src audionode.PCM16Source) erro
 		tb.firstAudioSent = false
 		tb.playbackStarted = time.Now()
 		tb.mu.Unlock()
-		// go2rtc drops the idle AAC-ELD ffmpeg bridge over time, so re-assert the
-		// route before speaking, bounded by the playback lifetime.
+		// go2rtc drops the idle AAC-ELD ffmpeg bridge over time, so make sure it
+		// is live before speaking, bounded by the playback lifetime. It is only
+		// re-posted when missing: a POST restarts a live bridge.
 		routeCtx, routeCancel := context.WithTimeout(ctx, 5*time.Second)
-		if rerr := tb.assertRoute(routeCtx); rerr != nil {
+		if rerr := tb.ensureRoute(routeCtx); rerr != nil {
 			routeCancel()
 			return fmt.Errorf("talkback route: %w", rerr)
 		}
