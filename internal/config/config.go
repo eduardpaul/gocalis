@@ -23,7 +23,8 @@ type Config struct {
 	Nodes            []NodeConfig   `yaml:"nodes"`
 }
 
-// IntercomConfig holds settings for the two-node intercom bridge feature.
+// IntercomConfig holds settings for intercom calls: between nodes, and from the
+// intercom web page (/intercom) to a node.
 type IntercomConfig struct {
 	// DefaultTimeoutSeconds is the default automatic end time for an intercom
 	// call when the request does not override it. A call always ends by this
@@ -35,6 +36,14 @@ type IntercomConfig struct {
 	// hardware echo cancellation does not feed its own speaker output (the peer's
 	// voice) back into the call.
 	EchoCancellation IntercomAECConfig `yaml:"echo_cancellation"`
+
+	// Viewers maps a node id to the go2rtc page the intercom web page embeds to
+	// show and play that node's camera and microphone, e.g.
+	// "https://go2rtc.example/stream.html?src=doorbell_tv&mode=webrtc". The page
+	// is a plain go2rtc viewer (go2rtc fans the stream out); gocalis does not
+	// relay the doorbell's audio or video. It must be reachable from the
+	// browser (over HTTPS when the intercom page is). Optional.
+	Viewers map[string]string `yaml:"viewers"`
 }
 
 // IntercomAECConfig configures the per-node software echo canceller.

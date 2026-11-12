@@ -42,6 +42,10 @@ type Server struct {
 	startTime     time.Time
 	authToken     string
 
+	// intercomViewers maps a node id to the go2rtc viewer the intercom page
+	// embeds (config intercom.viewers).
+	intercomViewers map[string]string
+
 	hub      *wshub.Hub
 	upgrader websocket.Upgrader
 
@@ -83,6 +87,12 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/ask", s.control(s.handleAsk))
 	mux.HandleFunc("/api/reload-speakers", s.control(s.handleReloadSpeakers))
 	mux.HandleFunc("/api/events", s.handleEvents)
+
+	// Intercom page: the browser plays the node from go2rtc and streams its
+	// microphone to gocalis, which puts it on the node's one output path.
+	mux.HandleFunc("/intercom", s.handleIntercomPage)
+	mux.HandleFunc("/api/intercom/config", s.withCORS(httpsec.RequireToken(s.authToken, s.handleIntercomConfig)))
+	mux.HandleFunc("/api/intercom/ws", s.handleIntercomWS)
 
 	// Static files from embedded React build
 	staticFS, err := fs.Sub(distFS, "dist")

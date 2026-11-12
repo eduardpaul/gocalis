@@ -154,6 +154,7 @@ func main() {
 		// Initialize dashboard web server.
 		log.Printf("Starting Dashboard Web Server on %s...\n", *httpAddr)
 		webServer := webserver.NewServer(*httpAddr, centralBrain, executor, speakerEngine, cfg.Security.AuthToken, cfg.Security.AllowedOrigins)
+		webServer.SetIntercomViewers(cfg.Intercom.Viewers)
 		eventBus.Add(webServer)
 
 		go func() {

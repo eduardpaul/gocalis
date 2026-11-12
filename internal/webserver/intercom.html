@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intercom</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f4f4f5; --fg: #18181b; --muted: #71717a; --card: #ffffff; --accent: #16a34a; --stop: #dc2626; --border: #d4d4d8; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #09090b; --fg: #f4f4f5; --muted: #a1a1aa; --card: #18181b; --border: #3f3f46; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+  .viewer { position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 16 / 9; }
+  .viewer iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  .viewer p { position: absolute; inset: 0; margin: 0; display: grid; place-items: center; color: #a1a1aa; padding: 16px; text-align: center; }
+  .bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+  select, input { font: inherit; padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 999px; padding: 14px 28px; color: #fff; background: var(--accent); cursor: pointer; }
+  button.live { background: var(--stop); }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--muted); flex: 1 1 200px; }
+  meter { width: 120px; }
+  .token { display: none; gap: 8px; }
+  .token.show { display: flex; }
+</style>
+</head>
+<body>
+<main>
+  <div class="viewer" id="viewer"><p>Cargando…</p></div>
+  <div class="bar">
+    <select id="node" aria-label="Dispositivo"></select>
+    <button id="talk" disabled>Hablar</button>
+    <meter id="level" min="0" max="1" value="0" aria-label="Nivel del micrófono"></meter>
+    <span id="status"></span>
+  </div>
+  <form class="bar token" id="tokenForm">
+    <input id="token" type="password" placeholder="Token de la API" autocomplete="current-password">
+    <button type="submit">Guardar</button>
+  </form>
+</main>
+<script>
+"use strict";
+// The doorbell is shown and heard through go2rtc's own viewer (iframe): this
+// page never sends anything to go2rtc. The microphone goes only to gocalis
+// (/api/intercom/ws), which puts it on the doorbell's single talkback path.
+const params = new URLSearchParams(location.search);
+const $ = (id) => document.getElementById(id);
+let token = params.get("token") || sessionStorage.getItem("gocalis-token") || "";
+let config = null;
+let session = null; // { ws, ctx, stream, node, timer, ending }
+
+function setStatus(text) { $("status").textContent = text; }
+
+function api(path) {
+  const u = new URL(path, location.href);
+  if (token) u.searchParams.set("token", token);
+  return u;
+}
+
+async function loadConfig() {
+  const res = await fetch(api("api/intercom/config"));
+  if (res.status === 401) {
+    $("tokenForm").classList.add("show");
+    setStatus("Hace falta el token de la API.");
+    return;
+  }
+  if (!res.ok) throw new Error("config: " + res.status);
+  config = await res.json();
+  $("tokenForm").classList.remove("show");
+  const sel = $("node");
+  sel.innerHTML = "";
+  for (const id of config.nodes || []) {
+    const o = document.createElement("option");
+    o.value = o.textContent = id;
+    sel.appendChild(o);
+  }
+  const wanted = params.get("node") || Object.keys(config.viewers || {})[0];
+  if (wanted && (config.nodes || []).includes(wanted)) sel.value = wanted;
+  sel.disabled = (config.nodes || []).length < 2;
+  showViewer();
+  $("talk").disabled = !sel.value;
+  setStatus(sel.value ? "Listo." : "No hay dispositivos.");
+}
+
+function showViewer() {
+  const url = (config.viewers || {})[$("node").value];
+  const box = $("viewer");
+  box.innerHTML = "";
+  if (!url) {
+    const p = document.createElement("p");
+    p.textContent = "Sin visor configurado para este dispositivo (intercom.viewers).";
+    box.appendChild(p);
+    return;
+  }
+  const f = document.createElement("iframe");
+  f.src = url;
+  f.allow = "autoplay; fullscreen";
+  box.appendChild(f);
+}
+
+// AudioWorklet: downmix to mono, decimate to the server rate by averaging each
+// output period (a cheap anti-alias filter), and post 20 ms PCM16 frames.
+// Silence is sent too, so the server can tell a live page from a vanished one.
+const WORKLET = `
+class Mic extends AudioWorkletProcessor {
+  constructor(o) {
+    super();
+    this.out = o.processorOptions.rate;
+    this.step = sampleRate / this.out;
+    this.pos = 0; this.acc = 0; this.cnt = 0;
+    this.frame = new Int16Array(this.out / 50); this.n = 0;
+    this.peak = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0];
+    if (!ch || ch.length === 0) return true;
+    const len = ch[0].length;
+    for (let i = 0; i < len; i++) {
+      let s = 0;
+      for (let c = 0; c < ch.length; c++) s += ch[c][i];
+      this.acc += s / ch.length; this.cnt++;
+      this.pos += 1;
+      if (this.pos < this.step) continue;
+      this.pos -= this.step;
+      const x = Math.max(-1, Math.min(1, this.acc / this.cnt));
+      this.acc = 0; this.cnt = 0;
+      this.peak = Math.max(this.peak, Math.abs(x));
+      this.frame[this.n++] = x < 0 ? x * 0x8000 : x * 0x7fff;
+      if (this.n === this.frame.length) {
+        this.port.postMessage({ pcm: this.frame.buffer, peak: this.peak }, [this.frame.buffer]);
+        this.frame = new Int16Array(this.out / 50); this.n = 0; this.peak = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("gocalis-mic", Mic);`;
+
+async function start() {
+  const node = $("node").value;
+  if (!node || session) return;
+  $("talk").disabled = true;
+  setStatus("Abriendo el micrófono…");
+  let stream, ctx;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      // Echo cancellation keeps the doorbell audio this page plays out of the
+      // microphone, so the visitor does not hear themselves back.
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+    ctx = new AudioContext();
+    const blob = URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" }));
+    await ctx.audioWorklet.addModule(blob);
+    URL.revokeObjectURL(blob);
+    await ctx.resume();
+  } catch (e) {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (ctx) ctx.close();
+    setStatus("Sin micrófono: " + e.message);
+    $("talk").disabled = false;
+    return;
+  }
+
+  const wsURL = api("api/intercom/ws");
+  wsURL.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  wsURL.searchParams.set("node_id", node);
+  wsURL.searchParams.set("duration_seconds", String(config.default_duration_seconds || 300));
+  const ws = new WebSocket(wsURL);
+  ws.binaryType = "arraybuffer";
+  session = { ws, ctx, stream, node, timer: null, ending: null };
+
+  const src = ctx.createMediaStreamSource(stream);
+  const mic = new AudioWorkletNode(ctx, "gocalis-mic", { processorOptions: { rate: config.sample_rate || 16000 } });
+  mic.port.onmessage = (e) => {
+    $("level").value = e.data.peak;
+    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) ws.send(e.data.pcm);
+  };
+  src.connect(mic);
+
+  ws.onmessage = (e) => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (m.event === "intercom_started") {
+      session.ending = Date.now() + m.duration_seconds * 1000;
+      $("talk").textContent = "Colgar";
+      $("talk").classList.add("live");
+      $("talk").disabled = false;
+      tick();
+      session.timer = setInterval(tick, 1000);
+    } else if (m.event === "intercom_ended") {
+      stop(reasonText(m));
+    } else if (m.event === "error") {
+      stop("No se pudo hablar: " + m.message);
+    }
+  };
+  ws.onclose = () => stop();
+  ws.onerror = () => stop("Conexión perdida.");
+}
+
+function tick() {
+  if (!session || !session.ending) return;
+  const left = Math.max(0, Math.round((session.ending - Date.now()) / 1000));
+  setStatus(`Hablando con ${session.node} · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`);
+}
+
+function reasonText(m) {
+  switch (m.reason) {
+    case "timeout": return "Llamada terminada (tiempo agotado).";
+    case "stopped": return "Llamada terminada.";
+    case "shutdown": return "Llamada terminada: gocalis se ha detenido.";
+    default: return "Llamada terminada: " + (m.message || m.reason || "error");
+  }
+}
+
+function stop(text) {
+  const s = session;
+  if (!s) return;
+  session = null;
+  clearInterval(s.timer);
+  s.stream.getTracks().forEach((t) => t.stop());
+  s.ctx.close();
+  if (s.ws.readyState === WebSocket.OPEN) {
+    s.ws.send(JSON.stringify({ action: "stop" }));
+    s.ws.close();
+  }
+  $("level").value = 0;
+  $("talk").textContent = "Hablar";
+  $("talk").classList.remove("live");
+  $("talk").disabled = false;
+  setStatus(text || "Llamada terminada.");
+}
+
+$("talk").onclick = () => (session ? stop() : start());
+$("node").onchange = () => { if (!session) showViewer(); };
+$("tokenForm").onsubmit = (e) => {
+  e.preventDefault();
+  token = $("token").value.trim();
+  sessionStorage.setItem("gocalis-token", token);
+  loadConfig().catch((err) => setStatus(err.message));
+};
+window.addEventListener("pagehide", () => stop());
+if (params.get("token")) sessionStorage.setItem("gocalis-token", token);
+loadConfig().catch((err) => setStatus(err.message));
+</script>
+</body>
+</html>

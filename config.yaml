@@ -61,6 +61,19 @@ models:
         - "Esta es mi clave vocal de seguridad para hoy."
         - "Reconoce mis patrones de voz y ejecuta el comando."
 
+# Intercom calls (between nodes, and from the intercom page at /intercom to a
+# node). During a call the node plays only the call: TTS/ask/play requests for it
+# fail with "node is in an intercom call" and an ask in progress is ended.
+# intercom:
+#   default_timeout_seconds: 60
+#   echo_cancellation:
+#     enabled: false
+#   # go2rtc viewer the intercom page embeds for each node (a plain go2rtc
+#   # viewer: the page never talks to go2rtc). Must be reachable from the browser
+#   # over HTTPS when the page is served over HTTPS.
+#   viewers:
+#     front_door: "https://go2rtc.example/stream.html?src=doorbell_tv&mode=webrtc"
+
 mqtt:
   enabled: false
   broker: "tcp://localhost:1883"
