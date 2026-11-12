@@ -55,6 +55,8 @@ module.exports = function(RED) {
             }
 
             const participants = message.node_ids || [];
+            // Intercom page microphones talking in the call (e.g. "web-1").
+            const remotes = message.remote_ids || [];
             const configured = configuredIds(null);
             const relevant = configured.length === 0 ||
                 participants.some((p) => configured.indexOf(p) !== -1);
@@ -62,7 +64,7 @@ module.exports = function(RED) {
                 return;
             }
 
-            const who = participants.join(" ↔ ") || "call";
+            const who = participants.concat(remotes.length ? ["intercom page"] : []).join(" ↔ ") || "call";
             if (message.event === "intercom_started") {
                 node.status({ fill: "green", shape: "dot", text: `in call: ${who}` });
                 return;
@@ -70,19 +72,23 @@ module.exports = function(RED) {
 
             // intercom_ended
             const reason = message.reason || "ended";
-            node.status({ fill: "grey", shape: "ring", text: `ended (${reason})` });
+            node.status({ fill: message.status === "error" ? "red" : "grey", shape: "ring", text: `ended (${reason})` });
             node.send([null, {
                 topic: "gocalis/intercom",
                 payload: {
                     event: "intercom_ended",
                     node_ids: participants,
+                    remote_ids: remotes,
                     node_id: message.node_id,
                     peer_node_id: message.peer_node_id,
+                    status: message.status,
+                    message: message.message,
                     reason: reason,
                     duration_seconds: message.duration_seconds
                 },
                 node_id: message.node_id,
                 node_ids: participants,
+                remote_ids: remotes,
                 reason: reason,
                 duration_seconds: message.duration_seconds
             }]);

@@ -61,13 +61,13 @@ A real-time listener node that triggers when the background wakeword detection l
     * `msg.speaker`: Verified speaker name.
 
 ### 5. `gocalis intercom` (Live Audio Bridge)
-Opens a live two-way (or N-way) audio intercom bridge between two or more nodes. While a call is active, any `say`/`ask`/`play` targeting a participant is queued until the call ends.
+Opens a live two-way (or N-way) audio intercom bridge between two or more nodes. A call takes its participants over: a `say`/`play`/`ask` already running on one is cut off (an ask ends with `"interrupted by an intercom call"`), and while the call lasts every `say`/`ask`/`play` targeting a participant fails at once with `"node is in an intercom call"` instead of being queued (a broadcast to `all` skips those nodes). Wake word detection is off on participants during the call. Calls opened from the intercom web page (`/intercom`) are reported here too.
 * **Participants**: The node IDs to bridge, e.g. `kitchen, bedroom`. Overridable per message via `msg.node_ids` (array or comma-separated string), or `msg.node_id` + `msg.peer_node_id` for a two-node call.
 * **Timeout (s)**: Call time limit; `0` uses the server default (`intercom.default_timeout_seconds`). Overridable via `msg.duration_seconds`.
 * **Stopping**: Send `msg.payload = "stop"` (or `msg.action = "intercom_stop"`, or `msg.stop = true`) to end the call. Target a specific participant with `msg.node_id`.
 * **Outputs**:
   * **Output 1 (Started / Stopping)**: Emits once the engine accepts the call (or when a stop is sent).
-  * **Output 2 (Call Ended)**: Emits when the call ends for any reason. `msg.payload.reason` is `timeout`, `stopped`, `shutdown`, or `error`; `msg.payload.duration_seconds` is the call length. Also fires for matching calls started/stopped elsewhere (web UI, timeout).
+  * **Output 2 (Call Ended)**: Emits when the call ends for any reason. `msg.payload.reason` is `timeout`, `stopped`, `shutdown`, or `error`; `msg.payload.duration_seconds` is the call length; `msg.payload.remote_ids` lists intercom page microphones that took part. Also fires for matching calls started/stopped elsewhere (web UI, intercom page, timeout).
 
 ### 6. `gocalis stt` (Speech-to-Text on Files)
 A stateless file transcription node.

@@ -49,8 +49,16 @@
 
 <script type="text/html" data-help-name="gocalis-intercom">
     <p>Opens a live two-way (or N-way) audio intercom bridge between two or more
-    Gocalis nodes. While a call is active, any <b>say</b>/<b>ask</b>/<b>play</b>
-    targeting a participant is queued until the call ends.</p>
+    Gocalis nodes. A call takes every participant over: a <b>say</b>/<b>play</b>
+    or <b>ask</b> already running on it is cut off (an ask ends with
+    <code>"interrupted by an intercom call"</code>), and while the call lasts any
+    <b>say</b>/<b>ask</b>/<b>play</b> targeting a participant fails at once with
+    <code>"node is in an intercom call"</code> (it is not queued). A broadcast to
+    <code>all</code> skips nodes in a call. Wake word detection is off on the
+    participants for the whole call.</p>
+    <p>The intercom web page (<code>/intercom</code> on the Gocalis dashboard)
+    opens calls of its own to a single node; this node reports them too (output
+    2, with <code>remote_ids</code>) and can end them with a stop.</p>
 
     <h3>Starting a call</h3>
     <p>Send any message to start a call between the configured
@@ -81,8 +89,11 @@
         <li>Call ended — emits when the call ends for any reason.
         <code>msg.payload.reason</code> is one of <code>timeout</code>,
         <code>stopped</code>, <code>shutdown</code>, or <code>error</code>, and
-        <code>msg.payload.duration_seconds</code> is the call length. This fires
-        for matching calls even when they were started or stopped elsewhere (web
-        UI, timeout, another flow).</li>
+        <code>msg.payload.duration_seconds</code> is the call length;
+        <code>msg.payload.status</code> is <code>success</code> or
+        <code>error</code> (with <code>msg.payload.message</code>), and
+        <code>msg.payload.remote_ids</code> lists intercom page microphones that
+        took part. This fires for matching calls even when they were started or
+        stopped elsewhere (web UI, intercom page, timeout, another flow).</li>
     </ol>
 </script>

@@ -271,9 +271,10 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
               />
             </label>
             <p className="hint">
-              While a call is live, every participant is held: any Say/Ask targeting them is queued
-              until it ends. Each node hears all the others (mix-minus). The call auto-ends after the
-              timeout, or use Stop below.
+              While a call is live it is the only audio on its participants: whatever they were
+              saying is cut off, and any Say/Ask targeting them fails until the call ends. Each node
+              hears all the others (mix-minus). The call auto-ends after the timeout, or use Stop
+              below. To talk to the doorbell from a phone, use the intercom page (/intercom).
             </p>
           </>
         )}

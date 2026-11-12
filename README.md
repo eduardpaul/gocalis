@@ -271,6 +271,44 @@ Each service admits at most 32 concurrent commands. Model and per-node queues ho
 
 Shutdown cancels commands, closes event connections, joins command/wake/capture/reload work, and only then closes inference engines. An engine waits for any active native call before deleting its model. The review and rationale are in [docs/architecture-performance-review.md](docs/architecture-performance-review.md).
 
+### Intercom
+
+An intercom call carries live voice through Gocalis's nodes. It is started either
+between nodes (`{"action": "intercom", "node_ids": ["living_room", "front_door"], "duration_seconds": 120}`,
+ended with `{"action": "intercom_stop", "node_id": "front_door"}`; events
+`intercom_started` / `intercom_ended`) or from the intercom page.
+
+**Intercom page.** `GET /intercom` serves a standalone page meant to sit behind
+a signing-in reverse proxy (it asks for the API token like the dashboard, or
+takes `?token=`; `?node=front_door` preselects the node). It shows and plays the
+doorbell through a plain go2rtc viewer in an iframe (`intercom.viewers`, e.g.
+`stream.html?src=doorbell_tv&mode=webrtc`): go2rtc fans the stream out and
+Gocalis relays no audio or video to the browser. The browser microphone goes
+only to Gocalis, over `GET /api/intercom/ws?node_id=...` (16 kHz mono PCM16
+binary frames; JSON status messages back).
+
+**One source of doorbell audio.** Every call plays through the node's normal
+output: for the doorbell, the single WHIP producer on `talkback_in` and the one
+`ffmpeg:talkback_in#audio=eld` bridge into `doorbell_raw_homekit` that TTS uses.
+Nothing in the intercom opens another `?dst=` route or a browser backchannel;
+go2rtc's `Stream.Play` stops every other bridge on that stream, so a second
+sender would cut Gocalis off. Gocalis re-posts its bridge only when go2rtc no
+longer lists it.
+
+**Priority.** A call takes its nodes over: the TTS, play or ask in progress is
+cut off (an ask ends with status `error`, `"interrupted by an intercom call"`,
+without running ASR). While the call lasts, every TTS/play/ask for those nodes,
+including `gocalis-say` and the HTTP API, fails at once with
+`"node is in an intercom call"` rather than being queued (a stale reply played
+after the call would be worse). A broadcast to `all` skips them. One call per
+node: a second page or call for a busy node is refused.
+
+**No self-hearing.** While a node is in a call its microphone reaches only the
+intercom bridge (and only when another node listens; for a page call nobody in
+Gocalis does), never wake word detection, VAD, ASR or the assistant. That holds
+for the node's `auto_ask_capture_delay_seconds` after the call too, while the
+device plays out its buffered tail.
+
 ### Local multi-device audio simulator
 
 [tools/simulator](tools/simulator/README.md) provides virtual RTSP microphones and
