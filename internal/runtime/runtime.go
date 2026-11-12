@@ -305,6 +305,11 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	halfDuplex := !nodeCfg.RTCStream.EchoCancellation
 	previousState := node.StateIdle
 	wakeActive := false // whether the wake stream is currently being fed (node IDLE)
+	// After an intercom call the device keeps playing the tail of the human's
+	// voice from its jitter buffer for a moment; that echo must not reach the
+	// wake word detector or a new ask either.
+	intercomTail := time.Duration(nodeCfg.GetAutoAskCaptureDelaySeconds(1.5) * float64(time.Second))
+	var intercomGuardUntil time.Time
 	audioNode.OnAudio(func(samples []float32) {
 		handle.Recorder.Add(samples)
 		if len(samples) == 0 {
@@ -313,6 +318,9 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		state := pNode.GetState()
 		if state != previousState {
 			vadGate.Reset()
+			if previousState == node.StateIntercom {
+				intercomGuardUntil = time.Now().Add(intercomTail)
+			}
 			previousState = state
 		}
 		// Half-duplex gate: while the node is playing its own TTS, the microphone
@@ -324,12 +332,22 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			return
 		}
 
-		// Intercom tap: while this node is bridged to a peer, forward the raw
-		// continuous mic to the intercom engine (which streams it to the peer's
-		// speaker). No tap installed = a cheap map lookup. The node is in the
-		// INTERCOM state during a call, so the half-duplex gate above does not
-		// drop this audio and full-duplex conversation is preserved.
-		r.brain.ForwardRawAudio(nodeCfg.NodeID, samples)
+		// Intercom: while the node is in a call its microphone carries the people
+		// talking on the intercom, including the echo of the human's own voice on
+		// the device speaker. It goes ONLY to the intercom tap (installed when a
+		// peer node listens; no tap = a cheap map lookup), never to wake word
+		// detection, VAD/ask capture, ASR or the assistant. The half-duplex gate
+		// above does not apply (the node is INTERCOM, not SPEAKING), so the call
+		// stays full duplex.
+		if state == node.StateIntercom {
+			r.brain.ForwardRawAudio(nodeCfg.NodeID, samples)
+			wakeActive = false
+			return
+		}
+		if time.Now().Before(intercomGuardUntil) {
+			wakeActive = false
+			return
+		}
 
 		// Wake word detection runs on the CONTINUOUS audio stream, but only while the
 		// node is IDLE (waiting for a fresh activation). The streaming zipformer KWS
