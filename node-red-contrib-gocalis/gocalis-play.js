@@ -79,7 +79,12 @@ module.exports = function(RED) {
                 msg.node_id = result.node_id || resolvedNodeId;
 
                 if (result.event === "error" || result.status === "error") {
-                    node.status({ fill: "red", shape: "ring", text: result.message || "error" });
+                    // On a node somebody has to answer: nobody did
+                    // ("unanswered"), or they left midway ("hung_up").
+                    msg.reason = result.reason;
+                    node.status(result.reason
+                        ? { fill: "yellow", shape: "ring", text: result.reason.replace("_", " ") }
+                        : { fill: "red", shape: "ring", text: result.message || "error" });
                     done(`Gocalis engine reported failure: ${result.message || "error"}`);
                     return;
                 }

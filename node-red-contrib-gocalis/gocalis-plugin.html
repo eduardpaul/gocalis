@@ -6,7 +6,7 @@
             name: { value: "" },
             server: { value: "", type: "gocalis-config", required: true },
             plugin: { value: "telegram", required: true },
-            command: { value: "call" },
+            command: { value: "hangup" },
             nodeId: { value: "" },
             args: { value: "", validate: function(v) {
                 if (v === undefined || String(v).trim() === "") { return true; }
@@ -42,7 +42,7 @@
     </div>
     <div class="form-row">
         <label for="node-input-command"><i class="fa fa-terminal"></i> Command</label>
-        <input type="text" id="node-input-command" placeholder="e.g. call">
+        <input type="text" id="node-input-command" placeholder="e.g. hangup">
     </div>
     <div class="form-row">
         <label for="node-input-nodeId"><i class="fa fa-microphone"></i> Node</label>
@@ -99,37 +99,31 @@
     </ol>
 
     <h3>The telegram_call plugin</h3>
-    <p>Brings a Telegram group's voice chat into an intercom call with a node:
-    the doorbell rings, the voice chat opens, and whoever comes into it from
-    the group talks to the door.</p>
-    <p><b>call</b> (with a <b>Node</b>) opens the group's voice chat and waits
-    in it. The intercom call starts when somebody from the group comes in.
-    Args, all optional: <code>ring_seconds</code> (how long to wait),
-    <code>duration_seconds</code> (how long the intercom call lasts at most),
-    <code>chat</code> and <code>title</code> (instead of the configured group
-    and voice chat name). Sent again for the same node while waiting, the wait
-    starts over.</p>
-    <p><b>hangup</b> ends it at whatever point it is.</p>
+    <p>Makes a Telegram group's voice chat a node of gocalis, whose id is the
+    plugin's (e.g. <code>telegram</code>). That node is used with the regular
+    nodes: <b>gocalis say</b>, <b>gocalis ask</b> and <b>gocalis intercom</b>
+    with it as the node ring the group (the voice chat opens and gocalis waits
+    in it) and happen when somebody of the group comes in. For the doorbell: a
+    <b>gocalis intercom</b> node with the doorbell and <code>telegram</code>
+    as participants.</p>
+    <p>The one command is <b>hangup</b>: it takes gocalis out of the voice chat
+    at whatever point it is.</p>
     <p>Events:</p>
     <ul>
-        <li><code>telegram_call_waiting</code>: the voice chat is open and
-        nobody is there yet. <code>data.chat</code>,
-        <code>data.ring_seconds</code>.</li>
-        <li><code>telegram_call_answered</code>: somebody came in and the
-        intercom call started. <code>data.answered</code> has their names,
-        <code>data.remote_id</code> is the voice chat's id in the intercom
-        call (as in <code>remote_ids</code> of the intercom events).</li>
-        <li><code>telegram_call_ended</code>: it is over.
+        <li><code>call_ringing</code>: the voice chat is open and nobody is
+        there yet. <code>data.chat</code>, <code>data.ring_seconds</code>. The
+        moment to notify the group, as Telegram does not ring for a voice
+        chat.</li>
+        <li><code>call_answered</code>: somebody came in.
+        <code>data.answered</code> has their names.</li>
+        <li><code>call_ended</code>: gocalis is out of the voice chat.
         <code>payload.reason</code> is <code>unanswered</code> (nobody came in
         time), <code>hung_up</code> (everybody on Telegram left),
-        <code>stopped</code> (hangup, or the intercom call was stopped),
-        <code>timeout</code> (the intercom call reached its limit),
+        <code>completed</code> (nothing more to do on the node),
         <code>closed</code> (the voice chat was closed from Telegram),
-        <code>left</code> (the voice chat was taken out of the intercom call)
-        or <code>error</code> (see <code>payload.message</code>).
-        <code>data.answered</code> tells whether anybody ever came in.</li>
+        <code>cancelled</code> (what rang was given up),
+        <code>stopped</code> (hangup) or <code>error</code> (see
+        <code>payload.message</code>). <code>data.answered</code> tells whether
+        anybody ever came in.</li>
     </ul>
-    <p>The regular intercom events (<code>intercom_started</code>,
-    <code>intercom_ended</code>...) are reported as for any call; a
-    <b>gocalis intercom</b> node sees them.</p>
 </script>

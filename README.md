@@ -295,7 +295,10 @@ Events: `intercom_started`, `intercom_joined`, `intercom_left` and
 `participant_id` (who), ended adds `reason` and `duration_seconds`, the others
 `remaining_seconds`. A node whose playback fails is dropped from the call
 (`intercom_left` with `status: "error"`); the call ends in error only if that
-leaves a single participant.
+leaves a single participant. A node somebody has to answer (see
+[Nodes somebody has to answer](#nodes-somebody-has-to-answer)) is rung first:
+`intercom_ringing` comes before `intercom_started`, and nobody answering ends
+the call with `reason: "unanswered"`.
 
 **Intercom page.** `GET /intercom` serves a standalone page meant to sit behind
 a signing-in reverse proxy (it asks for the API token like the dashboard, or
@@ -378,42 +381,65 @@ plugins:
     settings: {...}       # belong to the type
 ```
 
-It takes commands through the same API as everything else, and reports with
-events that carry its id:
+A plugin can add a **node**, whose id is the plugin's. `tts`, `play`, `ask`
+and `intercom` reach it like a configured node, so flows use it with the
+nodes they already have. It can also take commands of its own, and report
+with events that carry its id:
 
 ```json
-{"action": "plugin", "plugin": "telegram", "command": "call", "node_id": "front_door", "args": {"ring_seconds": 60}}
+{"action": "plugin", "plugin": "telegram", "command": "hangup"}
 ```
 
 ```json
-{"event": "telegram_call_waiting", "plugin": "telegram", "node_id": "front_door", "data": {"chat": "Casa", "ring_seconds": 60, "started_voice_chat": true}}
+{"event": "call_ringing", "plugin": "telegram", "node_id": "telegram", "data": {"chat": "Casa", "ring_seconds": 60, "started_voice_chat": true}}
 ```
 
-`node_id` is the node the command is about, when it is about one; `args` is an
-object with the command's own parameters, and an arg the plugin does not know
-is refused. A command the plugin refuses is answered with an `error` event
-that has `plugin` set. `GET /api/plugins` lists the plugins and whether each
-can take commands right now (`ready`, `detail`); the dashboard shows the same.
-A plugin that needs a login has a setup step: `gocalis -config config.yaml
--plugin-setup <id>`.
+`args` is an object with the command's own parameters, and an arg the plugin
+does not know is refused. A command the plugin refuses is answered with an
+`error` event that has `plugin` set. `GET /api/plugins` lists the plugins and
+whether each is usable right now (`ready`, `detail`); the dashboard shows the
+same. A plugin that needs a login has a setup step: `gocalis -config
+config.yaml -plugin-setup <id>`.
 
 A plugin type is a package under `internal/plugins` that registers itself with
-`plugin.Register` and is linked in from `cmd/main.go`. It gets the intercom
-engine (to bring an outside party into a call as a remote participant) and a
-way to emit events; see `internal/plugin`.
+`plugin.Register` and is linked in from `cmd/main.go`. It gets a way to add its
+node and to emit events; see `internal/plugin`.
 
-#### `telegram_call`: answer the door from a Telegram group
+#### Nodes somebody has to answer
 
-When the doorbell rings, a flow sends `call` for the doorbell node. The plugin
-opens the voice chat of a Telegram group and waits in it. The moment somebody
-from the group comes in, the intercom call starts: the doorbell is taken over,
-the chime plays, and the two sides talk. Until then the doorbell is left
-alone. In the intercom call the voice chat is one participant, like an
-intercom page, so pages and other nodes can be in the same call.
+A speaker or a doorbell is always there: what is said to it plays at once. A
+call is not: somebody has to pick up. `GET /api/nodes` tells the two apart
+(`"answer": "auto"` or `"call"`), and every action does the right thing on
+both, so a flow does not need to know which kind it talks to:
+
+| Action on a node that has to be answered | What happens |
+|---|---|
+| `tts`, `play` | The node rings (state `RINGING`). Once somebody answers it plays; `tts_completed` / `play_completed` as usual. Nobody answering is an `error` with `reason: "unanswered"`; somebody leaving midway, `reason: "hung_up"`. |
+| `ask` | Rings, asks whoever answers and listens to them. `ask_completed` has `status: "unanswered"` when nobody did and `"hung_up"` when they left without an answer; an answer given before hanging up counts. |
+| `intercom` | Rings that node first and leaves the others alone: `intercom_ringing`, then `intercom_started` when somebody answers, with the call's time running from there. Nobody answering takes the node out (`intercom_left`, `reason: "unanswered"`), which ends a call of two (`intercom_ended`, `reason: "unanswered"`). Hanging up takes the node out too (`intercom_left`, `reason: "hung_up"`). Joining a running call, the node is announced with `intercom_ringing` and `intercom_joined` once answered. |
+| `tts` / `play` to `"all"` | Never rings anybody: a broadcast is for the nodes that are always there. |
+
+Once somebody answered, what follows does not ring again while they are on the
+line: an `ask`, then a `tts` with the reply, is one call.
+
+#### `telegram_call`: a Telegram group as a node
+
+The plugin makes the voice chat of a Telegram group a node that has to be
+answered. Using the node opens the group's voice chat and gocalis waits in it;
+the moment somebody of the group comes in, they are who the node reaches:
+
+- **Answer the door from Telegram:** when the doorbell rings, the flow starts
+  an intercom call between the doorbell and this node
+  (`{"action": "intercom", "node_ids": ["front_door", "telegram"]}`). The
+  doorbell is left alone until somebody answers; then the chime plays and the
+  two sides talk. Intercom pages and other nodes can be in the same call.
+- **Say or ask something:** `{"action": "tts", "node_id": "telegram", "text":
+  "..."}` and `{"action": "ask", "node_id": "telegram", "text": "..."}` ring
+  the group and speak to, or ask, whoever comes in.
 
 ```yaml
 plugins:
-  - id: telegram
+  - id: telegram          # the node's id
     type: telegram_call
     settings:
       api_id: 123456
@@ -423,6 +449,7 @@ plugins:
       chat: "Casa"
       title: "Timbre"
       ring_seconds: 60
+      idle_seconds: 15
 ```
 
 - **The account.** Only a Telegram *user* can be in a voice chat; a bot
@@ -435,33 +462,42 @@ plugins:
   running container (`docker exec -it gocalis gocalis -config /app/config.yaml
   -plugin-setup telegram`); gocalis picks the login up without a restart.
   Whoever has that file has the account: keep it on a volume that outlives the
-  container, and out of repositories and shared backups.
+  container, and out of repositories and shared backups. Until there is a
+  login the node exists and tells whoever uses it why it cannot be reached.
 - **The group** (`chat`) is its `@username`, its numeric id, or its exact
   title: a group, not a person, because only groups have voice chats. The
   account must be a member, and to start the voice chat an admin that can
   manage video chats. Use a private group: everybody who can come into its
   voice chat can talk at your door. `-plugin-setup` checks `chat` and, when it
   is empty or does not name a group, lists the account's groups with their ids.
+- **`ring_seconds`** (default 60, at most 240) is how long gocalis waits in
+  the voice chat before what rang fails as unanswered.
+- **`idle_seconds`** (default 15) is how long gocalis stays after a `tts`,
+  `play` or `ask`, so that a reply does not ring again. An intercom call hangs
+  up as soon as it is over.
 
 | Command | Meaning |
 |---|---|
-| `call` | Opens the group's voice chat for `node_id` and waits in it for somebody to come in. Args, all optional: `ring_seconds` (how long to wait; default from the settings), `duration_seconds` (how long the intercom call lasts at most once it starts; default `intercom.default_timeout_seconds`), `chat` and `title` (instead of the settings). Sent again for the same node while waiting, the wait starts over. One call at a time: for another node it is refused as busy. |
-| `hangup` | Ends it at whatever point it is. `node_id` is optional. |
+| `hangup` | Takes gocalis out of the voice chat at whatever point it is: ringing, or with somebody on the line. What was waiting or running on the node ends. |
 
 | Event | Meaning |
 |---|---|
-| `telegram_call_waiting` | The voice chat is open and nobody is there yet. `data`: `chat`, `ring_seconds`, `started_voice_chat`. |
-| `telegram_call_answered` | Somebody came in and the intercom call started (`intercom_started`, or `intercom_joined` when the node already was in a call, is reported too). `data`: `chat`, `answered` (their names), `remote_id` (the voice chat's id in the intercom call, e.g. `telegram-3`). |
-| `telegram_call_ended` | It is over. `reason`: `unanswered` (nobody came in time), `hung_up` (everybody on Telegram left), `stopped` (`hangup`, or the intercom call was stopped), `timeout` (the intercom call reached its limit), `closed` (the voice chat was closed from Telegram), `left` (the voice chat was taken out of an intercom call that goes on), `shutdown`, or `error` with `message`. `data`: `chat`, `answered` (whether anybody came in), `duration_seconds`. |
+| `call_ringing` | The voice chat is open and nobody is there yet. `data`: `chat`, `ring_seconds`, `started_voice_chat`. |
+| `call_answered` | Somebody came in. `data`: `chat`, `answered` (their names). |
+| `call_ended` | gocalis is out of the voice chat. `reason`: `unanswered` (nobody came in time), `hung_up` (everybody on Telegram left), `completed` (nothing more to do on the node: the intercom call is over, or `idle_seconds` passed), `closed` (the voice chat was closed from Telegram), `cancelled` (what rang was given up before anybody answered), `stopped` (`hangup`), `shutdown`, or `error` with `message`. `data`: `chat`, `answered` (whether anybody came in), `duration_seconds`. |
 
-At the end the plugin leaves the voice chat, and closes it if it was the one
-that started it. A voice chat that was already going is used as it is: with
-people in it the call is answered at once, and afterwards it is left open.
+These come on top of the node's own events (`state_changed` with `RINGING`,
+and the ones of whatever action used the node), and all carry `node_id` and
+`plugin`, both the plugin's id.
+
+At the end gocalis leaves the voice chat, and closes it if it was the one that
+started it. A voice chat that was already going is used as it is: with people
+in it the node is answered at once, and afterwards it is left open.
 
 Telegram does not ring anybody for a voice chat: members see it at the top of
 the group, with a notification according to their settings for that group. To
-make it ring, have the flow also send a message to the group when it sends
-`call`.
+make it ring, have the flow also send a message to the group when it starts
+(`call_ringing` is the moment).
 
 ### Local multi-device audio simulator
 

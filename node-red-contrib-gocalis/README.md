@@ -71,8 +71,9 @@ Runs live intercom calls between nodes. A call is a conference: nodes (and inter
 * **Leaving / stopping**: Send `msg.payload = "leave"` to take one node out of its call (the call goes on for the others), or `"stop"` to end the call for everyone. Both act on `msg.node_id`, or the first configured participant.
 * **Outputs**:
   * **Output 1 (Request sent)**: Emits once the engine has the nodes in a call (`msg.node_ids` lists who is in it), or when a leave or stop has been sent.
-  * **Output 2 (Someone joined / left)**: Emits for every `intercom_joined` / `intercom_left`. `msg.event` tells which, `msg.participant_id` who, and `msg.node_ids` / `msg.remote_ids` who is in the call now (`remote_ids` are intercom pages).
-  * **Output 3 (Call ended)**: Emits when the call ends for any reason. `msg.reason` is `timeout`, `stopped`, `left`, `shutdown`, or `error`; `msg.duration_seconds` is how long it lasted.
+  * **Output 2 (Someone joined / left)**: Emits for every `intercom_joined` / `intercom_left`. `msg.event` tells which, `msg.participant_id` who, and `msg.node_ids` / `msg.remote_ids` who is in the call now (`remote_ids` are intercom pages). Also emits `intercom_ringing` while a node somebody has to answer is rung; such a node leaves with `msg.reason` `unanswered` or `hung_up`.
+  * **Output 3 (Call ended)**: Emits when the call ends for any reason. `msg.reason` is `timeout`, `stopped`, `left`, `unanswered`, `shutdown`, or `error`; `msg.duration_seconds` is how long it lasted.
+* **Nodes somebody has to answer** (a Telegram group, node `telegram` of the `telegram_call` plugin): the call rings that node first and leaves the others alone. Output 1 emits when they answered; when nobody does, the call ends on output 3 with reason `unanswered` without ever touching the other nodes.
   * Outputs 2 and 3 also fire for matching calls started or changed elsewhere (intercom page, dashboard, timeout).
 
 ### 6. `gocalis plugin` (Plugin Commands and Events)
@@ -84,7 +85,7 @@ Sends commands to a Gocalis plugin (an entry of the `plugins` list in the server
 * **Outputs**:
   * **Output 1 (Command sent)**: The request as it went to Gocalis.
   * **Output 2 (Plugin events)**: Everything the plugin reports, whoever sent the command. `msg.event` is the event name, `msg.node_id` the node it is about, `msg.payload` the whole event (`status`, `reason`, `message`, and the plugin's own fields in `data`). A command the plugin refused arrives as the event `error`.
-* **Answering the door from Telegram** (plugin type `telegram_call`): wire the doorbell press to a `gocalis plugin` node with Plugin `telegram`, Command `call` and Node the doorbell. The server opens the group's voice chat and waits; the intercom call starts when somebody from the group comes in. Output 2 then gives `telegram_call_waiting`, `telegram_call_answered` (`payload.data.answered` has the names) and `telegram_call_ended` (`payload.reason`: `unanswered`, `hung_up`, `stopped`, `timeout`, `closed`, `left`, `error`). Send `"hangup"` to end it. Args: `ring_seconds`, `duration_seconds`, `chat`, `title`.
+* **The `telegram_call` plugin** makes a Telegram group a node (its id is the plugin's, e.g. `telegram`) that somebody has to answer, used with the regular nodes: `gocalis say`, `gocalis ask` and `gocalis intercom` with Node `telegram` ring the group and happen when somebody comes into its voice chat. To answer the door from Telegram, wire the doorbell press to a `gocalis intercom` node with Participants `front_door, telegram`. A say or play that nobody answers fails with `msg.reason` `unanswered`; an ask reports it as `msg.status` on its second output. This node's Output 2 gives `call_ringing` (the moment to notify the group), `call_answered` (`payload.data.answered` has the names) and `call_ended` (`payload.reason`: `unanswered`, `hung_up`, `completed`, `closed`, `cancelled`, `stopped`, `error`). Its one command is `hangup`.
 
 ### 7. `gocalis stt` (Speech-to-Text on Files)
 A stateless file transcription node.

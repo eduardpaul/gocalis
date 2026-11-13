@@ -51,7 +51,7 @@ module.exports = function(RED) {
         // configured participants we reflect every call.
         const eventHandler = (message) => {
             const kind = message.event;
-            if (kind !== "intercom_started" && kind !== "intercom_joined" &&
+            if (kind !== "intercom_ringing" && kind !== "intercom_started" && kind !== "intercom_joined" &&
                 kind !== "intercom_left" && kind !== "intercom_ended") {
                 return;
             }
@@ -84,9 +84,19 @@ module.exports = function(RED) {
                 return;
             }
 
+            if (kind === "intercom_ringing") {
+                // A node somebody has to answer is being rung: for a call that
+                // starts when they do, or (participant_id) to join a running one.
+                node.status({ fill: "blue", shape: "ring", text: `ringing ${message.participant_id || nodes.join(", ")}` });
+                out.participant_id = message.participant_id;
+                node.send([null, out, null]);
+                return;
+            }
+
             node.status({ fill: "green", shape: "dot", text: `in call: ${nodes.concat(remotes).join(", ")}` });
             if (kind !== "intercom_started") {
                 out.participant_id = message.participant_id;
+                out.reason = message.reason;
                 node.send([null, out, null]);
             }
         };
@@ -167,17 +177,26 @@ module.exports = function(RED) {
             try {
                 // The request is answered by the event that shows all our nodes
                 // in one call (a new call, or the last of them joining a running
-                // one), or by the error raised for it.
+                // one), or by the error raised for it. A node somebody has to
+                // answer is rung first, so that can take its ring time; when
+                // nobody answers, the call ends without ever having started.
                 const result = await node.server.request(payload, {
                     match: (m) => (m.event === "error" && m.node_id === nodes[0]) ||
                         ((m.event === "intercom_started" || m.event === "intercom_joined") &&
-                            nodes.every((n) => (m.node_ids || []).indexOf(n) !== -1)),
-                    timeoutMs: 30000
+                            nodes.every((n) => (m.node_ids || []).indexOf(n) !== -1)) ||
+                        (m.event === "intercom_ended" &&
+                            nodes.some((n) => (m.node_ids || []).indexOf(n) !== -1)),
+                    timeoutMs: 300000
                 });
 
                 if (result.event === "error") {
                     node.status({ fill: "red", shape: "ring", text: result.message || "error" });
                     done(`Gocalis engine reported failure: ${result.message || "error"}`);
+                    return;
+                }
+                if (result.event === "intercom_ended") {
+                    // Output 3 has the event; there is no call to report here.
+                    done();
                     return;
                 }
 

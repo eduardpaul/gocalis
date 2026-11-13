@@ -86,6 +86,7 @@ button {
 .badge.listening { background: #d1fae5; color: #065f46; }
 .badge.processing { background: #fef3c7; color: #92400e; }
 .badge.challenging { background: #fee2e2; color: #991b1b; }
+.badge.ringing { background: #ede9fe; color: #5b21b6; }
 
 @media (prefers-color-scheme: dark) {
   .badge.idle { background: #374151; color: #d1d5db; }
@@ -93,6 +94,7 @@ button {
   .badge.listening { background: #064e3b; color: #a7f3d0; }
   .badge.processing { background: #78350f; color: #fde68a; }
   .badge.challenging { background: #7f1d1d; color: #fecaca; }
+  .badge.ringing { background: #4c1d95; color: #ddd6fe; }
 }
 
 input, textarea, select {

@@ -207,6 +207,12 @@ module.exports = function(RED) {
                     node.status({ fill: "yellow", shape: "ring", text: "silence timeout" });
                     send([null, msg]);
                     done();
+                } else if (result.status === "unanswered" || result.status === "hung_up") {
+                    // A node somebody has to answer: nobody did, or they left
+                    // before giving an answer.
+                    node.status({ fill: "yellow", shape: "ring", text: result.status.replace("_", " ") });
+                    send([null, msg]);
+                    done();
                 } else if (result.status === "verification_failed") {
                     node.status({ fill: "red", shape: "ring", text: "auth failed" });
                     send([null, msg]);

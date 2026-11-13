@@ -78,14 +78,16 @@ models:
 #     front_door: "https://go2rtc.example/stream.html?src=doorbell_tv&mode=webrtc"
 
 # Plugins: optional parts of gocalis, switched on here. Each has an id (how API
-# requests address it), a type (the plugin code) and settings of its own.
+# requests address it, and the id of the node it adds), a type (the plugin
+# code) and settings of its own.
 # plugins:
-#   # telegram_call: brings a Telegram group's voice chat into an intercom call
-#   # with a node. On the "call" command it opens the group's voice chat and
-#   # waits there; the intercom call starts when somebody from the group comes
-#   # in. It logs in as a Telegram user (a bot cannot be in a voice chat): use
-#   # an account of its own, not the one you answer with, and log it in once
-#   # with `gocalis -config config.yaml -plugin-setup telegram`.
+#   # telegram_call: makes a Telegram group's voice chat a node, one somebody
+#   # has to answer. tts, play, ask and intercom on node "telegram" open the
+#   # group's voice chat and wait there; they happen when somebody of the group
+#   # comes in. For the doorbell: an intercom call between the doorbell node
+#   # and this one. It logs in as a Telegram user (a bot cannot be in a voice
+#   # chat): use an account of its own, not the one you answer with, and log it
+#   # in once with `gocalis -config config.yaml -plugin-setup telegram`.
 #   - id: telegram
 #     type: telegram_call
 #     settings:
@@ -98,6 +100,7 @@ models:
 #       chat: "Casa"                   # the group: @username, numeric id or exact title
 #       title: "Timbre"                # name of a voice chat the plugin starts
 #       ring_seconds: 60               # how long it waits for somebody to come in
+#       idle_seconds: 15               # how long it stays after a tts/ask, for a reply
 
 mqtt:
   enabled: false

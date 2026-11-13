@@ -25,7 +25,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
   const [callMode, setCallMode] = useState('')
   const [plugins, setPlugins] = useState([])
   const [pluginId, setPluginId] = useState('')
-  const [pluginCommand, setPluginCommand] = useState('call')
+  const [pluginCommand, setPluginCommand] = useState('hangup')
   const [pluginNode, setPluginNode] = useState('')
   const [pluginArgs, setPluginArgs] = useState('')
   const [text, setText] = useState('')
@@ -351,12 +351,11 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
                   type="text"
                   value={pluginCommand}
                   onChange={(e) => setPluginCommand(e.target.value)}
-                  placeholder="call"
+                  placeholder="hangup"
                   list="plugin-commands"
                   required
                 />
                 <datalist id="plugin-commands">
-                  <option value="call" />
                   <option value="hangup" />
                 </datalist>
               </label>
@@ -378,13 +377,14 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
                 type="text"
                 value={pluginArgs}
                 onChange={(e) => setPluginArgs(e.target.value)}
-                placeholder='{"ring_seconds": 60}'
+                placeholder='{}'
               />
             </label>
             <p className="hint">
-              A plugin reports with events: watch the event feed. For telegram_call, &quot;call&quot;
-              with a node opens the group&apos;s voice chat and waits; the intercom call starts when
-              somebody from the group comes in, and &quot;hangup&quot; ends it.
+              A plugin reports with events: watch the event feed. The node a plugin adds is used
+              from the other tabs: for telegram_call, TTS, Ask and Intercom on its node ring the
+              group and happen when somebody comes in; &quot;hangup&quot; here takes gocalis out of the
+              voice chat.
             </p>
           </>
         )}

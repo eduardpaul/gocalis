@@ -88,15 +88,22 @@
         <li>Request sent: emits once the engine has the nodes in a call
         (<code>msg.payload</code> is the <code>intercom_started</code> or
         <code>intercom_joined</code> event, <code>msg.node_ids</code> who is in
-        the call), or when a leave or stop has been sent.</li>
+        the call), or when a leave or stop has been sent. With a node somebody
+        has to answer that is when they answered; when nobody does, nothing is
+        emitted here and output 3 tells.</li>
         <li>Someone joined / left: emits for every <code>intercom_joined</code>
         and <code>intercom_left</code> of a matching call.
         <code>msg.event</code> tells which, <code>msg.participant_id</code> who,
         and <code>msg.node_ids</code> / <code>msg.remote_ids</code> who is in the
-        call now (<code>remote_ids</code> are intercom pages).</li>
+        call now (<code>remote_ids</code> are intercom pages). Also emits
+        <code>intercom_ringing</code> while a node somebody has to answer (a
+        Telegram group) is rung; such a node leaves with
+        <code>msg.reason</code> <code>unanswered</code> or
+        <code>hung_up</code>.</li>
         <li>Call ended: emits when a matching call ends for any reason.
         <code>msg.reason</code> is one of <code>timeout</code>,
         <code>stopped</code>, <code>left</code> (the others left),
+        <code>unanswered</code> (nobody answered, so it never started),
         <code>shutdown</code>, or <code>error</code>;
         <code>msg.duration_seconds</code> is how long it lasted and
         <code>msg.payload.status</code> is <code>success</code> or

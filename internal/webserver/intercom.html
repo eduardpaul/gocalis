@@ -246,6 +246,11 @@ async function join(withMic) {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     switch (m.event) {
+      case "intercom_ringing":
+        // A node somebody has to answer is being rung. Joining a call that
+        // already runs, the call itself goes on meanwhile.
+        if (!m.participant_id) setStatus("Llamando… esperando a que contesten.");
+        break;
       case "intercom_started":
       case "intercom_joined":
       case "intercom_left":
@@ -358,6 +363,7 @@ function reasonText(m) {
     case "timeout": return "Llamada terminada (tiempo agotado).";
     case "stopped": return "Llamada terminada.";
     case "left": return "Llamada terminada: no queda nadie más.";
+    case "unanswered": return "Nadie ha contestado.";
     case "shutdown": return "Llamada terminada: gocalis se ha detenido.";
     default: return "Llamada terminada: " + (m.message || m.reason || "error");
   }

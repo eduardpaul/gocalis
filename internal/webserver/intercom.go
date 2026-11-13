@@ -91,8 +91,9 @@ func (s *Server) handleIntercomConfig(w http.ResponseWriter, r *http.Request) {
 type intercomMessage struct {
 	Action string `json:"action,omitempty"` // page: "leave"
 
-	// Server: "intercom_started" | "intercom_joined" | "intercom_left" |
-	// "intercom_ended" (the events of the call the page is in) | "error".
+	// Server: "intercom_ringing" | "intercom_started" | "intercom_joined" |
+	// "intercom_left" | "intercom_ended" (the events of the call the page is
+	// in) | "error".
 	Event            string   `json:"event,omitempty"`
 	RemoteID         string   `json:"remote_id,omitempty"`      // the page's own id in the call
 	ParticipantID    string   `json:"participant_id,omitempty"` // who joined or left
