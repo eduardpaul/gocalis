@@ -437,9 +437,11 @@ plugins:
   Whoever has that file has the account: keep it on a volume that outlives the
   container, and out of repositories and shared backups.
 - **The group** (`chat`) is its `@username`, its numeric id, or its exact
-  title. The account must be a member, and to start the voice chat an admin
-  that can manage video chats. Use a private group: everybody who can come
-  into its voice chat can talk at your door.
+  title: a group, not a person, because only groups have voice chats. The
+  account must be a member, and to start the voice chat an admin that can
+  manage video chats. Use a private group: everybody who can come into its
+  voice chat can talk at your door. `-plugin-setup` checks `chat` and, when it
+  is empty or does not name a group, lists the account's groups with their ids.
 
 | Command | Meaning |
 |---|---|

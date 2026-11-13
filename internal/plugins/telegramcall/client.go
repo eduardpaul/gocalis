@@ -38,13 +38,18 @@ type chat struct {
 	peer    tg.InputPeerClass
 	channel *tg.InputChannel // set for supergroups and channels
 	id      int64            // the basic group's id otherwise
+	manages bool             // the account may start a voice chat there
 }
 
 func (c *chat) String() string {
-	if c.channel != nil {
-		return fmt.Sprintf("the supergroup %q (id %d)", c.title, c.channel.ChannelID)
+	rights := "the account cannot start a voice chat there, only join one"
+	if c.manages {
+		rights = "the account can start voice chats there"
 	}
-	return fmt.Sprintf("the group %q (id %d)", c.title, c.id)
+	if c.channel != nil {
+		return fmt.Sprintf("the supergroup %q (id %d; %s)", c.title, c.channel.ChannelID, rights)
+	}
+	return fmt.Sprintf("the group %q (id %d; %s)", c.title, c.id, rights)
 }
 
 // connectTelegram runs the account's connection: it logs in from the session
@@ -276,10 +281,8 @@ func (c *client) end(ctx context.Context, vc voiceChat) error {
 	return closedOr(err)
 }
 
-// describe resolves a chat and says what it is, for the setup to show.
-func (c *client) describe(ctx context.Context, name string) (*chat, error) {
-	return c.resolve(ctx, name)
-}
+// errNotAGroup is a chat setting that names something without voice chats.
+var errNotAGroup = errors.New("a voice chat needs a group: create one with the account and the people who answer the door in it, and name that group")
 
 // resolve finds the group a name stands for: "@username", a numeric id (as
 // Telegram clients or bots show it, with or without the -100 or - in front),
@@ -299,10 +302,16 @@ func (c *client) resolve(ctx context.Context, name string) (*chat, error) {
 		if err != nil {
 			return nil, fmt.Errorf("find the chat %s: %w", name, err)
 		}
+		if _, person := resolved.Peer.(*tg.PeerUser); person {
+			return nil, fmt.Errorf("%s is a person: %w", name, errNotAGroup)
+		}
 		for _, candidate := range resolved.Chats {
-			if group := asChat(candidate); group != nil && group.matches(peerID(resolved.Peer), "") {
+			if group := asChat(candidate); group.matches(peerID(resolved.Peer), "") {
 				found = group
 			}
+		}
+		if found == nil {
+			return nil, fmt.Errorf("the account is not in the group %s", name)
 		}
 	} else {
 		var id int64
@@ -313,31 +322,47 @@ func (c *client) resolve(ctx context.Context, name string) (*chat, error) {
 			}
 			id, _ = strconv.ParseInt(digits, 10, 64)
 		}
-		dialogs := query.GetDialogs(c.api).BatchSize(100).Iter()
-		for found == nil && dialogs.Next(ctx) {
-			entities := dialogs.Value().Entities
-			for _, candidate := range entities.Channels() {
-				if group := asChat(candidate); group.matches(id, name) {
-					found = group
-				}
-			}
-			for _, candidate := range entities.Chats() {
-				if group := asChat(candidate); group.matches(id, name) {
-					found = group
-				}
-			}
-		}
-		if err := dialogs.Err(); err != nil {
+		groups, err := c.groups(ctx)
+		if err != nil {
 			return nil, fmt.Errorf("look for the chat %q: %w", name, err)
 		}
-	}
-	if found == nil {
-		return nil, fmt.Errorf("no group %q among the account's chats", name)
+		for _, group := range groups {
+			if found == nil && group.matches(id, name) {
+				found = group
+			}
+		}
+		if found == nil {
+			return nil, fmt.Errorf("no group %q among the account's chats", name)
+		}
 	}
 	c.mu.Lock()
 	c.chats[name] = found
 	c.mu.Unlock()
 	return found, nil
+}
+
+// groups lists the groups the account is in, the most recently used first.
+func (c *client) groups(ctx context.Context) ([]*chat, error) {
+	var groups []*chat
+	dialogs := query.GetDialogs(c.api).BatchSize(100).Iter()
+	for dialogs.Next(ctx) {
+		entities := dialogs.Value().Entities
+		var group *chat
+		switch peer := dialogs.Value().Peer.(type) {
+		case *tg.InputPeerChannel:
+			if channel := entities.Channels()[peer.ChannelID]; channel != nil {
+				group = asChat(channel)
+			}
+		case *tg.InputPeerChat:
+			if basic := entities.Chats()[peer.ChatID]; basic != nil {
+				group = asChat(basic)
+			}
+		}
+		if group != nil {
+			groups = append(groups, group)
+		}
+	}
+	return groups, dialogs.Err()
 }
 
 // matches tells whether the group has that id or, with no id, that title.
@@ -363,12 +388,13 @@ func asChat(candidate tg.ChatClass) *chat {
 			title:   ch.Title,
 			peer:    &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash},
 			channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash},
+			manages: ch.Creator || ch.AdminRights.ManageCall,
 		}
 	case *tg.Chat:
 		if ch == nil || ch.Left || ch.Deactivated {
 			return nil
 		}
-		return &chat{title: ch.Title, peer: &tg.InputPeerChat{ChatID: ch.ID}, id: ch.ID}
+		return &chat{title: ch.Title, peer: &tg.InputPeerChat{ChatID: ch.ID}, id: ch.ID, manages: ch.Creator || ch.AdminRights.ManageCall}
 	}
 	return nil
 }

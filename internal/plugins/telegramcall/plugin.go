@@ -343,15 +343,27 @@ func (p *Plugin) Setup(ctx context.Context, in io.Reader, out io.Writer) error {
 	ask := newPrompter(in, out)
 	return connectTelegram(ctx, p.settings, ask, func(ctx context.Context, api telegramAPI, account string) error {
 		fmt.Fprintf(out, "Logged in as %s.\n", account)
-		if p.settings.Chat == "" {
-			return nil
+		telegram := api.(*client)
+		if p.settings.Chat != "" {
+			group, err := telegram.resolve(ctx, p.settings.Chat)
+			if err == nil {
+				fmt.Fprintf(out, "The chat %q is %s.\n", p.settings.Chat, group)
+				return nil
+			}
+			fmt.Fprintf(out, "The chat %q cannot be used: %v\n", p.settings.Chat, err)
 		}
-		vc, err := api.(*client).describe(ctx, p.settings.Chat)
+		groups, err := telegram.groups(ctx)
 		if err != nil {
-			fmt.Fprintf(out, "The chat %q was not found: %v\n", p.settings.Chat, err)
+			return fmt.Errorf("list the account's groups: %w", err)
+		}
+		if len(groups) == 0 {
+			fmt.Fprintln(out, "The account is in no group yet.", errNotAGroup)
 			return nil
 		}
-		fmt.Fprintf(out, "The chat %q is %s.\n", p.settings.Chat, vc)
+		fmt.Fprintln(out, "Groups the account is in (\"chat\" takes a title or an id):")
+		for _, group := range groups {
+			fmt.Fprintf(out, "  %s\n", group)
+		}
 		return nil
 	})
 }
