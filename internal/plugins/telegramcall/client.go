@@ -186,9 +186,10 @@ func (c *client) current(ctx context.Context, group *chat) (*voiceChat, error) {
 // join implements telegramAPI.
 func (c *client) join(ctx context.Context, vc voiceChat, payload string) (string, error) {
 	result, err := c.api.PhoneJoinGroupCall(ctx, &tg.PhoneJoinGroupCallRequest{
-		Call:   vc.input(),
-		JoinAs: &tg.InputPeerSelf{},
-		Params: tg.DataJSON{Data: payload},
+		Call:         vc.input(),
+		JoinAs:       &tg.InputPeerSelf{},
+		VideoStopped: true, // audio only
+		Params:       tg.DataJSON{Data: payload},
 	})
 	if err != nil {
 		return "", closedOr(err)
@@ -305,13 +306,12 @@ func (c *client) resolve(ctx context.Context, name string) (*chat, error) {
 		}
 	} else {
 		var id int64
-		if n, err := strconv.ParseInt(name, 10, 64); err == nil {
+		if _, err := strconv.ParseInt(name, 10, 64); err == nil {
 			digits := strings.TrimPrefix(name, "-")
 			if len(digits) > 10 && strings.HasPrefix(digits, "100") {
 				digits = digits[3:]
 			}
 			id, _ = strconv.ParseInt(digits, 10, 64)
-			_ = n
 		}
 		dialogs := query.GetDialogs(c.api).BatchSize(100).Iter()
 		for found == nil && dialogs.Next(ctx) {

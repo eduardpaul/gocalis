@@ -204,7 +204,7 @@ func (l *link) joinPayload() (string, error) {
 func (l *link) connect(params string) error {
 	var response joinResponse
 	if err := json.Unmarshal([]byte(params), &response); err != nil {
-		return fmt.Errorf("parse connection params: %w", err)
+		return fmt.Errorf("parse connection params %.300q: %w", params, err)
 	}
 	answer, err := answerSDP(response)
 	if err != nil {
@@ -347,13 +347,26 @@ type joinResponse struct {
 }
 
 type candidate struct {
-	Foundation string `json:"foundation"`
-	Component  string `json:"component"`
-	Protocol   string `json:"protocol"`
-	Priority   string `json:"priority"`
-	IP         string `json:"ip"`
-	Port       string `json:"port"`
-	Type       string `json:"type"`
+	Foundation text `json:"foundation"`
+	Component  text `json:"component"`
+	Protocol   text `json:"protocol"`
+	Priority   text `json:"priority"`
+	IP         text `json:"ip"`
+	Port       text `json:"port"`
+	Type       text `json:"type"`
+}
+
+// text is a JSON value kept as text: the server writes numbers such as a port
+// as strings, and this takes them either way.
+type text string
+
+func (t *text) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		s = strings.TrimSpace(string(data))
+	}
+	*t = text(s)
+	return nil
 }
 
 type payloadType struct {
@@ -377,10 +390,10 @@ func answerSDP(response joinResponse) (string, error) {
 	}
 	var candidates []candidate
 	for _, c := range transport.Candidates {
-		if net.ParseIP(c.IP) == nil || !strings.EqualFold(c.Protocol, "udp") {
+		if net.ParseIP(string(c.IP)) == nil || !strings.EqualFold(string(c.Protocol), "udp") {
 			continue
 		}
-		if port, err := strconv.Atoi(c.Port); err != nil || port <= 0 || port > 65535 {
+		if port, err := strconv.Atoi(string(c.Port)); err != nil || port <= 0 || port > 65535 {
 			continue
 		}
 		candidates = append(candidates, c)
@@ -410,7 +423,7 @@ func answerSDP(response joinResponse) (string, error) {
 	}
 
 	family := "IP4"
-	if net.ParseIP(candidates[0].IP).To4() == nil {
+	if net.ParseIP(string(candidates[0].IP)).To4() == nil {
 		family = "IP6"
 	}
 	id := strconv.Itoa(opusID)
@@ -421,8 +434,8 @@ func answerSDP(response joinResponse) (string, error) {
 		"t=0 0",
 		"a=group:BUNDLE 0",
 		"a=ice-lite",
-		"m=audio " + candidates[0].Port + " UDP/TLS/RTP/SAVPF " + id,
-		"c=IN " + family + " " + candidates[0].IP,
+		"m=audio " + string(candidates[0].Port) + " UDP/TLS/RTP/SAVPF " + id,
+		"c=IN " + family + " " + string(candidates[0].IP),
 		"a=mid:0",
 		"a=ice-ufrag:" + transport.Ufrag,
 		"a=ice-pwd:" + transport.Pwd,
@@ -430,7 +443,7 @@ func answerSDP(response joinResponse) (string, error) {
 		"a=setup:active",
 	}
 	for i, c := range candidates {
-		foundation, component, priority, kind := c.Foundation, c.Component, c.Priority, c.Type
+		foundation, component, priority, kind := string(c.Foundation), string(c.Component), string(c.Priority), string(c.Type)
 		if foundation == "" {
 			foundation = strconv.Itoa(i + 1)
 		}

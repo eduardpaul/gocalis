@@ -154,7 +154,7 @@ func (s *fakeSFU) join(payload string) string {
 		case strings.HasPrefix(line, "a=candidate:"):
 			f := strings.Fields(strings.TrimPrefix(line, "a=candidate:"))
 			if len(f) >= 8 {
-				response.Transport.Candidates = append(response.Transport.Candidates, candidate{Foundation: f[0], Component: f[1], Protocol: f[2], Priority: f[3], IP: f[4], Port: f[5], Type: f[7]})
+				response.Transport.Candidates = append(response.Transport.Candidates, candidate{Foundation: text(f[0]), Component: text(f[1]), Protocol: text(f[2]), Priority: text(f[3]), IP: text(f[4]), Port: text(f[5]), Type: text(f[7])})
 			}
 		}
 	}
@@ -365,6 +365,38 @@ func TestAnswerSDPNeedsATransport(t *testing.T) {
 	}
 	if strings.Contains(answer, "203.0.113.1") {
 		t.Errorf("answer kept the TCP candidate:\n%s", answer)
+	}
+}
+
+// The connection params are read whether the server writes numbers as strings
+// (as it does) or as numbers, and whatever else it adds.
+func TestConnectionParamsAreReadLeniently(t *testing.T) {
+	const params = `{"transport":{"candidates":[
+		{"generation":"0","component":"1","protocol":"udp","port":"32000","ip":"203.0.113.7","foundation":"1","id":"x","priority":"2130706431","type":"host","network":"0"},
+		{"generation":0,"component":1,"protocol":"udp","port":32001,"ip":"203.0.113.8","foundation":2,"priority":2130706430,"type":"host"}],
+		"xmlns":"urn:xmpp:jingle:transports:ice-udp:1","ufrag":"abc","rtcp-mux":true,"pwd":"def",
+		"fingerprints":[{"fingerprint":"AA:BB","setup":"active","hash":"sha-256"}]},
+		"audio":{"payload-types":[{"id":111,"name":"opus","clockrate":48000,"channels":2,"parameters":{"minptime":10,"useinbandfec":1},"rtcp-fbs":[{"type":"transport-cc"}]}],
+		"rtp-hdrexts":[{"id":1,"uri":"urn:ietf:params:rtp-hdrext:ssrc-audio-level"}]},
+		"video":{"endpoint":"x"}}`
+	var response joinResponse
+	if err := json.Unmarshal([]byte(params), &response); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := answerSDP(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"m=audio 32000 UDP/TLS/RTP/SAVPF 111",
+		"a=candidate:1 1 udp 2130706431 203.0.113.7 32000 typ host",
+		"a=candidate:2 1 udp 2130706430 203.0.113.8 32001 typ host",
+		"a=ice-ufrag:abc",
+		"a=fingerprint:sha-256 AA:BB",
+	} {
+		if !strings.Contains(answer, want) {
+			t.Errorf("answer lacks %q:\n%s", want, answer)
+		}
 	}
 }
 

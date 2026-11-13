@@ -381,7 +381,7 @@ func (r *ring) newWatch(vc voiceChat, conn media) *watch {
 		}
 		ticker := time.NewTicker(r.p.lookEvery)
 		defer ticker.Stop()
-		failures, last := 0, -1
+		failures, out, last := 0, 0, -1
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 			others, in, err := r.api.present(ctx, vc, conn.source())
@@ -395,11 +395,16 @@ func (r *ring) newWatch(vc voiceChat, conn media) *watch {
 					deliver(sighting{err: fmt.Errorf("look at the voice chat: %w", err)})
 					return
 				}
-			case !in:
-				deliver(sighting{err: errors.New("gocalis is no longer in the voice chat")})
-				return
 			default:
 				failures = 0
+				// One look that misses us can be Telegram catching up; several
+				// in a row mean we were dropped.
+				if in {
+					out = 0
+				} else if out++; out >= presenceFailures {
+					deliver(sighting{err: errors.New("gocalis is no longer in the voice chat")})
+					return
+				}
 				if len(others) != last {
 					if !deliver(sighting{others: others}) {
 						return
