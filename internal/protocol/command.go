@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"gocalis/internal/ai"
 	"gocalis/internal/ask"
 	"gocalis/internal/audio"
+	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 	"gocalis/internal/intercom"
@@ -181,7 +183,7 @@ func (e *Executor) executeTTS(ctx context.Context, req Request) {
 	}
 
 	if err != nil {
-		e.publishError(req.NodeID, err.Error())
+		e.publishFailure(req.NodeID, err)
 		return
 	}
 
@@ -226,7 +228,7 @@ func (e *Executor) executePlay(ctx context.Context, req Request) {
 	}
 
 	if err != nil {
-		e.publishError(req.NodeID, err.Error())
+		e.publishFailure(req.NodeID, err)
 		return
 	}
 
@@ -376,6 +378,21 @@ func (e *Executor) publishError(nodeID string, message string) {
 		Status:  "error",
 		Message: message,
 	})
+}
+
+// publishFailure reports why a tts or play did not happen. On a node somebody
+// has to answer the error also says, in reason, that nobody did ("unanswered")
+// or that they left before it was through ("hung_up").
+func (e *Executor) publishFailure(nodeID string, err error) {
+	log.Printf("[Executor] Error (node: %s): %v\n", nodeID, err)
+	resp := Response{Event: "error", NodeID: nodeID, Status: "error", Message: err.Error()}
+	switch {
+	case errors.Is(err, audionode.ErrUnanswered):
+		resp.Reason = "unanswered"
+	case errors.Is(err, audionode.ErrHungUp):
+		resp.Reason = "hung_up"
+	}
+	e.Publisher.Publish(resp)
 }
 
 // Submit admits detached commands into the application's bounded task lifetime.

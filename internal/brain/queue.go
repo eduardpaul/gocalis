@@ -6,6 +6,8 @@ import (
 	"errors"
 	"math"
 	"sync"
+
+	"gocalis/internal/audionode"
 )
 
 // ErrIntercomActive is returned to a turn request (speak, play, ask, wake reply)
@@ -151,16 +153,20 @@ func (q *nodeQueue) acquireMode(ctx context.Context, priority int, exclusive boo
 	}
 }
 
-// preemptedErr reports a turn error as ErrPreempted when the turn was cut off by
-// an intercom call, so callers see why instead of a bare "context canceled".
-func preemptedErr(turnCtx context.Context, err error) error {
-	if err != nil && turnCtx != nil && errors.Is(context.Cause(turnCtx), ErrPreempted) {
-		return ErrPreempted
+// turnErr reports the error of a turn that was cut short as what cut it: an
+// intercom call taking the node over (ErrPreempted) or the far side of a node
+// hanging up (audionode.ErrHungUp), so callers see why instead of a bare
+// "context canceled".
+func turnErr(turnCtx context.Context, err error) error {
+	if err == nil || turnCtx == nil {
+		return err
+	}
+	if cause := context.Cause(turnCtx); errors.Is(cause, ErrPreempted) || errors.Is(cause, audionode.ErrHungUp) {
+		return cause
 	}
 	return err
 }
 
-// waiter is a single parked caller on a nodeQueue.
 type waiter struct {
 	priority int
 	seq      uint64

@@ -18,6 +18,9 @@ const (
 	// unlike IDLE it suppresses wake detection so a keyword spoken during the
 	// call does not spawn a competing ask turn.
 	StateIntercom NodeState = "INTERCOM"
+	// StateRinging: a turn is waiting for somebody to answer the node. Only a
+	// node that has to be answered (audionode.Callee) is ever in it.
+	StateRinging NodeState = "RINGING"
 )
 
 type stateTransition struct {

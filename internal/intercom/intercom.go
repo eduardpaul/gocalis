@@ -19,6 +19,7 @@ package intercom
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"slices"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"gocalis/internal/audio"
+	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 )
@@ -97,12 +99,12 @@ func (r *Remote) Left() <-chan struct{} { return r.left }
 // Event is an intercom lifecycle notification emitted to the transport layer.
 // It is transport-neutral so this package does not depend on protocol.
 type Event struct {
-	Event            string   // "intercom_started" | "intercom_joined" | "intercom_left" | "intercom_ended"
-	ParticipantID    string   // who joined or left (a node id or a remote id)
+	Event            string   // "intercom_ringing" | "intercom_started" | "intercom_joined" | "intercom_left" | "intercom_ended"
+	ParticipantID    string   // who is rung to join a running call, joined or left (a node id or a remote id)
 	NodeIDs          []string // nodes in the call after the event, in join order
 	RemoteIDs        []string // remotes in the call after the event, in join order
 	Status           string   // "success" | "error"
-	Reason           string   // on "intercom_ended": "timeout" | "stopped" | "left" | "shutdown" | "error"
+	Reason           string   // on "intercom_ended": "timeout" | "stopped" | "left" | "unanswered" | "shutdown" | "error"; on "intercom_left": "unanswered" | "hung_up", or empty
 	Message          string   // error detail, when Status == "error"
 	DurationSeconds  float64  // on "intercom_ended": how long the call lasted
 	RemainingSeconds float64  // otherwise: time left until the call's deadline
@@ -151,7 +153,9 @@ type call struct {
 
 	nodes    []*nodeMember // in join order
 	remotes  []*Remote     // in join order
+	duration time.Duration // how long the call was asked to last
 	deadline time.Time
+	waiting  bool   // it has not started: a node somebody has to answer is being rung
 	live     bool   // the initial participants are in the mix; later ones join on their own
 	ending   bool   // the call is over: nobody can join any more
 	reason   string // why it is ending
@@ -172,6 +176,7 @@ type nodeMember struct {
 	unseat context.CancelCauseFunc
 
 	turn     *brain.Turn   // the takeover, once the node has been acquired
+	ringing  bool          // it is rung to join a call the others are already in
 	out      *bridge       // the node's mix, once it is in the mix
 	aec      EchoCanceller // its echo canceller, if enabled
 	gone     bool          // it left the call
@@ -203,6 +208,14 @@ func (e *Engine) Shutdown() { e.baseCancel() }
 // already are in one, the others join it ("intercom_joined" for each). duration
 // is how long the call lasts from now at least; when <= 0 the configured default
 // is used. It returns at once: the call runs in the background.
+//
+// A node somebody has to answer is rung first. A new call with one only starts
+// once they answered: "intercom_ringing" now, "intercom_started" then, and the
+// other nodes are left alone until then. Nobody answering takes that node out
+// ("intercom_left", reason "unanswered"), which ends the call ("intercom_ended",
+// reason "unanswered") unless two others remain. Joining a running call, such a
+// node is announced with "intercom_ringing" and "intercom_joined" once
+// answered.
 func (e *Engine) Connect(nodes []string, duration time.Duration) error {
 	uniq, err := distinctNodes(nodes)
 	if err != nil {
@@ -242,7 +255,7 @@ func (e *Engine) Connect(nodes []string, duration time.Duration) error {
 		for _, n := range uniq {
 			c.addNode(n)
 		}
-		c.announce(c.event("intercom_started", ""))
+		c.open()
 		go c.run()
 		return nil
 	}
@@ -255,7 +268,12 @@ func (e *Engine) Connect(nodes []string, duration time.Duration) error {
 	c.extend(duration)
 	for _, n := range joiners {
 		m := c.addNode(n)
-		c.announce(c.event("intercom_joined", n))
+		if e.brain.NeedsAnswer(n) {
+			m.ringing = true
+			c.announce(c.event("intercom_ringing", n))
+		} else {
+			c.announce(c.event("intercom_joined", n))
+		}
 		if c.live {
 			go c.acquire(m)
 		}
@@ -313,7 +331,7 @@ func (e *Engine) ConnectRemote(r *Remote, nodeID string, playsNode bool, duratio
 		c = e.newCall(duration)
 		c.addNode(nodeID)
 		c.addRemote(r)
-		c.announce(c.event("intercom_started", ""))
+		c.open()
 		go c.run()
 		return nil
 	}
@@ -341,7 +359,7 @@ func (e *Engine) Leave(id string) bool {
 		return false
 	}
 	if !c.ending {
-		c.remove(id, "")
+		c.remove(id, "", "")
 	}
 	return true
 }
@@ -417,7 +435,23 @@ func (e *Engine) newCall(duration time.Duration) *call {
 		started:  now,
 		mix:      newMixer(bridgeRate),
 		over:     make(chan struct{}),
+		duration: duration,
 		deadline: now.Add(e.timeout(duration)),
+	}
+}
+
+// open announces a new call: started, or, when one of its nodes has to be
+// answered first, ringing.
+func (c *call) open() {
+	for _, m := range c.nodes {
+		if c.e.brain.NeedsAnswer(m.id) {
+			c.waiting = true
+		}
+	}
+	if c.waiting {
+		c.announce(c.event("intercom_ringing", ""))
+	} else {
+		c.announce(c.event("intercom_started", ""))
 	}
 }
 
@@ -505,9 +539,10 @@ func (c *call) end(reason string) {
 	}
 }
 
-// remove takes a participant out of the call: it left (failure empty) or was
-// lost to an error. The call ends when that leaves fewer than two.
-func (c *call) remove(id, failure string) {
+// remove takes a participant out of the call: it left, for the given reason if
+// there is one to tell ("unanswered", "hung_up"), or was lost to an error
+// (failure). The call ends when that leaves fewer than two.
+func (c *call) remove(id, reason, failure string) {
 	delete(c.e.calls, id)
 	var page *Remote
 	if i := slices.IndexFunc(c.nodes, func(m *nodeMember) bool { return m.id == id }); i >= 0 {
@@ -522,6 +557,7 @@ func (c *call) remove(id, failure string) {
 	}
 
 	ev := c.event("intercom_left", id)
+	ev.Reason = reason
 	if failure != "" {
 		ev.Status = "error"
 		ev.Message = failure
@@ -541,14 +577,24 @@ func (c *call) remove(id, failure string) {
 	case failure != "":
 		c.failure = failure
 		c.end("error")
+	case reason == "unanswered" && !c.live:
+		// The call never started.
+		c.end("unanswered")
 	default:
 		c.end("left")
 	}
 }
 
-// goLive puts every participant in the mix and starts mixing.
+// goLive puts every participant in the mix and starts mixing. A call that was
+// waiting for somebody to answer starts here: its time runs from now.
 func (c *call) goLive() {
 	c.live = true
+	if c.waiting {
+		c.waiting = false
+		c.started = time.Now()
+		c.deadline = c.started.Add(c.e.timeout(c.duration))
+		c.announce(c.event("intercom_started", ""))
+	}
 	for _, m := range c.nodes {
 		c.attachNode(m)
 	}
@@ -569,7 +615,10 @@ func (c *call) goLive() {
 // when enabled) becomes a talker and its speaker plays its mix-minus. From here
 // on the brain reaches the node through its line into the call.
 func (c *call) attachNode(m *nodeMember) {
-	m.aec = c.e.newCanceller(m.id)
+	// Whoever answers a call does so on a device that cancels its own echo.
+	if !c.e.brain.IsCallee(m.id) {
+		m.aec = c.e.newCanceller(m.id)
+	}
 	in := newBridgeBuffer(bridgeRate, bridgeRate/2)
 	m.out = newBridgeBuffer(bridgeRate, bridgeRate/2)
 	c.mix.addTalker(m.id, in)
@@ -650,10 +699,20 @@ func (c *call) acquire(m *nodeMember) {
 		// It left, or the call ended, while the node was being taken over.
 	case shutdown:
 		c.end("shutdown")
+	case errors.Is(err, audionode.ErrUnanswered):
+		c.remove(m.id, "unanswered", "")
 	case err != nil:
-		c.remove(m.id, "could not acquire node '"+m.id+"': "+err.Error())
+		c.remove(m.id, "", "could not acquire node '"+m.id+"': "+err.Error())
 	default:
 		m.turn = turn
+		if m.ringing {
+			m.ringing = false
+			// In a call that has not started it is one of those the start
+			// announces.
+			if !c.waiting {
+				c.announce(c.event("intercom_joined", m.id))
+			}
+		}
 		if c.live {
 			c.attachNode(m)
 			c.mix.play(c.e.joinChime, "")
@@ -672,10 +731,15 @@ func (c *call) stream(m *nodeMember) {
 		played = m.aec.Playback
 	}
 	err := m.turn.StreamOut(m.turn.Context(), m.out, played)
-	if err != nil && m.ctx.Err() == nil {
+	hungUp := m.turn.HungUp() || errors.Is(err, audionode.ErrHungUp)
+	if (err != nil || hungUp) && m.ctx.Err() == nil {
 		c.e.mu.Lock()
-		if !m.gone && !c.ending {
-			c.remove(m.id, err.Error())
+		switch {
+		case m.gone || c.ending:
+		case hungUp:
+			c.remove(m.id, "hung_up", "")
+		default:
+			c.remove(m.id, "", err.Error())
 		}
 		c.e.mu.Unlock()
 	}
@@ -695,9 +759,17 @@ func (c *call) run() {
 	// left. Whoever joins meanwhile is one more initial participant.
 	for {
 		e.mu.Lock()
+		// Nodes somebody has to answer go first, so the others are left
+		// alone while those ring.
 		var next *nodeMember
 		for _, m := range c.nodes {
-			if m.turn == nil {
+			if m.turn != nil {
+				continue
+			}
+			if next == nil {
+				next = m
+			}
+			if e.brain.IsCallee(m.id) {
 				next = m
 				break
 			}

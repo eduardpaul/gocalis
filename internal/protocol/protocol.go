@@ -69,7 +69,7 @@ type Response struct {
 	Keyword        string `json:"keyword,omitempty"`          // For Wake Word event
 	Message        string `json:"message,omitempty"`          // For error messages
 	AudioFile      string `json:"audio_file,omitempty"`       // For TTS output
-	State          string `json:"state,omitempty"`            // For NodeState updates
+	State          string `json:"state,omitempty"`            // For NodeState updates ("RINGING": a turn waits for somebody to answer the node)
 
 	// Combined wake event fields. When a wake word triggers AutoAsk, a single
 	// "wake" event carries the device (NodeID/Keyword) plus the captured ASR
@@ -84,12 +84,21 @@ type Response struct {
 	// ask ran inside it.
 	InCall bool `json:"in_call,omitempty"`
 
-	// Intercom event fields (event == "intercom_started" / "intercom_joined" /
-	// "intercom_left" / "intercom_ended"). NodeIDs and RemoteIDs (intercom
-	// pages) list who is in the call after the event; ParticipantID is who
-	// joined or left. Reason is why the call ended ("timeout", "stopped",
-	// "left", "shutdown", "error") and DurationSeconds how long it lasted;
-	// the other events carry RemainingSeconds, the time left to its deadline.
+	// Intercom event fields (event == "intercom_ringing" / "intercom_started" /
+	// "intercom_joined" / "intercom_left" / "intercom_ended"). NodeIDs and
+	// RemoteIDs (intercom pages) list who is in the call after the event;
+	// ParticipantID is who joined or left. "intercom_ringing" tells that a node
+	// somebody has to answer is being rung: for a new call, which starts
+	// ("intercom_started") once they answer, or, with ParticipantID, to join a
+	// running one. Reason is why the call ended ("timeout", "stopped", "left",
+	// "unanswered", "shutdown", "error") and DurationSeconds how long it
+	// lasted; on "intercom_left" it is "unanswered" or "hung_up" for a node
+	// somebody had to answer. The other events carry RemainingSeconds, the time
+	// left to its deadline.
+	//
+	// Reason is also set on the "error" that answers a tts or play for a node
+	// somebody has to answer: "unanswered" when nobody did, "hung_up" when they
+	// left before it was through. An ask reports the same two as its Status.
 	NodeIDs          []string `json:"node_ids,omitempty"`
 	RemoteIDs        []string `json:"remote_ids,omitempty"`
 	ParticipantID    string   `json:"participant_id,omitempty"`

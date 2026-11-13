@@ -53,9 +53,12 @@ type Config struct {
 
 // Result is the outcome of an ask session.
 type Result struct {
-	ContextID     string
-	NodeID        string
-	Status        string // "success", "silence_timeout", "verification_failed", "error"
+	ContextID string
+	NodeID    string
+	// Status is "success", "silence_timeout", "verification_failed" or "error";
+	// on a node somebody has to answer also "unanswered" (nobody did) and
+	// "hung_up" (they left before giving an answer).
+	Status        string
 	Transcription string
 	Speaker       string
 	ErrorMessage  string
@@ -102,20 +105,35 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 	}
 	turn, err := e.Brain.AcquireNode(ctx, cfg.NodeID, cfg.Priority)
 	if err != nil {
-		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
+		status := "error"
+		if errors.Is(err, audionode.ErrUnanswered) {
+			status = "unanswered"
+		}
+		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: status, ErrorMessage: err.Error()}
 	}
 	defer turn.Release()
 	// Run the whole flow on the turn's context: an intercom call that takes the
 	// node over cancels it, ending the ask cleanly with a clear reason instead of
-	// letting it listen to (or answer) the people talking on the intercom.
+	// letting it listen to (or answer) the people talking on the intercom. So
+	// does whoever answered the node hanging up.
+	requestCtx := ctx
 	ctx = turn.Context()
 	defer func() {
-		if turn.Preempted() && result.Status != "success" {
+		if result.Status == "success" {
+			return
+		}
+		switch {
+		case turn.Preempted():
 			result.Status = "error"
 			result.ErrorMessage = brain.ErrPreempted.Error()
-			result.Transcription = ""
-			result.Audio = nil
+		case turn.HungUp():
+			result.Status = "hung_up"
+			result.ErrorMessage = audionode.ErrHungUp.Error()
+		default:
+			return
 		}
+		result.Transcription = ""
+		result.Audio = nil
 	}()
 	handle := turn.Handle
 	if handle.Config.Diagnostics.Enabled {
@@ -262,7 +280,11 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 	captured := sess.StopCapture()
 	timings["capture"] = time.Since(captureAt)
 	if ctx.Err() != nil {
-		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: ctx.Err().Error()}
+		if !turn.HungUp() || len(captured) == 0 {
+			return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: ctx.Err().Error()}
+		}
+		// They gave their answer and hung up: it still counts.
+		ctx = requestCtx
 	}
 	// Announce the end of listening with a chime on every device.
 	e.playChime(ctx, turn, chimeStop)
