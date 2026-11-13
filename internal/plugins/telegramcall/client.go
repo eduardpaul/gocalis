@@ -209,12 +209,13 @@ func (c *client) join(ctx context.Context, vc voiceChat, payload string) (string
 			VideoStopped: true, // audio only
 			Params:       tg.DataJSON{Data: payload},
 		})
-		// A voice chat started a moment ago can refuse its first participant
-		// with this (a 500); the same request is taken shortly after.
-		if !tgerr.Is(err, "GROUPCALL_ADD_PARTICIPANTS_FAILED") || attempt == joinAttempts {
+		// A voice chat started a moment ago can fail to take its first
+		// participant (seen: 500 GROUPCALL_ADD_PARTICIPANTS_FAILED and -503
+		// Timeout); the same request is taken shortly after.
+		if !serverSide(err) || attempt == joinAttempts {
 			break
 		}
-		log.Printf("[telegram_call] The voice chat of %q is not taking participants yet, trying again (%d/%d)\n", vc.Chat, attempt, joinAttempts-1)
+		log.Printf("[telegram_call] The voice chat of %q did not take the join (%v), trying again (%d/%d)\n", vc.Chat, err, attempt, joinAttempts-1)
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -248,6 +249,14 @@ func (c *client) join(ctx context.Context, vc voiceChat, payload string) (string
 func (c *client) present(ctx context.Context, vc voiceChat, source uint32) ([]person, bool, error) {
 	signed := int(int32(source))
 	sources, err := c.api.PhoneCheckGroupCall(ctx, &tg.PhoneCheckGroupCallRequest{Call: vc.input(), Sources: []int{signed}})
+	if tgerr.Is(err, "GROUPCALL_JOIN_MISSING") {
+		// Telegram says this both when it dropped us from a voice chat that
+		// goes on and, mostly, when somebody ended the voice chat.
+		if _, err := c.api.PhoneGetGroupCall(ctx, &tg.PhoneGetGroupCallRequest{Call: vc.input(), Limit: 1}); closedOr(err) == errVoiceChatClosed {
+			return nil, false, errVoiceChatClosed
+		}
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, false, closedOr(err)
 	}
@@ -435,6 +444,13 @@ func closedOr(err error) error {
 		return errVoiceChatClosed
 	}
 	return err
+}
+
+// serverSide tells whether a request failed on Telegram's side (a 5xx, or one
+// of its negative codes such as -503 Timeout) and not because of what it asked.
+func serverSide(err error) bool {
+	rpc, ok := tgerr.As(err)
+	return ok && (rpc.Code >= 500 || rpc.Code < 0)
 }
 
 func updatesOf(result tg.UpdatesClass) []tg.UpdateClass {

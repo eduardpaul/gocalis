@@ -398,13 +398,16 @@ func (r *ring) newWatch(vc voiceChat, conn media) *watch {
 			default:
 				failures = 0
 				// One look that misses us can be Telegram catching up; several
-				// in a row mean we were dropped.
-				if in {
-					out = 0
-				} else if out++; out >= presenceFailures {
-					deliver(sighting{err: errors.New("gocalis is no longer in the voice chat")})
-					return
+				// in a row mean we were dropped. Who else is there is only
+				// believed from a look that has us in it.
+				if !in {
+					if out++; out >= presenceFailures {
+						deliver(sighting{err: errors.New("gocalis is no longer in the voice chat")})
+						return
+					}
+					break
 				}
+				out = 0
 				if len(others) != last {
 					if !deliver(sighting{others: others}) {
 						return
