@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"gocalis/internal/ai"
+	"gocalis/internal/ask"
 	"gocalis/internal/audio"
 	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
@@ -587,6 +589,86 @@ func TestIntercomHoldSetsNodeAside(t *testing.T) {
 	}
 	if !slices.Contains(b, back) {
 		t.Fatal("the node was not back in the conversation after the hold")
+	}
+}
+
+// heardASR is a transcriber that records what it was given.
+type heardASR struct{ samples []float32 }
+
+func (s *heardASR) TranscribeSamples(_ context.Context, samples []float32, _ int, _ ai.JobOptions) (string, error) {
+	s.samples = append([]float32(nil), samples...)
+	return "cuelga", nil
+}
+func (*heardASR) TranscribeFile(context.Context, string, ai.JobOptions) (string, error) {
+	return "", nil
+}
+func (*heardASR) CreateStream() (ai.TranscriptionStream, error) { return nil, nil }
+func (*heardASR) Close()                                        {}
+
+// TestIntercomAskInCall runs a whole ask inside a call, as the wake word does on
+// a node with wake_in_call: the command reaches the assistant and not the call,
+// and the node is back in the conversation afterwards.
+func TestIntercomAskInCall(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+	asr := &heardASR{}
+	asker := ask.NewEngine(rig.brain, asr, nil, config.SpeakerIDConfig{})
+	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	rig.waitForState(t, "A", node.StateIntercom)
+	rig.waitForState(t, "B", node.StateIntercom)
+
+	// mic stands in for A's capture path: a node in a call sends its microphone
+	// to the call and, while an ask listens to it, to that ask.
+	mic := func(level float32, speech bool) int16 {
+		chunk := []float32{level, level, level}
+		rig.brain.ForwardRawAudio("A", chunk)
+		rig.brain.Sessions().FeedPCM("A", chunk, speech)
+		return audio.FloatToPCM16(chunk)[0]
+	}
+	done := make(chan ask.Result, 1)
+	go func() {
+		done <- asker.Run(context.Background(), ask.Config{NodeID: "A", VADTimeoutSeconds: 2, PostSpeechSilenceSeconds: 0.1, InCall: true})
+	}()
+	// The command: said for a while once the ask is under way, so that some of
+	// it falls after the listening chime, then silence ends the turn.
+	for rig.brain.Sessions().ActiveCount("A") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var command int16
+	for until := time.Now().Add(700 * time.Millisecond); time.Now().Before(until); {
+		command = mic(0.3, true)
+		time.Sleep(20 * time.Millisecond)
+	}
+	var result ask.Result
+	select {
+	case result = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the ask did not finish")
+	}
+	if result.Status != "success" || result.Transcription != "cuelga" || !result.InCall {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(asr.samples) == 0 {
+		t.Fatal("the command did not reach ASR")
+	}
+	back := mic(0.7, false)
+	time.Sleep(80 * time.Millisecond)
+
+	if rig.nodes["A"].GetState() != node.StateIntercom {
+		t.Fatalf("the ask took node A out of the call: %s", rig.nodes["A"].GetState())
+	}
+	rig.engine.Stop("A")
+	rig.waitForEvent(t, "intercom_ended", "")
+	b := rig.played("B")
+	if slices.Contains(b, command) {
+		t.Fatal("the call heard the command")
+	}
+	if !slices.Contains(b, back) {
+		t.Fatal("node A was not back in the call after the ask")
+	}
+	if !slices.ContainsFunc(rig.played("A"), func(v int16) bool { return v != 0 }) {
+		t.Fatal("node A did not hear the ask's chimes")
 	}
 }
 

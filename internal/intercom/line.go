@@ -47,6 +47,11 @@ func (l *line) playClip(ctx context.Context, pcm []int16, sampleRate int, to str
 	c := l.mix.play(audio.ResampleInt16(pcm, sampleRate, bridgeRate), to)
 	select {
 	case <-c.done:
+		// The mixer also drops a node's clips when the node goes out of the
+		// mix: that is not having played.
+		if l.seat.Err() != nil {
+			return context.Cause(l.seat)
+		}
 		return nil
 	case <-ctx.Done():
 		l.mix.drop(c)

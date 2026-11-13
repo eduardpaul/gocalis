@@ -364,7 +364,10 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		// node aside.
 		if state == node.StateIntercom {
 			r.brain.ForwardRawAudio(nodeCfg.NodeID, samples)
-			if nodeCfg.KWS.WakeInCall && !wakePending.Load() {
+			// As outside a call, the wake word is paused while a turn is
+			// already listening to the node.
+			listening := r.brain.Sessions().ActiveCount(nodeCfg.NodeID) > 0
+			if nodeCfg.KWS.WakeInCall && !listening && !wakePending.Load() {
 				if !wakeActive {
 					wakeStream.Reset()
 					wakeActive = true
@@ -373,7 +376,6 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			} else {
 				wakeActive = false
 			}
-			listening := r.brain.Sessions().ActiveCount(nodeCfg.NodeID) > 0
 			if listening {
 				if !askInCall {
 					// The VAD last ran before the call, or for an earlier ask.
