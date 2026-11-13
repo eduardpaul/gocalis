@@ -17,6 +17,8 @@
   select, input { font: inherit; padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
   button { font: inherit; font-weight: 600; border: 0; border-radius: 999px; padding: 14px 28px; color: #fff; background: var(--accent); cursor: pointer; }
   button.live { background: var(--stop); }
+  button.quiet { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 2px var(--border); }
+  button.quiet.open { box-shadow: inset 0 0 0 2px var(--accent); color: var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
   #status { color: var(--muted); flex: 1 1 200px; }
   #who { color: var(--muted); margin: 0; padding: 0 4px; min-height: 1.4em; }
@@ -32,6 +34,7 @@
   <div class="bar">
     <select id="node" aria-label="Dispositivo"></select>
     <button id="talk" disabled>Hablar</button>
+    <button id="mic" class="quiet" disabled>Escuchar</button>
     <meter id="level" min="0" max="1" value="0" aria-label="Nivel del micrófono"></meter>
     <span id="status"></span>
   </div>
@@ -43,16 +46,19 @@
 </main>
 <script>
 "use strict";
-// The page joins the call of a node. The node is shown, and heard, through
-// go2rtc's own viewer (iframe): this page never sends anything to go2rtc. The
-// microphone goes only to gocalis (/api/intercom/ws), which mixes it into the
-// call; gocalis sends back the rest of the call (the other pages and nodes, the
-// chimes), without the node the viewer already plays.
+// The page joins the call of a node, to listen ("Escuchar") or to talk
+// ("Hablar"); the microphone can be opened and closed at any time during the
+// call. The node is shown, and heard, through go2rtc's own viewer (iframe): this
+// page never sends anything to go2rtc. The microphone, while open, goes only to
+// gocalis (/api/intercom/ws), which mixes it into the call; gocalis sends back
+// the rest of the call (the other pages and nodes, the chimes), without the node
+// the viewer already plays.
 const params = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 let token = params.get("token") || sessionStorage.getItem("gocalis-token") || "";
 let config = null;
-let session = null; // { ws, ctx, stream, node, spk, timer, ending, me }
+let session = null; // { ws, ctx, node, spk, mic, timer, ending, me, note }
+let busy = false;   // joining, or opening the microphone
 
 function setStatus(text) { $("status").textContent = text; }
 
@@ -83,7 +89,7 @@ async function loadConfig() {
   if (wanted && (config.nodes || []).includes(wanted)) sel.value = wanted;
   sel.disabled = (config.nodes || []).length < 2;
   showViewer();
-  $("talk").disabled = !sel.value;
+  render();
   setStatus(sel.value ? "Listo." : "No hay dispositivos.");
 }
 
@@ -105,8 +111,8 @@ function showViewer() {
 
 // AudioWorklets, both at the server rate on the wire (mono PCM16).
 // Mic: downmix to mono, decimate by averaging each output period (a cheap
-// anti-alias filter), and post 20 ms frames. Silence is sent too, so the server
-// can tell a live page from a vanished one.
+// anti-alias filter), and post 20 ms frames, silence included: a steady stream
+// is what the server's jitter cushion expects while the microphone is open.
 // Speaker: play the frames the server sends, resampled by linear interpolation.
 // A short cushion absorbs network jitter; audio beyond the buffer drops the
 // oldest, so a stall cannot leave lasting delay.
@@ -181,18 +187,28 @@ class Speaker extends AudioWorkletProcessor {
 }
 registerProcessor("gocalis-speaker", Speaker);`;
 
-async function start() {
+// openMic asks for the microphone. Echo cancellation keeps what this page
+// plays (the viewer, the rest of the call) out of it, so nobody hears
+// themselves back.
+function openMic() {
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+  });
+}
+
+// join puts this page in the node's call. With a microphone stream it talks
+// from the start; without one it only listens until the microphone is opened.
+async function join(withMic) {
   const node = $("node").value;
-  if (!node || session) return;
-  $("talk").disabled = true;
-  setStatus("Abriendo el micrófono…");
-  let stream, ctx;
+  if (!node || session || busy) return;
+  busy = true;
+  render();
+  let stream = null, ctx;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      // Echo cancellation keeps what this page plays (the viewer, the rest of
-      // the call) out of the microphone, so nobody hears themselves back.
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-    });
+    if (withMic) {
+      setStatus("Abriendo el micrófono…");
+      stream = await openMic();
+    }
     ctx = new AudioContext();
     const blob = URL.createObjectURL(new Blob([WORKLETS], { type: "text/javascript" }));
     await ctx.audioWorklet.addModule(blob);
@@ -201,10 +217,12 @@ async function start() {
   } catch (e) {
     if (stream) stream.getTracks().forEach((t) => t.stop());
     if (ctx) ctx.close();
-    setStatus("Sin micrófono: " + e.message);
-    $("talk").disabled = false;
+    busy = false;
+    render();
+    setStatus((withMic && !ctx ? "Sin micrófono: " : "Sin audio: ") + e.message);
     return;
   }
+  setStatus("Entrando en la llamada…");
 
   const wsURL = api("api/intercom/ws");
   wsURL.protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -217,15 +235,8 @@ async function start() {
     numberOfInputs: 0, outputChannelCount: [1], processorOptions: { rate },
   });
   spk.connect(ctx.destination);
-  session = { ws, ctx, stream, node, spk, timer: null, ending: null, me: "" };
-
-  const src = ctx.createMediaStreamSource(stream);
-  const mic = new AudioWorkletNode(ctx, "gocalis-mic", { processorOptions: { rate } });
-  mic.port.onmessage = (e) => {
-    $("level").value = e.data.peak;
-    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) ws.send(e.data.pcm);
-  };
-  src.connect(mic);
+  session = { ws, ctx, node, rate, spk, mic: null, timer: null, ending: null, me: "", note: "" };
+  if (stream) connectMic(session, stream);
 
   ws.onmessage = (e) => {
     if (typeof e.data !== "string") {
@@ -241,15 +252,75 @@ async function start() {
         inCall(m);
         break;
       case "intercom_ended":
-        stop(reasonText(m));
+        leave(reasonText(m));
         break;
       case "error":
-        stop("No se pudo entrar: " + m.message);
+        leave("No se pudo entrar: " + m.message);
         break;
     }
   };
-  ws.onclose = () => stop();
-  ws.onerror = () => stop("Conexión perdida.");
+  ws.onclose = () => leave();
+  ws.onerror = () => leave("Conexión perdida.");
+}
+
+// connectMic starts sending the microphone stream to the call.
+function connectMic(s, stream) {
+  const src = s.ctx.createMediaStreamSource(stream);
+  const worklet = new AudioWorkletNode(s.ctx, "gocalis-mic", { processorOptions: { rate: s.rate } });
+  worklet.port.onmessage = (e) => {
+    $("level").value = e.data.peak;
+    if (s.ws.readyState === WebSocket.OPEN && s.ws.bufferedAmount < 64000) s.ws.send(e.data.pcm);
+  };
+  src.connect(worklet);
+  s.mic = { stream, src, worklet };
+}
+
+// toggleMic opens or closes the microphone of a page that is in a call. Closed,
+// the page sends nothing and the browser lets go of the microphone.
+async function toggleMic() {
+  const s = session;
+  if (!s || busy) return;
+  if (s.mic) {
+    closeMic(s);
+    render();
+    return;
+  }
+  busy = true;
+  render();
+  try {
+    const stream = await openMic();
+    if (session === s) connectMic(s, stream);
+    else stream.getTracks().forEach((t) => t.stop());
+  } catch (e) {
+    s.note = "Sin micrófono: " + e.message;
+    setTimeout(() => { s.note = ""; }, 6000);
+  }
+  busy = false;
+  render();
+  tick();
+}
+
+function closeMic(s) {
+  if (!s.mic) return;
+  s.mic.worklet.port.onmessage = null;
+  s.mic.src.disconnect();
+  s.mic.stream.getTracks().forEach((t) => t.stop());
+  s.mic = null;
+  $("level").value = 0;
+}
+
+// render sets the two buttons for where the page is: out of a call they join it
+// (to talk, or to listen); in a call they hang up and work the microphone.
+function render() {
+  const talk = $("talk"), mic = $("mic");
+  const live = !!(session && session.me);
+  const none = !config || !$("node").value;
+  talk.textContent = live ? "Colgar" : "Hablar";
+  talk.classList.toggle("live", live);
+  talk.disabled = none || (!live && (busy || !!session));
+  mic.textContent = !live ? "Escuchar" : (session.mic ? "Cerrar micro" : "Abrir micro");
+  mic.classList.toggle("open", live && !!session.mic);
+  mic.disabled = none || busy || (!live && !!session);
 }
 
 // inCall reflects an event of the call this page is in: who is in it now and
@@ -258,10 +329,9 @@ function inCall(m) {
   if (!session) return;
   if (!session.me) {
     session.me = m.remote_id;
-    $("talk").textContent = "Colgar";
-    $("talk").classList.add("live");
-    $("talk").disabled = false;
     session.timer = setInterval(tick, 1000);
+    busy = false;
+    render();
   }
   session.ending = Date.now() + (m.remaining_seconds || 0) * 1000;
   tick();
@@ -278,7 +348,9 @@ function inCall(m) {
 function tick() {
   if (!session || !session.ending) return;
   const left = Math.max(0, Math.round((session.ending - Date.now()) / 1000));
-  setStatus(`En llamada con ${session.node} · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`);
+  const mic = session.mic ? "micrófono abierto" : "solo escuchando";
+  setStatus(session.note ||
+    `En llamada con ${session.node} · ${mic} · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`);
 }
 
 function reasonText(m) {
@@ -291,35 +363,34 @@ function reasonText(m) {
   }
 }
 
-// stop takes this page out of the call; the call goes on for the others.
-function stop(text) {
+// leave takes this page out of the call; the call goes on for the others.
+function leave(text) {
   const s = session;
   if (!s) return;
   session = null;
+  busy = false;
   clearInterval(s.timer);
-  s.stream.getTracks().forEach((t) => t.stop());
+  closeMic(s);
   s.ctx.close();
   if (s.ws.readyState === WebSocket.OPEN) {
     s.ws.send(JSON.stringify({ action: "leave" }));
     s.ws.close();
   }
-  $("level").value = 0;
   $("who").textContent = "";
-  $("talk").textContent = "Hablar";
-  $("talk").classList.remove("live");
-  $("talk").disabled = false;
+  render();
   setStatus(text || "Has salido de la llamada.");
 }
 
-$("talk").onclick = () => (session ? stop() : start());
-$("node").onchange = () => { if (!session) showViewer(); };
+$("talk").onclick = () => (session ? leave() : join(true));
+$("mic").onclick = () => (session ? toggleMic() : join(false));
+$("node").onchange = () => { if (!session) { showViewer(); render(); } };
 $("tokenForm").onsubmit = (e) => {
   e.preventDefault();
   token = $("token").value.trim();
   sessionStorage.setItem("gocalis-token", token);
   loadConfig().catch((err) => setStatus(err.message));
 };
-window.addEventListener("pagehide", () => stop());
+window.addEventListener("pagehide", () => leave());
 if (params.get("token")) sessionStorage.setItem("gocalis-token", token);
 loadConfig().catch((err) => setStatus(err.message));
 </script>

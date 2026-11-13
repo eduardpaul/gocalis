@@ -299,16 +299,21 @@ leaves a single participant.
 
 **Intercom page.** `GET /intercom` serves a standalone page meant to sit behind
 a signing-in reverse proxy (it asks for the API token like the dashboard, or
-takes `?token=`; `?node=front_door` preselects the node). "Hablar" joins the
-call the node is in, or starts one with it, so several browsers can talk to the
-doorbell, and to each other, at once; "Colgar" leaves, and the call goes on for
-the others. The page shows and plays the node through a plain go2rtc viewer in
-an iframe (`intercom.viewers`, e.g. `stream.html?src=doorbell_tv&mode=webrtc`):
-go2rtc fans that stream out and Gocalis does not relay it. Everything else
-travels over `GET /api/intercom/ws?node_id=...`: the browser microphone goes up
+takes `?token=`; `?node=front_door` preselects the node). The page joins the
+call the node is in, or starts one with it, so several browsers can be on the
+doorbell, and talk to each other, at once. "Hablar" joins with the microphone
+open and "Escuchar" joins to listen only; once in the call the microphone can be
+opened and closed at any time, and the browser only asks for it when it is first
+opened. "Colgar" leaves, and the call goes on for the others. The page shows and
+plays the node through a plain go2rtc viewer in an iframe (`intercom.viewers`,
+e.g. `stream.html?src=doorbell_tv&mode=webrtc`): go2rtc fans that stream out and
+Gocalis does not relay it. Everything else travels over
+`GET /api/intercom/ws?node_id=...`: the browser microphone, while open, goes up
 as 16 kHz mono PCM16 binary frames, and the rest of the call (the other pages
 and nodes, the chimes) comes down in the same format, next to the call's events
-as JSON. A node without a viewer is heard through that same downlink.
+as JSON. A node without a viewer is heard through that same downlink. Gocalis
+pings each page and takes one that stops answering out of the call, whether or
+not it was sending a microphone.
 
 **One source of doorbell audio.** Every call plays through the node's normal
 output: for the doorbell, the single WHIP producer on `talkback_in` and the one

@@ -30,10 +30,14 @@ const (
 	intercomPageCallSeconds = 300
 	intercomMaxCallSeconds  = 1800
 
-	// intercomIdleTimeout drops a page that stopped sending: the page
-	// streams microphone frames (silence included) every 20 ms, so a gap this
-	// long means the browser went away (tab closed, phone locked, network lost).
-	intercomIdleTimeout = 5 * time.Second
+	// A page is known to be there by answering pings, which a browser does on
+	// its own whether or not the page sends its microphone: intercomPingInterval
+	// is how often it is pinged, and intercomIdleTimeout how long it may stay
+	// silent (no pong, no message) before it is taken out of the call. That is
+	// a browser that went away without closing the socket (network lost, device
+	// asleep).
+	intercomPingInterval = 2 * time.Second
+	intercomIdleTimeout  = 6 * time.Second
 
 	// intercomMaxFrameBytes bounds one microphone message (1 s of 16 kHz PCM16).
 	intercomMaxFrameBytes = 2 * intercom.RemoteSampleRate
@@ -106,15 +110,17 @@ type intercomMessage struct {
 //	GET /api/intercom/ws?node_id=front_door[&duration_seconds=300][&token=...]
 //
 // The page joins the call the node is in, or starts one with it, when the
-// socket opens. It sends its microphone as binary messages of 16 kHz mono PCM16
-// little-endian; gocalis mixes it into the call, which reaches the node through
-// its normal output (for the doorbell, the one WHIP talkback track and AAC-ELD
-// bridge that TTS uses). The page gets binary messages in the same format with
-// the rest of the call (the other pages and nodes, the chimes), minus the node
-// it shows when that one has a go2rtc viewer: the page plays it from there. It
-// also gets the events of the call as JSON. The page leaves the call when the
-// socket closes, when it sends {"action":"leave"} or when it stops sending; the
-// call goes on for the others unless fewer than two remain.
+// socket opens. Sending a microphone is up to the page: it may join to listen
+// and open its microphone later, or never. When it does, it sends 16 kHz mono
+// PCM16 little-endian as binary messages; gocalis mixes it into the call, which
+// reaches the node through its normal output (for the doorbell, the one WHIP
+// talkback track and AAC-ELD bridge that TTS uses). The page gets binary
+// messages in the same format with the rest of the call (the other pages and
+// nodes, the chimes), minus the node it shows when that one has a go2rtc
+// viewer: the page plays it from there. It also gets the events of the call as
+// JSON. The page leaves the call when the socket closes, when it sends
+// {"action":"leave"} or when it stops answering pings; the call goes on for the
+// others unless fewer than two remain.
 func (s *Server) handleIntercomWS(w http.ResponseWriter, r *http.Request) {
 	if !httpsec.TokenValid(r, s.authToken) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -244,9 +250,29 @@ func (s *Server) handleIntercomWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 	}()
 
+	// Ping the page for as long as it is in the call. Its pongs, like anything
+	// else it sends, push the read deadline back.
+	go func() {
+		ticker := time.NewTicker(s.intercomPing)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second))
+			}
+		}
+	}()
+	alive := func() { _ = conn.SetReadDeadline(time.Now().Add(s.intercomIdle)) }
+	conn.SetPongHandler(func(string) error {
+		alive()
+		return nil
+	})
+
 	conn.SetReadLimit(intercomMaxFrameBytes)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(intercomIdleTimeout))
+		alive()
 		kind, data, err := conn.ReadMessage()
 		if err != nil {
 			break

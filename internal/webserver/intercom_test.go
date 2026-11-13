@@ -21,7 +21,9 @@ import (
 	"gocalis/internal/protocol"
 )
 
-func newIntercomTestServer(t *testing.T) (*httptest.Server, *audionode.Stub, *brain.Brain) {
+// newIntercomTestServer serves the intercom socket for one stub node, "door".
+// tune adjusts the server before it starts.
+func newIntercomTestServer(t *testing.T, tune ...func(*Server)) (*httptest.Server, *audionode.Stub, *brain.Brain) {
 	t.Helper()
 	b := brain.New(nil)
 	stub := &audionode.Stub{}
@@ -32,6 +34,9 @@ func newIntercomTestServer(t *testing.T) (*httptest.Server, *audionode.Stub, *br
 	t.Cleanup(eng.Shutdown)
 	s := NewServer("", b, &protocol.Executor{IntercomEngine: eng}, nil, "secret", nil)
 	t.Cleanup(s.hub.Close)
+	for _, fn := range tune {
+		fn(s)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/intercom/ws", s.handleIntercomWS)
 	srv := httptest.NewServer(mux)
@@ -228,5 +233,75 @@ func TestIntercomWSPagesShareACall(t *testing.T) {
 			t.Fatalf("node not freed after the call: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// quickPings makes the server notice a vanished page within a fraction of a
+// second.
+func quickPings(s *Server) {
+	s.intercomPing, s.intercomIdle = 40*time.Millisecond, 300*time.Millisecond
+}
+
+// TestIntercomWSListenOnly verifies a page that never sends a microphone stays
+// in the call and hears it: answering pings is all it takes to be there.
+func TestIntercomWSListenOnly(t *testing.T) {
+	srv, _, b := newIntercomTestServer(t, quickPings)
+	c, _, err := dialIntercom(t, srv, "node_id=door&token=secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if m := readIntercom(t, c, nil); m.Event != "intercom_started" {
+		t.Fatalf("first message = %+v", m)
+	}
+
+	// Listen for several idle timeouts while the node talks. Reading is what
+	// answers the server's pings, as a browser does by itself.
+	stop := time.Now().Add(time.Second)
+	var heard []int16
+	for time.Now().Before(stop) {
+		b.ForwardRawAudio("door", []float32{0.5, 0.5, 0.5})
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		kind, data, err := c.ReadMessage()
+		if err != nil {
+			t.Fatalf("the listening page was dropped: %v", err)
+		}
+		if kind != websocket.BinaryMessage {
+			t.Fatalf("unexpected message for a page that only listens: %s", data)
+		}
+		for i := 0; i+1 < len(data); i += 2 {
+			heard = append(heard, int16(binary.LittleEndian.Uint16(data[i:])))
+		}
+	}
+	if runLength(heard, 16383) < 3 {
+		t.Fatal("the listening page did not hear the node")
+	}
+	if err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0, brain.CallReject); !errors.Is(err, brain.ErrIntercomActive) {
+		t.Fatalf("PlaySamples = %v: the call did not last", err)
+	}
+}
+
+// TestIntercomWSDropsVanishedPage verifies a page that stops answering pings is
+// taken out of the call, which frees the node.
+func TestIntercomWSDropsVanishedPage(t *testing.T) {
+	srv, _, b := newIntercomTestServer(t, quickPings)
+	c, _, err := dialIntercom(t, srv, "node_id=door&token=secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	readIntercom(t, c, nil)
+
+	// From here on nothing reads the socket, so no ping is answered.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0, brain.CallReject)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the vanished page still holds the node: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

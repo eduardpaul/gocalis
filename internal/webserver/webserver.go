@@ -46,6 +46,10 @@ type Server struct {
 	// embeds (config intercom.viewers).
 	intercomViewers map[string]string
 
+	// intercomPing and intercomIdle are how often an intercom page is pinged
+	// and how long it may go without answering before it is dropped.
+	intercomPing, intercomIdle time.Duration
+
 	hub      *wshub.Hub
 	upgrader websocket.Upgrader
 
@@ -64,6 +68,8 @@ func NewServer(addr string, b *brain.Brain, executor *protocol.Executor, speaker
 		speakerEngine: speakerEngine,
 		startTime:     time.Now(),
 		authToken:     authToken,
+		intercomPing:  intercomPingInterval,
+		intercomIdle:  intercomIdleTimeout,
 		hub:           wshub.New(),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
