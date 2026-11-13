@@ -5,14 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
-	"gocalis/internal/intercom"
+	"gocalis/internal/audionode"
 	"gocalis/internal/plugin"
 )
 
-// telegramAPI is what a ring needs from the logged-in Telegram account.
+// telegramAPI is what a call needs from the logged-in Telegram account.
 type telegramAPI interface {
 	// open finds the voice chat of the chat, or starts one with that title.
 	// started tells it started one.
@@ -61,66 +60,108 @@ func (l *link) connected() <-chan struct{} { return l.up }
 func (l *link) lost() <-chan struct{}      { return l.down }
 func (l *link) source() uint32             { return l.ssrc }
 
+// Why a call is told to end.
 var (
 	errVoiceChatClosed = errors.New("the voice chat was closed")
 	errHangup          = errors.New("hangup requested")
+	errDone            = errors.New("nothing more to say")
+	errAbandoned       = errors.New("whoever was calling gave up")
 	errShutdown        = errors.New("gocalis is shutting down")
 	errOffline         = errors.New("the connection to Telegram was lost")
 )
 
 const (
-	// presenceFailures is how many of those looks may fail in a row.
+	// presenceFailures is how many looks at the voice chat may fail in a row.
 	presenceFailures = 4
 	// connectTimeout bounds the media connection coming up.
 	connectTimeout = 20 * time.Second
-	// tailTimeout bounds playing out the end of the call (the leave chime) to
-	// the voice chat before leaving it.
-	tailTimeout = 2 * time.Second
+	// tailTime is left between the last audio sent and leaving, so it is
+	// heard to the end.
+	tailTime = 400 * time.Millisecond
 	// cleanupTimeout bounds leaving and closing the voice chat.
 	cleanupTimeout = 10 * time.Second
 )
 
-// ring is one use of the plugin from the "call" command to the end: it opens
-// the voice chat and waits in it; when somebody from the group comes in it
-// puts the voice chat in an intercom call with the node; when they are gone,
-// or the intercom call is over, it leaves.
-type ring struct {
-	p        *Plugin
-	api      telegramAPI
-	node     string
-	chat     string
-	title    string
-	ringFor  time.Duration
-	callFor  time.Duration
-	ctx      context.Context
-	stop     context.CancelCauseFunc
-	again    chan struct{} // the same node asked again: the wait starts over
-	finished chan struct{}
+// call is one stay in the group's voice chat. gocalis opens the voice chat (or
+// joins the one that runs) and rings: it waits there for somebody of the group.
+// Once somebody came in, the call is the node's line to them, for every turn
+// that follows, until they are gone or gocalis hangs up; then it leaves, and
+// closes the voice chat if it opened it.
+type call struct {
+	p    *Plugin
+	api  telegramAPI
+	prev <-chan struct{} // the call before, which has to be out of the voice chat first
+	ctx  context.Context
+	stop context.CancelCauseFunc
 
-	mu      sync.Mutex
-	outcome string // why the intercom call let our remote go, from its events
-	failure string
+	answered chan struct{} // closed once somebody is in the voice chat
+	gone     chan struct{} // closed once nobody is on the line any more
+	finished chan struct{} // closed once gocalis is out of the voice chat
+	result   outcome       // how it ended; set before gone is closed
+	conn     media         // the audio connection; set before answered is closed
+
+	// Guarded by Plugin.mu.
+	users int         // turns waiting for the answer or holding the line
+	idle  *time.Timer // hangs up a line no turn holds
 }
 
-// outcome tells how a ring ended: for a reason, or with a failure.
+// outcome tells how a call ended: for a reason, or with a failure.
 type outcome struct {
 	reason  string
 	failure error
 }
 
-func (r *ring) run() {
-	defer close(r.finished)
+// over tells whether the call is ending or has ended.
+func (c *call) over() bool { return c.ctx.Err() != nil }
+
+// isAnswered tells whether somebody came in.
+func (c *call) isAnswered() bool {
+	select {
+	case <-c.answered:
+		return true
+	default:
+		return false
+	}
+}
+
+// err is what a turn is told when the call ended before anybody answered.
+func (c *call) err() error {
+	switch {
+	case c.result.failure != nil:
+		return c.result.failure
+	case c.result.reason == "unanswered":
+		return audionode.ErrUnanswered
+	}
+	return fmt.Errorf("the Telegram call ended before anybody answered (%s)", c.result.reason)
+}
+
+func (c *call) run() {
+	defer close(c.finished)
+	if c.prev != nil {
+		<-c.prev
+	}
 	began := time.Now()
-	answered, result := r.work()
-	r.p.release(r)
+	st := &stay{}
+	answered, result := c.work(st)
+
+	// Whoever holds the line, or waits for it, learns now; leaving the voice
+	// chat takes a moment more.
+	c.result = result
+	c.stop(nil)
+	close(c.gone)
+	if answered && result.failure == nil && result.reason != "hung_up" && result.reason != "closed" {
+		time.Sleep(tailTime)
+	}
+	c.leave(st)
+	c.p.release(c)
 
 	ev := plugin.Event{
-		Name:   "telegram_call_ended",
-		NodeID: r.node,
+		Name:   "call_ended",
+		NodeID: c.p.host.ID,
 		Status: "success",
 		Reason: result.reason,
 		Data: map[string]any{
-			"chat":             r.chat,
+			"chat":             st.vc.Chat,
 			"answered":         answered,
 			"duration_seconds": time.Since(began).Seconds(),
 		},
@@ -128,61 +169,75 @@ func (r *ring) run() {
 	if result.failure != nil {
 		ev.Status, ev.Reason, ev.Message = "error", "error", result.failure.Error()
 	}
-	log.Printf("[Plugin %s] Call for '%s' ended: %s %s\n", r.p.host.ID, r.node, ev.Reason, ev.Message)
-	r.p.host.Emit(ev)
+	log.Printf("[Plugin %s] Call ended: %s %s\n", c.p.host.ID, ev.Reason, ev.Message)
+	c.p.host.Emit(ev)
 }
 
-// work is the whole ring. It returns whether somebody answered and how it
-// ended.
-func (r *ring) work() (answered bool, result outcome) {
+// stay is what a call holds in Telegram, to be given back when it is over.
+type stay struct {
+	vc      voiceChat
+	started bool // the call started the voice chat
+	joined  bool
+	conn    media
+	mixing  chan struct{} // closed to stop the mixdown
+}
+
+// work is the call up to the moment it is over. It returns whether somebody
+// answered and how it ended.
+func (c *call) work(st *stay) (answered bool, result outcome) {
 	failed := func(format string, args ...any) outcome {
 		return outcome{failure: fmt.Errorf(format, args...)}
 	}
-	// stopped is the outcome when the ring's context ends.
+	// stopped is the outcome when the call's context ends.
 	stopped := func() outcome {
-		switch cause := context.Cause(r.ctx); {
+		switch cause := context.Cause(c.ctx); {
 		case errors.Is(cause, errHangup):
 			return outcome{reason: "stopped"}
+		case errors.Is(cause, errDone):
+			return outcome{reason: "completed"}
+		case errors.Is(cause, errAbandoned):
+			return outcome{reason: "cancelled"}
 		case errors.Is(cause, errShutdown):
 			return outcome{reason: "shutdown"}
 		default:
 			return outcome{failure: cause}
 		}
 	}
+	if c.ctx.Err() != nil {
+		return false, stopped()
+	}
 
-	vc, started, err := r.api.open(r.ctx, r.chat, r.title)
+	settings := c.p.settings
+	if settings.Chat == "" {
+		return false, failed("no group to call: set 'chat' in the settings of plugin '%s'", c.p.host.ID)
+	}
+	var err error
+	st.vc, st.started, err = c.api.open(c.ctx, settings.Chat, settings.Title)
 	if err != nil {
-		if r.ctx.Err() != nil {
+		if c.ctx.Err() != nil {
 			return false, stopped()
 		}
 		return false, failed("open the voice chat: %w", err)
 	}
-	r.chat = vc.Chat
 
 	mix := newMixdown()
-	conn, err := r.p.newMedia(mix)
+	conn, err := c.p.newMedia(mix)
 	if err != nil {
-		r.cleanup(vc, started, 0, false)
 		return false, failed("prepare the media connection: %w", err)
 	}
-	joined := false
-	defer func() {
-		conn.close()
-		r.cleanup(vc, started, conn.source(), joined)
-	}()
-
+	st.conn = conn
 	payload, err := conn.joinPayload()
 	if err != nil {
 		return false, failed("prepare the media connection: %w", err)
 	}
-	params, err := r.api.join(r.ctx, vc, payload)
+	params, err := c.api.join(c.ctx, st.vc, payload)
 	if err != nil {
-		if r.ctx.Err() != nil {
+		if c.ctx.Err() != nil {
 			return false, stopped()
 		}
 		return false, failed("join the voice chat: %w", err)
 	}
-	joined = true
+	st.joined = true
 	if err := conn.connect(params); err != nil {
 		return false, failed("connect to the voice chat: %w", err)
 	}
@@ -192,25 +247,25 @@ func (r *ring) work() (answered bool, result outcome) {
 		return false, failed("the media connection to the voice chat failed")
 	case <-time.After(connectTimeout):
 		return false, failed("the media connection to the voice chat did not come up in %v", connectTimeout)
-	case <-r.ctx.Done():
+	case <-c.ctx.Done():
 		return false, stopped()
 	}
 
-	log.Printf("[Plugin %s] Waiting in the voice chat of '%s' for somebody to answer for '%s' (%v)\n", r.p.host.ID, vc.Chat, r.node, r.ringFor)
-	r.p.host.Emit(plugin.Event{
-		Name:   "telegram_call_waiting",
-		NodeID: r.node,
+	log.Printf("[Plugin %s] Ringing: waiting in the voice chat of '%s' for somebody to come in (%v)\n", c.p.host.ID, st.vc.Chat, c.p.ringFor)
+	c.p.host.Emit(plugin.Event{
+		Name:   "call_ringing",
+		NodeID: c.p.host.ID,
 		Data: map[string]any{
-			"chat":               vc.Chat,
-			"ring_seconds":       r.ringFor.Seconds(),
-			"started_voice_chat": started,
+			"chat":               st.vc.Chat,
+			"ring_seconds":       c.p.ringFor.Seconds(),
+			"started_voice_chat": st.started,
 		},
 	})
 
 	// Wait for somebody from the group.
-	watch := r.newWatch(vc, conn)
+	watch := c.newWatch(st.vc, conn)
 	defer watch.stop()
-	deadline := time.NewTimer(r.ringFor)
+	deadline := time.NewTimer(c.p.ringFor)
 	defer deadline.Stop()
 	var others []person
 	for len(others) == 0 {
@@ -222,123 +277,70 @@ func (r *ring) work() (answered bool, result outcome) {
 			others = seen.others
 		case <-deadline.C:
 			return false, outcome{reason: "unanswered"}
-		case <-r.again:
-			deadline.Reset(r.ringFor)
 		case <-conn.lost():
 			return false, failed("the media connection to the voice chat was lost")
-		case <-r.ctx.Done():
+		case <-c.ctx.Done():
 			return false, stopped()
 		}
 	}
 
-	// Somebody is there: this is where the intercom call starts.
-	remote := r.p.host.Intercom.NewRemote("telegram", r.note)
-	if err := r.p.host.Intercom.ConnectRemote(remote, r.node, false, r.callFor); err != nil {
-		return false, failed("start the intercom call: %w", err)
-	}
-	mix.to(remote.Push)
-	mixing := make(chan struct{})
-	go mix.run(mixing)
-	defer close(mixing)
-	sent := make(chan struct{})
-	go func() {
-		defer close(sent)
-		pump(remote, conn)
-	}()
+	// Somebody is there: from here the node has a line to them.
+	mix.to(c.p.heard)
+	st.mixing = make(chan struct{})
+	go mix.run(st.mixing)
+	c.conn = conn
+	close(c.answered)
 
 	names := make([]string, len(others))
 	for i, o := range others {
 		names[i] = o.Name
 	}
-	log.Printf("[Plugin %s] %v answered for '%s'\n", r.p.host.ID, names, r.node)
-	r.p.host.Emit(plugin.Event{
-		Name:   "telegram_call_answered",
-		NodeID: r.node,
-		Data: map[string]any{
-			"chat":      vc.Chat,
-			"answered":  names,
-			"remote_id": remote.ID,
-		},
+	log.Printf("[Plugin %s] %v answered\n", c.p.host.ID, names)
+	c.p.host.Emit(plugin.Event{
+		Name:   "call_answered",
+		NodeID: c.p.host.ID,
+		Data:   map[string]any{"chat": st.vc.Chat, "answered": names},
 	})
 
-	// Stay until the people on Telegram are gone or the intercom call lets
-	// us go.
-	result = outcome{}
-	for done := false; !done; {
+	// Stay until the people on Telegram are gone or gocalis hangs up.
+	for {
 		select {
-		case <-remote.Left():
-			result = r.noted()
-			done = true
 		case seen := <-watch.seen:
 			if seen.err != nil {
-				result = seen.outcome()
-				done = true
-			} else if len(seen.others) == 0 {
-				result = outcome{reason: "hung_up"}
-				done = true
+				return true, seen.outcome()
+			}
+			if len(seen.others) == 0 {
+				return true, outcome{reason: "hung_up"}
 			}
 		case <-conn.lost():
-			result = failed("the media connection to the voice chat was lost")
-			done = true
-		case <-r.ctx.Done():
-			result = stopped()
-			done = true
+			return true, failed("the media connection to the voice chat was lost")
+		case <-c.ctx.Done():
+			return true, stopped()
 		}
 	}
-
-	// Out of the intercom call (a no-op when it already let us go), then
-	// give the voice chat the end of it to hear.
-	mix.to(nil)
-	r.p.host.Intercom.Leave(remote.ID)
-	select {
-	case <-sent:
-	case <-time.After(tailTimeout):
-	}
-	return true, result
 }
 
-// cleanup takes us out of the voice chat and closes it if this ring started
-// it. It runs when the ring's own context may already be over.
-func (r *ring) cleanup(vc voiceChat, started bool, source uint32, joined bool) {
+// leave takes gocalis out of the voice chat and closes it if this call started
+// it. It runs when the call's own context is over.
+func (c *call) leave(st *stay) {
+	if st.mixing != nil {
+		close(st.mixing)
+	}
+	if st.conn != nil {
+		st.conn.close()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	if joined {
-		if err := r.api.leave(ctx, vc, source); err != nil && !errors.Is(err, errVoiceChatClosed) {
-			log.Printf("[Plugin %s] Leaving the voice chat of '%s': %v\n", r.p.host.ID, vc.Chat, err)
+	if st.joined {
+		if err := c.api.leave(ctx, st.vc, st.conn.source()); err != nil && !errors.Is(err, errVoiceChatClosed) {
+			log.Printf("[Plugin %s] Leaving the voice chat of '%s': %v\n", c.p.host.ID, st.vc.Chat, err)
 		}
 	}
-	if started {
-		if err := r.api.end(ctx, vc); err != nil && !errors.Is(err, errVoiceChatClosed) {
-			log.Printf("[Plugin %s] Closing the voice chat of '%s': %v\n", r.p.host.ID, vc.Chat, err)
+	if st.started {
+		if err := c.api.end(ctx, st.vc); err != nil && !errors.Is(err, errVoiceChatClosed) {
+			log.Printf("[Plugin %s] Closing the voice chat of '%s': %v\n", c.p.host.ID, st.vc.Chat, err)
 		}
 	}
-}
-
-// note keeps why the intercom call let our remote go. It is the remote's
-// notify callback, so it must not block.
-func (r *ring) note(ev intercom.Event) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if ev.Event == "intercom_ended" {
-		r.outcome, r.failure = ev.Reason, ""
-		if ev.Status == "error" {
-			r.failure = ev.Message
-		}
-	}
-}
-
-// noted is how the ring ended when the intercom call let our remote go.
-func (r *ring) noted() outcome {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	switch {
-	case r.failure != "":
-		return outcome{failure: fmt.Errorf("the intercom call failed: %s", r.failure)}
-	case r.outcome != "":
-		return outcome{reason: r.outcome}
-	}
-	// Taken out of a call that goes on without us.
-	return outcome{reason: "left"}
 }
 
 // sighting is one look at the voice chat.
@@ -367,7 +369,7 @@ func (w *watch) stop() {
 	<-w.done
 }
 
-func (r *ring) newWatch(vc voiceChat, conn media) *watch {
+func (c *call) newWatch(vc voiceChat, conn media) *watch {
 	w := &watch{seen: make(chan sighting), quit: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(w.done)
@@ -379,12 +381,12 @@ func (r *ring) newWatch(vc voiceChat, conn media) *watch {
 				return false
 			}
 		}
-		ticker := time.NewTicker(r.p.lookEvery)
+		ticker := time.NewTicker(c.p.lookEvery)
 		defer ticker.Stop()
 		failures, out, last := 0, 0, -1
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			others, in, err := r.api.present(ctx, vc, conn.source())
+			others, in, err := c.api.present(ctx, vc, conn.source())
 			cancel()
 			switch {
 			case errors.Is(err, errVoiceChatClosed):
@@ -417,39 +419,11 @@ func (r *ring) newWatch(vc voiceChat, conn media) *watch {
 			}
 			select {
 			case <-ticker.C:
-			case <-r.api.changes():
+			case <-c.api.changes():
 			case <-w.quit:
 				return
 			}
 		}
 	}()
 	return w
-}
-
-// pump sends the voice chat what the intercom call has for our remote, in
-// whole frames no closer together than they play, until the remote is out of
-// the call and everything meant for it is sent.
-func pump(remote *intercom.Remote, conn media) {
-	var pending []int16
-	next := time.Now()
-	for {
-		pcm, err := remote.Read(context.Background())
-		if err != nil {
-			return
-		}
-		pending = append(pending, pcm...)
-		for len(pending) >= frameSamples {
-			if wait := time.Until(next); wait > 0 {
-				time.Sleep(wait)
-			}
-			if now := time.Now(); now.After(next.Add(100 * time.Millisecond)) {
-				next = now
-			}
-			next = next.Add(20 * time.Millisecond)
-			if err := conn.send(pending[:frameSamples]); err != nil {
-				return
-			}
-			pending = pending[frameSamples:]
-		}
-	}
 }

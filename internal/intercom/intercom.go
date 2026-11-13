@@ -66,9 +66,8 @@ type EchoCanceller interface {
 // RemoteSampleRate is the PCM16 rate of a Remote's audio, in both directions.
 const RemoteSampleRate = bridgeRate
 
-// Remote is a participant outside gocalis: an intercom web page, or a call a
-// plugin brings in (a Telegram voice chat). Its transport pushes the far side's
-// microphone with Push and sends the far side what Read returns.
+// Remote is a participant outside gocalis: an intercom web page. Its transport
+// pushes the page's microphone with Push and sends the page what Read returns.
 type Remote struct {
 	ID string
 
@@ -282,14 +281,12 @@ func (e *Engine) Connect(nodes []string, duration time.Duration) error {
 }
 
 // NewRemote creates a remote participant, ready to be passed to ConnectRemote.
-// kind says what it is ("web" for an intercom page, a plugin's name for a call
-// it brings in) and starts its id, which is unique within this engine. notify,
-// when not nil, receives every event of the call the remote is in, in order; it
-// must not block.
-func (e *Engine) NewRemote(kind string, notify func(Event)) *Remote {
+// Its id is unique within this engine. notify, when not nil, receives every
+// event of the call the remote is in, in order; it must not block.
+func (e *Engine) NewRemote(notify func(Event)) *Remote {
 	e.mu.Lock()
 	e.remoteSeq++
-	id := fmt.Sprintf("%s-%d", kind, e.remoteSeq)
+	id := fmt.Sprintf("web-%d", e.remoteSeq)
 	e.mu.Unlock()
 	mic := newBridgeBuffer(bridgeRate, bridgeRate*remoteMaxMs/1000)
 	mic.prime = bridgeRate * remotePrimeMs / 1000

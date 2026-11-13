@@ -145,7 +145,7 @@ func (r *recorder) last(t *testing.T) Response {
 }
 
 // knock is a plugin type for the test: "knock" reports on the node it names,
-// if gocalis has it.
+// if it is told how many times.
 type knock struct{ host plugin.Host }
 
 func init() {
@@ -160,14 +160,14 @@ func (k *knock) Command(_ context.Context, cmd plugin.Command) error {
 	if cmd.Name != "knock" {
 		return fmt.Errorf("unknown command: %s", cmd.Name)
 	}
-	if !k.host.HasNode(cmd.NodeID) {
-		return fmt.Errorf("node '%s' not registered", cmd.NodeID)
-	}
 	var args struct {
 		Times int `json:"times"`
 	}
 	if err := cmd.Decode(&args); err != nil {
 		return err
+	}
+	if args.Times < 1 {
+		return fmt.Errorf("knock at least once")
 	}
 	k.host.Emit(plugin.Event{Name: "knock_heard", NodeID: cmd.NodeID, Status: "success", Data: map[string]any{"times": args.Times}})
 	return nil
@@ -190,7 +190,7 @@ func TestExecutorRunsPluginCommands(t *testing.T) {
 		t.Fatalf("expected an error for the unknown plugin, got %+v", ev)
 	}
 
-	if err := e.StartPlugins(ctx, []config.PluginConfig{{ID: "bell", Type: "knock"}}); err != nil {
+	if err := e.StartPlugins(ctx, []config.PluginConfig{{ID: "bell", Type: "knock"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -200,7 +200,7 @@ func TestExecutorRunsPluginCommands(t *testing.T) {
 	}
 
 	e.Execute(ctx, Request{Action: "plugin", Plugin: "bell", Command: "knock", NodeID: "garden"})
-	if ev := out.last(t); ev.Event != "error" || ev.Plugin != "bell" || ev.NodeID != "garden" || !strings.Contains(ev.Message, "not registered") {
+	if ev := out.last(t); ev.Event != "error" || ev.Plugin != "bell" || ev.NodeID != "garden" || !strings.Contains(ev.Message, "at least once") {
 		t.Fatalf("expected the refusal as an error event, got %+v", ev)
 	}
 

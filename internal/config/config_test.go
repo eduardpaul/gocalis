@@ -166,6 +166,7 @@ func TestRejectInvalidPlugins(t *testing.T) {
 		"id twice":      "plugins:\n  - id: door\n    type: example\n  - id: door\n    type: example\n",
 		"id with slash": "plugins:\n  - id: a/b\n    type: example\n",
 		"unknown key":   "plugins:\n  - id: door\n    type: example\n    colour: red\n",
+		"id of a node":  "plugins:\n  - id: room\n    type: example\n",
 	} {
 		if _, err := loadText(t, minimalConfig+plugins); err == nil {
 			t.Errorf("%s: expected the configuration to be refused", name)

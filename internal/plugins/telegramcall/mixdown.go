@@ -15,7 +15,7 @@ const (
 )
 
 // mixdown makes one stream of the voice chat: Telegram delivers every
-// speaker separately, the intercom call wants what they say together. Each
+// speaker separately, the node hears what they say together. Each
 // speaker's audio queues up as it arrives; on a 20 ms clock one frame is
 // taken from each and their sum handed on.
 type mixdown struct {
@@ -79,8 +79,8 @@ func (m *mixdown) run(stop <-chan struct{}) {
 	}
 }
 
-// tick hands on one frame of everybody who has audio ready, or nothing when
-// nobody does.
+// tick hands on one frame of everybody who has audio ready: silence when
+// nobody does, as a microphone would.
 func (m *mixdown) tick() {
 	m.mu.Lock()
 	out := m.out
@@ -106,7 +106,7 @@ func (m *mixdown) tick() {
 		s.buf = s.buf[n:]
 	}
 	m.mu.Unlock()
-	if sum == nil || out == nil {
+	if out == nil {
 		return
 	}
 	frame := make([]int16, frameSamples)

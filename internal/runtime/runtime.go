@@ -130,20 +130,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 
 	// Initialize VoiceActivityDetector (VAD Gate)
 	log.Printf("[Node:%s] Initializing VAD Gate (model: %s)...\n", nodeCfg.NodeID, r.global.Models.VAD.SileroOnnxPath)
-	vadConfig := sherpa.VadModelConfig{
-		SileroVad: sherpa.SileroVadModelConfig{
-			Model:              r.global.Models.VAD.SileroOnnxPath,
-			Threshold:          r.global.Models.VAD.Threshold,
-			MinSilenceDuration: 0.032, // one VAD window; ask owns the turn endpoint
-			MinSpeechDuration:  0.25,
-			WindowSize:         512,
-			MaxSpeechDuration:  ai.MaxAudioSeconds,
-		},
-		SampleRate: 16000,
-		NumThreads: r.threads,
-		Provider:   "cpu",
-		Debug:      0,
-	}
+	vadConfig := vadModelConfig(r.global, r.threads)
 	vadGate := sherpa.NewVoiceActivityDetector(&vadConfig, 10.0)
 	if vadGate == nil {
 		log.Printf("[Node:%s] Failed to initialize VAD", nodeCfg.NodeID)
@@ -433,4 +420,22 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	// Block until context is cancelled
 	<-ctx.Done()
 	log.Printf("[Node:%s] Closing node handler...\n", nodeCfg.NodeID)
+}
+
+// vadModelConfig is how every node's speech gate is set up.
+func vadModelConfig(global *config.Config, threads int) sherpa.VadModelConfig {
+	return sherpa.VadModelConfig{
+		SileroVad: sherpa.SileroVadModelConfig{
+			Model:              global.Models.VAD.SileroOnnxPath,
+			Threshold:          global.Models.VAD.Threshold,
+			MinSilenceDuration: 0.032, // one VAD window; ask owns the turn endpoint
+			MinSpeechDuration:  0.25,
+			WindowSize:         512,
+			MaxSpeechDuration:  ai.MaxAudioSeconds,
+		},
+		SampleRate: 16000,
+		NumThreads: threads,
+		Provider:   "cpu",
+		Debug:      0,
+	}
 }

@@ -250,7 +250,7 @@ func TestIntercomRemoteAndNode(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
 
 	var notified eventCollector
-	remote := rig.engine.NewRemote("web", notified.emit)
+	remote := rig.engine.NewRemote(notified.emit)
 	if err := rig.engine.ConnectRemote(remote, "A", false, 0); err != nil {
 		t.Fatalf("ConnectRemote failed: %v", err)
 	}
@@ -308,14 +308,14 @@ func TestIntercomRemoteAndNode(t *testing.T) {
 func TestIntercomRemotePlaysNodeItself(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
 
-	viewer := rig.engine.NewRemote("web", nil)
+	viewer := rig.engine.NewRemote(nil)
 	if err := rig.engine.ConnectRemote(viewer, "A", true, 0); err != nil {
 		t.Fatalf("ConnectRemote failed: %v", err)
 	}
 	rig.waitForState(t, "A", node.StateIntercom)
 
 	// A second page joins the same call instead of being refused.
-	other := rig.engine.NewRemote("web", nil)
+	other := rig.engine.NewRemote(nil)
 	if err := rig.engine.ConnectRemote(other, "A", true, 0); err != nil {
 		t.Fatalf("second ConnectRemote failed: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestIntercomChimes(t *testing.T) {
 	rig.waitForState(t, "B", node.StateIntercom)
 	time.Sleep(100 * time.Millisecond) // the start chime plays out
 
-	page := rig.engine.NewRemote("web", nil)
+	page := rig.engine.NewRemote(nil)
 	if err := rig.engine.ConnectRemote(page, "A", false, 0); err != nil {
 		t.Fatalf("ConnectRemote failed: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestIntercomPlaysInCall(t *testing.T) {
 		t.Fatalf("Connect failed: %v", err)
 	}
 	rig.waitForState(t, "B", node.StateIntercom)
-	page := rig.engine.NewRemote("web", nil)
+	page := rig.engine.NewRemote(nil)
 	if err := rig.engine.ConnectRemote(page, "A", false, 0); err != nil {
 		t.Fatalf("ConnectRemote failed: %v", err)
 	}
@@ -704,7 +704,7 @@ func TestIntercomKeepsCallsApart(t *testing.T) {
 	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
-	if err := rig.engine.ConnectRemote(rig.engine.NewRemote("web", nil), "C", false, 0); err != nil {
+	if err := rig.engine.ConnectRemote(rig.engine.NewRemote(nil), "C", false, 0); err != nil {
 		t.Fatalf("ConnectRemote failed: %v", err)
 	}
 	if err := rig.engine.Connect([]string{"A", "C"}, 0); err == nil {
@@ -723,7 +723,7 @@ func TestIntercomRejectsInvalid(t *testing.T) {
 	if err := rig.engine.Connect([]string{"A", "ghost"}, time.Second); err == nil {
 		t.Fatal("expected error for unregistered node")
 	}
-	if err := rig.engine.ConnectRemote(rig.engine.NewRemote("web", nil), "ghost", false, 0); err == nil {
+	if err := rig.engine.ConnectRemote(rig.engine.NewRemote(nil), "ghost", false, 0); err == nil {
 		t.Fatal("expected error for a page calling an unregistered node")
 	}
 }

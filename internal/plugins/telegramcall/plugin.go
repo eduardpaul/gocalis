@@ -1,17 +1,19 @@
-// Package telegramcall is the "telegram_call" plugin: it brings a Telegram
-// group's voice chat into an intercom call with a node.
+// Package telegramcall is the "telegram_call" plugin: it makes a Telegram
+// group a node of gocalis, one that somebody has to answer.
 //
-// The use it is made for is a doorbell. When somebody rings, a flow sends the
-// plugin the "call" command for the doorbell node. The plugin, logged in as a
-// Telegram user, opens the voice chat of the configured group and waits in it.
-// The moment somebody from the group comes in, the intercom call starts: the
-// node is taken over and the two sides talk. It is over when the people on
-// Telegram are gone, when the intercom call ends, or when nobody came in time;
-// the plugin then leaves, and closes the voice chat if it opened it.
+// The node's id is the plugin's. Say something to it, ask it something or put
+// it in an intercom call, like any other node, and gocalis, logged in as a
+// Telegram user, goes into the voice chat of the configured group (starting it
+// when none runs) and waits there. The moment somebody of the group comes in,
+// whatever was asked for happens: they hear what is said, are asked and
+// listened to, or talk with the doorbell. When nobody comes in the ring time,
+// it fails as "unanswered". gocalis leaves when they are gone, when an intercom
+// call is over, or a little after the last thing it had to say, and closes the
+// voice chat if it opened it.
 //
-// In the intercom call the voice chat is one remote participant, like an
-// intercom page: everybody in it hears the call and is heard by it, and
-// intercom pages and other nodes can be in the same call.
+// The use it is made for is a doorbell: when somebody rings, a flow starts an
+// intercom call between the doorbell node and this one. The doorbell is left
+// alone until somebody on Telegram answers.
 //
 // Only a user account can be in a voice chat (a bot cannot), so the plugin
 // needs an api_id and api_hash from my.telegram.org and a login done once with
@@ -52,19 +54,26 @@ type Settings struct {
 	// account: keep it out of backups and repositories, and on a volume that
 	// outlives the container.
 	SessionFile string `yaml:"session_file"`
-	// Chat is the group whose voice chat is used when a command does not
-	// name one: its @username, its numeric id, or its exact title.
+	// Chat is the group whose voice chat is the node: its @username, its
+	// numeric id, or its exact title.
 	Chat string `yaml:"chat"`
 	// Title is given to a voice chat the plugin starts.
 	Title string `yaml:"title"`
-	// RingSeconds is how long the plugin waits in the voice chat for
-	// somebody to come in when a command does not say.
+	// RingSeconds is how long gocalis waits in the voice chat for somebody to
+	// come in before the turn that rang fails as unanswered.
 	RingSeconds float64 `yaml:"ring_seconds"`
+	// IdleSeconds is how long gocalis stays in an answered voice chat after a
+	// tts, play or ask, in case another follows (the reply to an answer). An
+	// intercom call hangs up when it is over.
+	IdleSeconds float64 `yaml:"idle_seconds"`
 }
 
 const (
 	defaultRingSeconds = 60
-	maxRingSeconds     = 600
+	// A tts, play or ask request lives five minutes at most, ring included.
+	maxRingSeconds     = 240
+	defaultIdleSeconds = 15
+	maxIdleSeconds     = 300
 )
 
 // connectFunc logs in to Telegram and calls ready with the account once it is
@@ -84,16 +93,21 @@ type Plugin struct {
 	// lookEvery is how often a call looks at who is in the voice chat when
 	// Telegram does not report a change by itself.
 	lookEvery time.Duration
+	ringFor   time.Duration
+	idleFor   time.Duration
 
 	mu     sync.Mutex
 	api    telegramAPI // nil while not connected
 	detail string
-	ring   *ring // the call in progress, if any
+	call   *call // the stay in the voice chat, from the ring until gocalis is out
+
+	audioMu sync.Mutex
+	onAudio func(samples []float32)
 }
 
 // New checks the settings and prepares the plugin.
 func New(cfg config.PluginConfig, host plugin.Host) (*Plugin, error) {
-	settings := Settings{SessionFile: "telegram.session", RingSeconds: defaultRingSeconds}
+	settings := Settings{SessionFile: "telegram.session", RingSeconds: defaultRingSeconds, IdleSeconds: defaultIdleSeconds}
 	if err := cfg.DecodeSettings(&settings); err != nil {
 		return nil, err
 	}
@@ -106,11 +120,16 @@ func New(cfg config.PluginConfig, host plugin.Host) (*Plugin, error) {
 	if settings.RingSeconds <= 0 || settings.RingSeconds > maxRingSeconds {
 		return nil, fmt.Errorf("settings: ring_seconds must be in (0,%d]", maxRingSeconds)
 	}
+	if settings.IdleSeconds <= 0 || settings.IdleSeconds > maxIdleSeconds {
+		return nil, fmt.Errorf("settings: idle_seconds must be in (0,%d]", maxIdleSeconds)
+	}
 	p := &Plugin{
 		host:      host,
 		settings:  settings,
 		newMedia:  func(heard sink) (media, error) { return newLink(heard) },
 		lookEvery: 3 * time.Second,
+		ringFor:   time.Duration(settings.RingSeconds * float64(time.Second)),
+		idleFor:   time.Duration(settings.IdleSeconds * float64(time.Second)),
 		detail:    "starting",
 	}
 	p.connect = func(ready func(context.Context, telegramAPI, string) error) error {
@@ -119,10 +138,20 @@ func New(cfg config.PluginConfig, host plugin.Host) (*Plugin, error) {
 	return p, nil
 }
 
-// Run keeps the plugin logged in to Telegram until ctx ends. Without a login
-// it waits for one to be made with -plugin-setup, which can happen while
-// gocalis runs.
+// Run adds the node and keeps the plugin logged in to Telegram until ctx ends.
+// Without a login it waits for one to be made with -plugin-setup, which can
+// happen while gocalis runs; the node is there meanwhile and tells whoever
+// calls it why it cannot.
 func (p *Plugin) Run(ctx context.Context) error {
+	if p.host.AddNode == nil {
+		return errors.New("no way to add the node")
+	}
+	remove, err := p.host.AddNode(p)
+	if err != nil {
+		return err
+	}
+	defer remove()
+
 	retry := 5 * time.Second
 	for ctx.Err() == nil {
 		if _, err := os.Stat(p.settings.SessionFile); err != nil {
@@ -138,10 +167,10 @@ func (p *Plugin) Run(ctx context.Context) error {
 			defer p.setAPI(nil, "disconnected")
 			select {
 			case <-ctx.Done():
-				p.stopRing(errShutdown)
+				p.endCall(errShutdown)
 				return nil
 			case <-online.Done():
-				p.stopRing(errOffline)
+				p.endCall(errOffline)
 				return online.Err()
 			}
 		})
@@ -192,130 +221,35 @@ func (p *Plugin) Status() plugin.Status {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	status := plugin.Status{Ready: p.api != nil, Detail: p.detail}
-	if p.ring != nil {
-		status.Detail += "; call for " + p.ring.node
+	if c := p.call; c != nil && !c.over() {
+		if c.isAnswered() {
+			status.Detail += "; in a call"
+		} else {
+			status.Detail += "; ringing"
+		}
 	}
 	return status
 }
 
-// callArgs are the args of the "call" command.
-type callArgs struct {
-	// Chat and Title replace the configured ones for this call.
-	Chat  string `json:"chat"`
-	Title string `json:"title"`
-	// RingSeconds is how long to wait for somebody to come in; 0 for the
-	// configured time.
-	RingSeconds float64 `json:"ring_seconds"`
-	// DurationSeconds is how long the intercom call lasts once it starts; 0
-	// for the intercom default.
-	DurationSeconds float64 `json:"duration_seconds"`
-}
-
-// Command implements plugin.Plugin. "call" opens the voice chat for the node
-// and waits for somebody to come in; "hangup" ends that, at whatever point it
-// is.
+// Command implements plugin.Plugin. The node is used with tts, play, ask and
+// intercom; the one thing left to command is "hangup", which takes gocalis out
+// of the voice chat at whatever point it is: ringing, or with somebody on the
+// line.
 func (p *Plugin) Command(_ context.Context, cmd plugin.Command) error {
-	switch cmd.Name {
-	case "call":
-		return p.call(cmd)
-	case "hangup":
-		return p.hangup(cmd)
+	if cmd.Name != "hangup" {
+		return fmt.Errorf("unknown command '%s' (telegram_call has: hangup)", cmd.Name)
 	}
-	return fmt.Errorf("unknown command '%s' (telegram_call has: call, hangup)", cmd.Name)
-}
-
-func (p *Plugin) call(cmd plugin.Command) error {
-	args := callArgs{Chat: p.settings.Chat, Title: p.settings.Title, RingSeconds: p.settings.RingSeconds}
-	if err := cmd.Decode(&args); err != nil {
-		return err
-	}
-	if args.RingSeconds == 0 {
-		args.RingSeconds = p.settings.RingSeconds
-	}
-	switch {
-	case cmd.NodeID == "":
-		return errors.New("call requires node_id")
-	case !p.host.HasNode(cmd.NodeID):
-		return fmt.Errorf("node '%s' not registered", cmd.NodeID)
-	case args.Chat == "":
-		return errors.New("call requires a chat: set 'chat' in the plugin settings or in the args")
-	case args.RingSeconds < 0 || args.RingSeconds > maxRingSeconds:
-		return fmt.Errorf("ring_seconds must be in (0,%d]", maxRingSeconds)
-	case args.DurationSeconds < 0:
-		return errors.New("duration_seconds must not be negative")
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.api == nil {
-		return fmt.Errorf("not connected to Telegram (%s)", p.detail)
-	}
-	if p.ring != nil {
-		if p.ring.node != cmd.NodeID {
-			return fmt.Errorf("busy with a call for node '%s'", p.ring.node)
-		}
-		// The bell again: whoever is waiting waits from now.
-		select {
-		case p.ring.again <- struct{}{}:
-		default:
-		}
-		return nil
-	}
-
-	ctx, stop := context.WithCancelCause(context.Background())
-	p.ring = &ring{
-		p:        p,
-		api:      p.api,
-		node:     cmd.NodeID,
-		chat:     args.Chat,
-		title:    args.Title,
-		ringFor:  time.Duration(args.RingSeconds * float64(time.Second)),
-		callFor:  time.Duration(args.DurationSeconds * float64(time.Second)),
-		ctx:      ctx,
-		stop:     stop,
-		again:    make(chan struct{}, 1),
-		finished: make(chan struct{}),
-	}
-	go p.ring.run()
-	return nil
-}
-
-func (p *Plugin) hangup(cmd plugin.Command) error {
 	if err := cmd.Decode(&struct{}{}); err != nil {
 		return err
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.ring == nil {
+	c := p.call
+	p.mu.Unlock()
+	if c == nil || c.over() {
 		return errors.New("no Telegram call in progress")
 	}
-	if cmd.NodeID != "" && cmd.NodeID != p.ring.node {
-		return fmt.Errorf("the Telegram call in progress is for node '%s'", p.ring.node)
-	}
-	p.ring.stop(errHangup)
+	c.stop(errHangup)
 	return nil
-}
-
-// stopRing ends the call in progress, if any, and waits until it is over.
-func (p *Plugin) stopRing(cause error) {
-	p.mu.Lock()
-	r := p.ring
-	p.mu.Unlock()
-	if r == nil {
-		return
-	}
-	r.stop(cause)
-	<-r.finished
-}
-
-// release is called by a ring that is over, before it reports so.
-func (p *Plugin) release(r *ring) {
-	p.mu.Lock()
-	if p.ring == r {
-		p.ring = nil
-	}
-	p.mu.Unlock()
-	r.stop(nil)
 }
 
 func (p *Plugin) setAPI(api telegramAPI, detail string) {

@@ -71,14 +71,14 @@ func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, sp
 }
 
 // StartPlugins builds the configured plugins and runs them until ctx ends. They
-// work with this executor's intercom engine and report on its event bus.
-func (e *Executor) StartPlugins(ctx context.Context, cfgs []config.PluginConfig) error {
+// report on this executor's event bus; addNode registers the nodes they bring
+// (see plugin.Services).
+func (e *Executor) StartPlugins(ctx context.Context, cfgs []config.PluginConfig, addNode func(id, typeName string, audio audionode.AudioNode) (func(), error)) error {
 	if len(cfgs) == 0 {
 		return nil
 	}
 	manager, err := plugin.Start(ctx, cfgs, plugin.Services{
-		Intercom: e.IntercomEngine,
-		HasNode:  func(nodeID string) bool { return e.Brain.GetNodeHandle(nodeID) != nil },
+		AddNode: addNode,
 		Publish: func(pluginID string, ev plugin.Event) {
 			e.Publisher.Publish(Response{
 				Event:   ev.Name,

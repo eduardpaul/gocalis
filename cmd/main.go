@@ -213,9 +213,11 @@ func main() {
 		}
 		defer stopWatcher()
 
-		// Plugins work with the intercom engine and the event bus, so they
-		// start once the transports are listening.
-		if err := executor.StartPlugins(ctx, cfg.Plugins); err != nil {
+		// Plugins report on the event bus, so they start once the transports
+		// are listening. The nodes they bring are run like the configured
+		// ones, less what only a configured node has.
+		endpoints := runtime.NewEndpoints(cfg, eventBus, centralBrain, threadsPerModel)
+		if err := executor.StartPlugins(ctx, cfg.Plugins, endpoints.Add); err != nil {
 			log.Fatalf("Failed to start plugins: %v", err)
 		}
 

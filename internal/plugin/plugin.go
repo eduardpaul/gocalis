@@ -1,8 +1,9 @@
 // Package plugin lets optional parts of gocalis be compiled in and switched on
 // from config.yaml. A plugin is one entry of the "plugins" list: it has an id,
 // a type that selects the code, and settings of its own. While gocalis runs it
-// takes commands sent through the API (action "plugin") and reports with
-// events.
+// can add a node of its own, which tts, play, ask and intercom then reach like
+// any other; it takes commands sent through the API (action "plugin") and
+// reports with events.
 //
 // A plugin type lives in its own package under internal/plugins, registers
 // itself from init with Register, and is linked in by a blank import in
@@ -19,8 +20,8 @@ import (
 	"sort"
 	"sync"
 
+	"gocalis/internal/audionode"
 	"gocalis/internal/config"
-	"gocalis/internal/intercom"
 )
 
 // Plugin is one configured plugin while gocalis runs.
@@ -91,18 +92,21 @@ type Event struct {
 type Host struct {
 	// ID is the plugin's id from the configuration.
 	ID string
-	// Intercom is the call engine: a plugin brings an outside party into a
-	// call with a node as a remote participant.
-	Intercom *intercom.Engine
-	// HasNode tells whether a node with that id is registered right now.
-	HasNode func(nodeID string) bool
+	// AddNode makes audio a node of gocalis whose id is the plugin's: tts,
+	// play, ask and intercom reach it like a configured node, and what it
+	// captures goes to the asks and calls on it. An audio node that implements
+	// audionode.Callee is one somebody has to answer. The plugin owns the
+	// node's transport: gocalis calls neither Connect nor Close on it, and the
+	// plugin must have stopped delivering audio before it calls remove, which
+	// takes the node out again. It is nil when the plugin is built for Setup
+	// only.
+	AddNode func(audio audionode.AudioNode) (remove func(), err error)
 	// Emit reports an event. It does not block.
 	Emit func(Event)
 }
 
 // Factory builds a plugin of one type from its entry in the configuration.
-// It only checks the settings and prepares: the work starts in Run. A Host
-// without an intercom engine means the plugin is being built for Setup only.
+// It only checks the settings and prepares: the work starts in Run.
 type Factory func(cfg config.PluginConfig, host Host) (Plugin, error)
 
 var (
@@ -152,8 +156,9 @@ func New(cfg config.PluginConfig, host Host) (Plugin, error) {
 
 // Services is what the plugins of one gocalis process share.
 type Services struct {
-	Intercom *intercom.Engine
-	HasNode  func(nodeID string) bool
+	// AddNode registers a plugin's audio node under the plugin's id; typeName
+	// is the plugin type, shown as the node's.
+	AddNode func(id, typeName string, audio audionode.AudioNode) (remove func(), err error)
 	// Publish sends a plugin's event out on the transports.
 	Publish func(pluginID string, ev Event)
 }
@@ -187,11 +192,15 @@ type running struct {
 func Start(ctx context.Context, cfgs []config.PluginConfig, services Services) (*Manager, error) {
 	m := &Manager{plugins: make(map[string]*running)}
 	for _, cfg := range cfgs {
-		id := cfg.ID
+		id, typeName := cfg.ID, cfg.Type
 		p, err := New(cfg, Host{
-			Intercom: services.Intercom,
-			HasNode:  services.HasNode,
-			Emit:     func(ev Event) { services.Publish(id, ev) },
+			AddNode: func(audio audionode.AudioNode) (func(), error) {
+				if services.AddNode == nil {
+					return nil, fmt.Errorf("this gocalis takes no nodes from plugins")
+				}
+				return services.AddNode(id, typeName, audio)
+			},
+			Emit: func(ev Event) { services.Publish(id, ev) },
 		})
 		if err != nil {
 			return nil, err

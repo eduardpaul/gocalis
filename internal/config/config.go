@@ -505,6 +505,12 @@ func (c *Config) normalizeAndValidate() error {
 			return fmt.Errorf("plugin %s: id is used twice", p.ID)
 		}
 		pluginIDs[p.ID] = true
+		// A plugin can add a node, whose id is the plugin's.
+		for _, n := range c.Nodes {
+			if n.NodeID == p.ID {
+				return fmt.Errorf("plugin %s: id is also the id of a node", p.ID)
+			}
+		}
 		if p.Type == "" {
 			return fmt.Errorf("plugin %s: type is required", p.ID)
 		}

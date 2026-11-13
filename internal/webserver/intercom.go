@@ -171,7 +171,7 @@ func (s *Server) handleIntercomWS(w http.ResponseWriter, r *http.Request) {
 	// is made up for by the next).
 	events := make(chan intercom.Event, 32)
 	engine := s.executor.IntercomEngine
-	remote := engine.NewRemote("web", func(ev intercom.Event) {
+	remote := engine.NewRemote(func(ev intercom.Event) {
 		select {
 		case events <- ev:
 		default:
