@@ -41,6 +41,9 @@ module.exports = function(RED) {
             ? parseFloat(config.captureDelay)
             : undefined;
         this.priority = parseInt(config.priority) || 0;
+        // What to do when the node is in an intercom call: "" fails, "node"
+        // runs inside the call for the node alone, "all" for the whole call.
+        this.callMode = config.callMode || "";
 
         const node = this;
 
@@ -170,6 +173,7 @@ module.exports = function(RED) {
                 vad_timeout_seconds: vadTimeout,
                 post_speech_silence_seconds: Number.isFinite(postSpeechSilenceSeconds) ? postSpeechSilenceSeconds : undefined,
                 capture_delay_seconds: Number.isFinite(captureDelaySeconds) ? captureDelaySeconds : undefined,
+                call_mode: (msg.call_mode !== undefined ? String(msg.call_mode) : node.callMode) || undefined,
                 priority: msg.priority !== undefined ? parseInt(msg.priority) : node.priority
             };
 
@@ -183,6 +187,7 @@ module.exports = function(RED) {
                 msg.status = result.status;
                 msg.transcription = result.text;
                 msg.speaker = result.speaker;
+                msg.in_call = result.in_call === true;
                 msg.audio_wav_base64 = result.audio_wav_base64;
                 msg.recording = result.audio_wav_base64 || result.recording;
                 msg.node_id = result.node_id || resolvedNodeId;

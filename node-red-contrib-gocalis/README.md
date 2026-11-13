@@ -33,6 +33,7 @@ Stores connection settings for the Gocalis daemon.
 Plays synthesized Text-To-Speech (TTS) audio out loud through the system speaker.
 * **Node ID**: The physical satellite node to play the audio on (defaults to `"default"`). Can be overridden dynamically via `msg.node_id` or `msg.room`.
 * **TTS Text**: The message to synthesize (can also be passed dynamically in `msg.payload`).
+* **In a call**: What to do when the node is in an intercom call. By default the request fails (`"node is in an intercom call"`); it can instead be said inside the call, to that node alone or to everyone in it. Overridable via `msg.call_mode` (`"node"` / `"all"`).
 * **Output**: Sends a message when playback finishes, allowing you to sequence actions.
 
 ### 3. `gocalis ask`
@@ -41,6 +42,7 @@ An interactive prompt-and-capture node. Plays a TTS prompt, then records and tra
 * **Prompt Text**: Greeting spoken before listening (can also be passed dynamically in `msg.payload`).
 * **Barge-In**: If enabled, the user can interrupt the prompt by speaking immediately.
 * **Verify Speaker**: If enabled, runs biometric voice verification to check the speaker's identity.
+* **In a call**: By default an ask fails for a node in an intercom call. With this option (or `msg.call_mode = "node"`) it runs inside the call: the node is set aside from the conversation while it hears the prompt and answers, then put back. The result carries `msg.in_call`.
 * **Outputs**:
   * **Output 1 (Success)**: Emits if speech is successfully captured and verified.
     * `msg.transcription`: The transcribed text.
@@ -59,6 +61,7 @@ A real-time listener node that triggers when the background wakeword detection l
     * `msg.transcription`: Decoded voice command.
     * `msg.node_id`: Originating physical node ID.
     * `msg.speaker`: Verified speaker name.
+  * Both messages carry `msg.in_call`: `true` when the wake word was said while the node was in an intercom call (the server enables that per node with `kws.wake_in_call`). A flow can use it to treat "Alfred, hang up" as a command about the call: send `msg.payload = "stop"` (or `"leave"`) with the same `msg.node_id` to a `gocalis intercom` node.
 
 ### 5. `gocalis intercom` (Live Calls)
 Runs live intercom calls between nodes. A call is a conference: nodes (and intercom pages, `/intercom`) join and leave it while it runs, each one hears all the others, and a chime tells the call that someone joined or left. It ends when fewer than two participants remain, on its time limit, or when it is stopped. A node in a call is taken over: a `say`/`play`/`ask` already running on it is cut off (an ask ends with `"interrupted by an intercom call"`), and until it leaves the call every `say`/`ask`/`play` targeting it fails at once with `"node is in an intercom call"` instead of being queued (a broadcast to `all` skips it).

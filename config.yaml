@@ -105,6 +105,12 @@ nodes:
       threshold: 0.25
       auto_ask: true
       auto_ask_capture_delay_seconds: 1.5
+      # Keep the wake word armed while this node is in an intercom call: saying
+      # it sets the node aside from the call while the assistant listens, and
+      # the "wake" event carries in_call. Only for nodes whose microphone does
+      # not pick up their own speaker (hardware echo cancellation); otherwise
+      # anyone in the call can wake the assistant through that speaker.
+      # wake_in_call: true
       priority: 10
       wake_responses: []
       num_threads: 1

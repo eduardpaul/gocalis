@@ -33,6 +33,9 @@ module.exports = function(RED) {
         this.textType = config.textType || "str";
         this.bargeIn = !!config.bargeIn;
         this.priority = parseInt(config.priority) || 0;
+        // What to do when the node is in an intercom call: "" fails, "node"
+        // runs inside the call for the node alone, "all" for the whole call.
+        this.callMode = config.callMode || "";
 
         const node = this;
 
@@ -118,6 +121,7 @@ module.exports = function(RED) {
                 action: "tts",
                 node_id: resolvedNodeId,
                 text: textToSay,
+                call_mode: (msg.call_mode !== undefined ? String(msg.call_mode) : node.callMode) || undefined,
                 priority: msg.priority !== undefined ? parseInt(msg.priority) : node.priority
             };
 

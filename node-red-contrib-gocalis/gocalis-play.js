@@ -5,6 +5,9 @@ module.exports = function(RED) {
         this.nodeId = config.nodeId || "default";
         this.nodeIdType = config.nodeIdType || "str";
         this.priority = parseInt(config.priority) || 0;
+        // What to do when the node is in an intercom call: "" fails, "node"
+        // runs inside the call for the node alone, "all" for the whole call.
+        this.callMode = config.callMode || "";
 
         const node = this;
 
@@ -60,6 +63,7 @@ module.exports = function(RED) {
                 action: "play",
                 node_id: resolvedNodeId,
                 audio_wav_base64: audioBase64,
+                call_mode: (msg.call_mode !== undefined ? String(msg.call_mode) : node.callMode) || undefined,
                 priority: msg.priority !== undefined ? parseInt(msg.priority) : node.priority
             };
 

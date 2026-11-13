@@ -332,6 +332,35 @@ participant gets leaves its own microphone out. That holds for the node's
 `auto_ask_capture_delay_seconds` after the call too, while the device plays out
 its buffered tail.
 
+**The assistant in a call.** Both rules above have an opt-in exception, so that
+a call does not put a node out of the assistant's reach.
+
+- `call_mode` on a `tts`, `play` or `ask` request says what to do when the node
+  is in a call instead of failing. `"node"` runs it inside the call for that
+  node alone: a TTS or recording is mixed into what the node hears, and an ask
+  sets the node aside from the conversation (the others do not hear its
+  microphone and it does not hear them) while it plays its prompt and listens,
+  then puts it back. `"all"` (TTS and play) plays it for everyone in the call,
+  pages included. The option does nothing for a node that is not in a call, and
+  a broadcast to `all` nodes with it reaches the ones in a call individually.
+  An ask in a call has no barge-in and no voice challenge; its result carries
+  `in_call: true`.
+- `kws.wake_in_call: true` on a node keeps its wake word armed during a call.
+  Saying it starts the node's usual wake turn inside the call, as an ask with
+  `call_mode: "node"`: the node is set aside, hears the listening chime, says
+  its command, and is back in the call while the command is transcribed. The
+  `wake` event then carries `in_call: true`, so a flow can tell "Alfred, cuelga"
+  said in a call (and answer it with `intercom_stop` or `intercom_leave`) from
+  an ordinary command. The others still hear the wake word itself: the node is
+  set aside once it has been recognised.
+
+  Enable it only on a node whose microphone does not pick up its own speaker
+  (a speakerphone with hardware echo cancellation). On any other node, whoever
+  is in the call can say the wake word through that node's speaker. Setting the
+  node aside keeps them from dictating the command that follows, but a flow
+  should still check `in_call` (and `speaker`, with speaker verification)
+  before it does anything a visitor at the door must not trigger.
+
 ### Local multi-device audio simulator
 
 [tools/simulator](tools/simulator/README.md) provides virtual RTSP microphones and

@@ -24,14 +24,19 @@ module.exports = function(RED) {
                     const isAutoAsk = message.auto_ask === true;
                     node.status({ fill: "green", shape: "dot", text: `${msgNodeId}: wake heard` });
 
+                    // in_call: the wake word was said while the node was in an
+                    // intercom call (kws.wake_in_call on the server).
+                    const inCall = message.in_call === true;
                     const wakeMsg = {
                         topic: "gocalis/wake",
                         node_id: msgNodeId,
+                        in_call: inCall,
                         payload: {
                             event: "wake_detected",
                             node_id: msgNodeId,
                             keyword: message.keyword,
                             auto_ask: isAutoAsk,
+                            in_call: inCall,
                             timestamp: message.timestamp
                         }
                     };
@@ -44,9 +49,11 @@ module.exports = function(RED) {
                             transcription: message.text,
                             speaker: message.speaker,
                             node_id: msgNodeId,
+                            in_call: inCall,
                             payload: {
                                 event: "command_received",
                                 node_id: msgNodeId,
+                                in_call: inCall,
                                 status: message.status,
                                 transcription: message.text,
                                 speaker: message.speaker,

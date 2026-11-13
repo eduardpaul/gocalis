@@ -20,6 +20,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
   const [nodeId, setNodeId] = useState('all')
   const [intercomNodes, setIntercomNodes] = useState([])
   const [intercomDuration, setIntercomDuration] = useState(60)
+  const [callMode, setCallMode] = useState('')
   const [text, setText] = useState('')
   const [filename, setFilename] = useState('')
   const [audioFile, setAudioFile] = useState('')
@@ -62,7 +63,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     try {
       let result
       if (activeTab === 'say') {
-        result = await onExecute('tts', { node_id: nodeId, text, priority: Number(priority) })
+        result = await onExecute('tts', { node_id: nodeId, text, priority: Number(priority), call_mode: callMode || undefined })
       } else if (activeTab === 'tts') {
         result = await onSynthesize({ text, filename, priority: Number(priority) })
       } else if (activeTab === 'ask') {
@@ -72,6 +73,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           require_speaker_id: requireSpeakerId,
           vad_timeout_seconds: Number(vadTimeout),
           priority: Number(priority),
+          call_mode: callMode === 'node' ? 'node' : undefined,
         })
       } else if (activeTab === 'intercom') {
         if (intercomNodes.length < 2) {
@@ -306,6 +308,17 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
               />
             </label>
           </>
+        )}
+
+        {(activeTab === 'say' || activeTab === 'ask') && (
+          <label>
+            If the node is in an intercom call <span className="hint">(the call owns its speaker)</span>
+            <select value={callMode} onChange={(e) => setCallMode(e.target.value)}>
+              <option value="">Fail</option>
+              <option value="node">Inside the call, for the node alone</option>
+              {activeTab === 'say' && <option value="all">Inside the call, for everyone</option>}
+            </select>
+          </label>
         )}
 
         {activeTab !== 'intercom' && (
