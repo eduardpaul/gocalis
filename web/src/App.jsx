@@ -113,6 +113,13 @@ function App() {
   const synthesize = (payload) => post('synthesize', payload)
   const ask = (payload) => post('ask', payload)
   const reloadSpeakers = () => post('reload-speakers')
+  const loadPlugins = async () => {
+    const res = await fetch(`${API_URL}/plugins`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) throw new Error(await res.text())
+    return res.json()
+  }
 
 
   return (
@@ -150,7 +157,7 @@ function App() {
         </section>
 
         <section className="dashboard-section">
-          <CommandCenter nodes={nodes} onExecute={execute} onSynthesize={synthesize} onAsk={ask} onReloadSpeakers={reloadSpeakers} />
+          <CommandCenter nodes={nodes} onExecute={execute} onSynthesize={synthesize} onAsk={ask} onReloadSpeakers={reloadSpeakers} onLoadPlugins={loadPlugins} />
         </section>
       </main>
 

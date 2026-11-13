@@ -75,7 +75,18 @@ Runs live intercom calls between nodes. A call is a conference: nodes (and inter
   * **Output 3 (Call ended)**: Emits when the call ends for any reason. `msg.reason` is `timeout`, `stopped`, `left`, `shutdown`, or `error`; `msg.duration_seconds` is how long it lasted.
   * Outputs 2 and 3 also fire for matching calls started or changed elsewhere (intercom page, dashboard, timeout).
 
-### 6. `gocalis stt` (Speech-to-Text on Files)
+### 6. `gocalis plugin` (Plugin Commands and Events)
+Sends commands to a Gocalis plugin (an entry of the `plugins` list in the server's `config.yaml`) and passes on the events it reports. The commands, their args and the events belong to each plugin type.
+* **Plugin**: The plugin's `id` on the server, e.g. `telegram`.
+* **Command**: The command any incoming message sends, e.g. `call`. Overridable via `msg.command`, or with a one-word `msg.payload` (`"hangup"`).
+* **Node**: The Gocalis node the command is about. Overridable via `msg.node_id`.
+* **Args**: A JSON object with the command's parameters. `msg.args` goes on top of it.
+* **Outputs**:
+  * **Output 1 (Command sent)**: The request as it went to Gocalis.
+  * **Output 2 (Plugin events)**: Everything the plugin reports, whoever sent the command. `msg.event` is the event name, `msg.node_id` the node it is about, `msg.payload` the whole event (`status`, `reason`, `message`, and the plugin's own fields in `data`). A command the plugin refused arrives as the event `error`.
+* **Answering the door from Telegram** (plugin type `telegram_call`): wire the doorbell press to a `gocalis plugin` node with Plugin `telegram`, Command `call` and Node the doorbell. The server opens the group's voice chat and waits; the intercom call starts when somebody from the group comes in. Output 2 then gives `telegram_call_waiting`, `telegram_call_answered` (`payload.data.answered` has the names) and `telegram_call_ended` (`payload.reason`: `unanswered`, `hung_up`, `stopped`, `timeout`, `closed`, `left`, `error`). Send `"hangup"` to end it. Args: `ring_seconds`, `duration_seconds`, `chat`, `title`.
+
+### 7. `gocalis stt` (Speech-to-Text on Files)
 A stateless file transcription node.
 * **Audio Source**: Can be a file path string or a raw Buffer passed in `msg.payload` containing the audio file.
 * **Verify Speaker**: If enabled, runs biometric voice verification to check the speaker's identity on the file.
@@ -84,7 +95,7 @@ A stateless file transcription node.
   * `msg.transcription`: The transcribed text.
   * `msg.speaker`: The identified speaker (if verification was enabled).
 
-### 7. `gocalis tts` (Text-to-Speech to Files)
+### 8. `gocalis tts` (Text-to-Speech to Files)
 A stateless speech synthesis node.
 * **TTS Text**: The text to synthesize (can also be passed dynamically in `msg.payload`).
 * **Outputs**:

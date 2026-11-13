@@ -1,0 +1,135 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-plugin',{
+        category: 'Gocalis Voice',
+        color: '#a78bfa',
+        defaults: {
+            name: { value: "" },
+            server: { value: "", type: "gocalis-config", required: true },
+            plugin: { value: "telegram", required: true },
+            command: { value: "call" },
+            nodeId: { value: "" },
+            args: { value: "", validate: function(v) {
+                if (v === undefined || String(v).trim() === "") { return true; }
+                try { const o = JSON.parse(v); return o !== null && typeof o === "object" && !Array.isArray(o); } catch (e) { return false; }
+            } }
+        },
+        inputs: 1,
+        outputs: 2,
+        outputLabels: ["command sent", "plugin events"],
+        icon: "font-awesome/fa-plug",
+        label: function() {
+            return this.name || (this.plugin ? `${this.plugin}: ${this.command || "…"}` : "Gocalis Plugin");
+        },
+        paletteLabel: "gocalis plugin",
+        oneditprepare: function() {
+            $("#node-input-args").typedInput({ type: "json", types: ["json"] });
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-plugin">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-server"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+    <div class="form-row">
+        <label for="node-input-plugin"><i class="fa fa-plug"></i> Plugin</label>
+        <input type="text" id="node-input-plugin" placeholder="plugin id from config.yaml, e.g. telegram">
+    </div>
+    <div class="form-row">
+        <label for="node-input-command"><i class="fa fa-terminal"></i> Command</label>
+        <input type="text" id="node-input-command" placeholder="e.g. call">
+    </div>
+    <div class="form-row">
+        <label for="node-input-nodeId"><i class="fa fa-microphone"></i> Node</label>
+        <input type="text" id="node-input-nodeId" placeholder="e.g. front_door (optional)">
+    </div>
+    <div class="form-row">
+        <label for="node-input-args"><i class="fa fa-list"></i> Args</label>
+        <input type="text" id="node-input-args" placeholder='e.g. {"ring_seconds": 60}' style="width: 70%;">
+    </div>
+</script>
+
+<script type="text/html" data-help-name="gocalis-plugin">
+    <p>Sends commands to a Gocalis <b>plugin</b> and passes on the events it
+    reports. Plugins are optional parts of Gocalis switched on in its
+    <code>config.yaml</code> (the <code>plugins</code> list); <b>Plugin</b> is
+    the <code>id</code> one has there. The commands, their args and the events
+    belong to each plugin type.</p>
+
+    <h3>Input</h3>
+    <p>Any message sends the configured <b>Command</b>.</p>
+    <dl class="message-properties">
+        <dt class="optional">command <span class="property-type">string</span></dt>
+        <dd>The command to send instead of the configured one. A
+        <code>msg.payload</code> that is a single word
+        (<code>"hangup"</code>) is taken as the command too.</dd>
+        <dt class="optional">node_id <span class="property-type">string</span></dt>
+        <dd>The Gocalis node the command is about, instead of the configured
+        <b>Node</b>.</dd>
+        <dt class="optional">args <span class="property-type">object</span></dt>
+        <dd>Parameters of the command, on top of the configured <b>Args</b>.</dd>
+    </dl>
+
+    <h3>Outputs</h3>
+    <ol class="node-ports">
+        <li>Command sent
+            <dl class="message-properties">
+                <dt>payload <span class="property-type">object</span></dt>
+                <dd>The request as it went to Gocalis.</dd>
+            </dl>
+        </li>
+        <li>Plugin events: everything this plugin reports, whoever asked
+            <dl class="message-properties">
+                <dt>event <span class="property-type">string</span></dt>
+                <dd>The event name. <code>"error"</code> is a command the
+                plugin refused; <code>payload.message</code> says why.</dd>
+                <dt>node_id <span class="property-type">string</span></dt>
+                <dd>The node the event is about.</dd>
+                <dt>payload <span class="property-type">object</span></dt>
+                <dd>The whole event: <code>status</code>, <code>reason</code>,
+                <code>message</code>, and the plugin's own fields in
+                <code>data</code>.</dd>
+            </dl>
+        </li>
+    </ol>
+
+    <h3>The telegram_call plugin</h3>
+    <p>Brings a Telegram group's voice chat into an intercom call with a node:
+    the doorbell rings, the voice chat opens, and whoever comes into it from
+    the group talks to the door.</p>
+    <p><b>call</b> (with a <b>Node</b>) opens the group's voice chat and waits
+    in it. The intercom call starts when somebody from the group comes in.
+    Args, all optional: <code>ring_seconds</code> (how long to wait),
+    <code>duration_seconds</code> (how long the intercom call lasts at most),
+    <code>chat</code> and <code>title</code> (instead of the configured group
+    and voice chat name). Sent again for the same node while waiting, the wait
+    starts over.</p>
+    <p><b>hangup</b> ends it at whatever point it is.</p>
+    <p>Events:</p>
+    <ul>
+        <li><code>telegram_call_waiting</code>: the voice chat is open and
+        nobody is there yet. <code>data.chat</code>,
+        <code>data.ring_seconds</code>.</li>
+        <li><code>telegram_call_answered</code>: somebody came in and the
+        intercom call started. <code>data.answered</code> has their names,
+        <code>data.remote_id</code> is the voice chat's id in the intercom
+        call (as in <code>remote_ids</code> of the intercom events).</li>
+        <li><code>telegram_call_ended</code>: it is over.
+        <code>payload.reason</code> is <code>unanswered</code> (nobody came in
+        time), <code>hung_up</code> (everybody on Telegram left),
+        <code>stopped</code> (hangup, or the intercom call was stopped),
+        <code>timeout</code> (the intercom call reached its limit),
+        <code>closed</code> (the voice chat was closed from Telegram),
+        <code>left</code> (the voice chat was taken out of the intercom call)
+        or <code>error</code> (see <code>payload.message</code>).
+        <code>data.answered</code> tells whether anybody ever came in.</li>
+    </ul>
+    <p>The regular intercom events (<code>intercom_started</code>,
+    <code>intercom_ended</code>...) are reported as for any call; a
+    <b>gocalis intercom</b> node sees them.</p>
+</script>

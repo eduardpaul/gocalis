@@ -10,6 +10,7 @@
       "gocalis-play": "gocalis-play.js",
       "gocalis-ask": "gocalis-ask.js",
       "gocalis-intercom": "gocalis-intercom.js",
+      "gocalis-plugin": "gocalis-plugin.js",
       "gocalis-wake-trigger": "gocalis-wake-trigger.js",
       "gocalis-stt": "gocalis-stt.js",
       "gocalis-tts": "gocalis-tts.js"

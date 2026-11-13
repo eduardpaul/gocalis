@@ -6,21 +6,28 @@ import { useState } from 'react'
 //  - ask        -> POST /api/ask                      (prompt -> listen -> ASR, returns text)
 //  - asr        -> POST /api/execute {action:'asr'}
 //  - speaker_id -> POST /api/execute {action:'speaker_id'}
+//  - plugin     -> POST /api/execute {action:'plugin'} (a command for a plugin from GET /api/plugins)
 const TABS = [
   { id: 'say', label: 'Say', hint: 'Speak text on a node' },
   { id: 'tts', label: 'TTS', hint: 'Render text to a WAV file (no playback)' },
   { id: 'ask', label: 'Ask', hint: 'Speak a prompt, listen, and transcribe the reply' },
   { id: 'intercom', label: 'Intercom', hint: 'Put nodes in a live call together' },
+  { id: 'plugin', label: 'Plugin', hint: 'Send a command to a plugin' },
   { id: 'asr', label: 'ASR', hint: 'Transcribe an audio file' },
   { id: 'speaker_id', label: 'Speaker ID', hint: 'Identify the speaker in an audio file' },
 ]
 
-function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers }) {
+function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers, onLoadPlugins }) {
   const [activeTab, setActiveTab] = useState('say')
   const [nodeId, setNodeId] = useState('all')
   const [intercomNodes, setIntercomNodes] = useState([])
   const [intercomDuration, setIntercomDuration] = useState(60)
   const [callMode, setCallMode] = useState('')
+  const [plugins, setPlugins] = useState([])
+  const [pluginId, setPluginId] = useState('')
+  const [pluginCommand, setPluginCommand] = useState('call')
+  const [pluginNode, setPluginNode] = useState('')
+  const [pluginArgs, setPluginArgs] = useState('')
   const [text, setText] = useState('')
   const [filename, setFilename] = useState('')
   const [audioFile, setAudioFile] = useState('')
@@ -44,8 +51,22 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     if (id === 'intercom' && intercomNodes.length < 2) {
       setIntercomNodes(singleNodeOptions.slice(0, 2).map((o) => o.value))
     }
+    if (id === 'plugin') {
+      refreshPlugins()
+    }
     setActiveTab(id)
     setLastResult(null)
+  }
+
+  // refreshPlugins reads the configured plugins and what each is doing.
+  const refreshPlugins = async () => {
+    try {
+      const list = await onLoadPlugins()
+      setPlugins(list)
+      setPluginId((current) => (list.some((p) => p.id === current) ? current : list[0]?.id ?? ''))
+    } catch (err) {
+      setLastResult({ status: 'error', error_message: err.message })
+    }
   }
 
   // toggleIntercomNode adds or removes a node from the participant set.
@@ -83,6 +104,25 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           node_ids: intercomNodes,
           duration_seconds: Number(intercomDuration),
         })
+      } else if (activeTab === 'plugin') {
+        if (!pluginId) {
+          throw new Error('No plugin is configured on the server')
+        }
+        let args
+        if (pluginArgs.trim() !== '') {
+          try {
+            args = JSON.parse(pluginArgs)
+          } catch (err) {
+            throw new Error(`Args are not valid JSON: ${err.message}`)
+          }
+        }
+        result = await onExecute('plugin', {
+          plugin: pluginId,
+          command: pluginCommand.trim(),
+          node_id: pluginNode || undefined,
+          args,
+        })
+        refreshPlugins()
       } else {
         // asr / speaker_id
         result = await onExecute(activeTab, {
@@ -284,6 +324,71 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           </>
         )}
 
+        {activeTab === 'plugin' && (
+          <>
+            <label>
+              Plugin
+              <select value={pluginId} onChange={(e) => setPluginId(e.target.value)}>
+                {plugins.length === 0 && <option value="">No plugins configured</option>}
+                {plugins.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.id} ({p.type})
+                  </option>
+                ))}
+              </select>
+            </label>
+            {plugins
+              .filter((p) => p.id === pluginId)
+              .map((p) => (
+                <p key={p.id} className="hint">
+                  {p.ready ? 'Ready' : 'Not ready'}: {p.detail}
+                </p>
+              ))}
+            <div className="form-row">
+              <label>
+                Command
+                <input
+                  type="text"
+                  value={pluginCommand}
+                  onChange={(e) => setPluginCommand(e.target.value)}
+                  placeholder="call"
+                  list="plugin-commands"
+                  required
+                />
+                <datalist id="plugin-commands">
+                  <option value="call" />
+                  <option value="hangup" />
+                </datalist>
+              </label>
+              <label>
+                Node
+                <select value={pluginNode} onChange={(e) => setPluginNode(e.target.value)}>
+                  <option value="">(none)</option>
+                  {singleNodeOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label>
+              Args <span className="hint">(JSON object, optional)</span>
+              <input
+                type="text"
+                value={pluginArgs}
+                onChange={(e) => setPluginArgs(e.target.value)}
+                placeholder='{"ring_seconds": 60}'
+              />
+            </label>
+            <p className="hint">
+              A plugin reports with events: watch the event feed. For telegram_call, &quot;call&quot;
+              with a node opens the group&apos;s voice chat and waits; the intercom call starts when
+              somebody from the group comes in, and &quot;hangup&quot; ends it.
+            </p>
+          </>
+        )}
+
         {(activeTab === 'asr' || activeTab === 'speaker_id') && (
           <>
             <label>
@@ -321,7 +426,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           </label>
         )}
 
-        {activeTab !== 'intercom' && (
+        {activeTab !== 'intercom' && activeTab !== 'plugin' && (
           <div className="form-row">
             <label>
               Priority
@@ -338,7 +443,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
 
         <div className="command-actions">
           <button type="submit" className="btn" disabled={loading}>
-            {loading ? 'Sending...' : activeTab === 'intercom' ? 'Connect' : `Run ${activeMeta?.label ?? activeTab}`}
+            {loading ? 'Sending...' : activeTab === 'intercom' ? 'Connect' : activeTab === 'plugin' ? 'Send' : `Run ${activeMeta?.label ?? activeTab}`}
           </button>
           {activeTab === 'intercom' ? (
             <>

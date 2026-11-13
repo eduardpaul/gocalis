@@ -33,7 +33,7 @@ gocalis/
 │       └── client.go     # WebRTC Client package (Pion client, websocket signaling, PCMU encoding)
 ├── config.yaml           # Global configurations and device (node) overrides
 ├── docker-compose.yaml   # Docker environment configuration (maps /dev/snd, runs host network)
-├── Dockerfile            # Container image builder (installs ALSA, bzip2, Go 1.24)
+├── Dockerfile            # Container image builder (installs ALSA, bzip2, Go 1.26)
 ├── go.mod                # Go module descriptor
 ├── go.sum                # Go dependency lockfile
 ├── README.md             # Project documentation (this file)
@@ -365,6 +365,101 @@ a call does not put a node out of the assistant's reach.
   node aside keeps them from dictating the command that follows, but a flow
   should still check `in_call` (and `speaker`, with speaker verification)
   before it does anything a visitor at the door must not trigger.
+
+### Plugins
+
+A plugin is an optional part of gocalis, compiled in and switched on in
+`config.yaml`:
+
+```yaml
+plugins:
+  - id: telegram          # how requests address it
+    type: telegram_call   # the plugin code
+    settings: {...}       # belong to the type
+```
+
+It takes commands through the same API as everything else, and reports with
+events that carry its id:
+
+```json
+{"action": "plugin", "plugin": "telegram", "command": "call", "node_id": "front_door", "args": {"ring_seconds": 60}}
+```
+
+```json
+{"event": "telegram_call_waiting", "plugin": "telegram", "node_id": "front_door", "data": {"chat": "Casa", "ring_seconds": 60, "started_voice_chat": true}}
+```
+
+`node_id` is the node the command is about, when it is about one; `args` is an
+object with the command's own parameters, and an arg the plugin does not know
+is refused. A command the plugin refuses is answered with an `error` event
+that has `plugin` set. `GET /api/plugins` lists the plugins and whether each
+can take commands right now (`ready`, `detail`); the dashboard shows the same.
+A plugin that needs a login has a setup step: `gocalis -config config.yaml
+-plugin-setup <id>`.
+
+A plugin type is a package under `internal/plugins` that registers itself with
+`plugin.Register` and is linked in from `cmd/main.go`. It gets the intercom
+engine (to bring an outside party into a call as a remote participant) and a
+way to emit events; see `internal/plugin`.
+
+#### `telegram_call`: answer the door from a Telegram group
+
+When the doorbell rings, a flow sends `call` for the doorbell node. The plugin
+opens the voice chat of a Telegram group and waits in it. The moment somebody
+from the group comes in, the intercom call starts: the doorbell is taken over,
+the chime plays, and the two sides talk. Until then the doorbell is left
+alone. In the intercom call the voice chat is one participant, like an
+intercom page, so pages and other nodes can be in the same call.
+
+```yaml
+plugins:
+  - id: telegram
+    type: telegram_call
+    settings:
+      api_id: 123456
+      api_hash: "0123456789abcdef0123456789abcdef"
+      phone: "+34600000000"
+      session_file: "data/telegram.session"
+      chat: "Casa"
+      title: "Timbre"
+      ring_seconds: 60
+```
+
+- **The account.** Only a Telegram *user* can be in a voice chat; a bot
+  cannot. Give gocalis an account of its own: an account is in a voice chat
+  once, so the one you answer with cannot also be gocalis. `api_id` and
+  `api_hash` come from <https://my.telegram.org> ("API development tools").
+- **The login** is done once: `gocalis -config config.yaml -plugin-setup
+  telegram` asks for the code Telegram sends (and the two-step password, if
+  the account has one) and writes `session_file`. In Docker, run it in the
+  running container (`docker exec -it gocalis gocalis -config /app/config.yaml
+  -plugin-setup telegram`); gocalis picks the login up without a restart.
+  Whoever has that file has the account: keep it on a volume that outlives the
+  container, and out of repositories and shared backups.
+- **The group** (`chat`) is its `@username`, its numeric id, or its exact
+  title. The account must be a member, and to start the voice chat an admin
+  that can manage video chats. Use a private group: everybody who can come
+  into its voice chat can talk at your door.
+
+| Command | Meaning |
+|---|---|
+| `call` | Opens the group's voice chat for `node_id` and waits in it for somebody to come in. Args, all optional: `ring_seconds` (how long to wait; default from the settings), `duration_seconds` (how long the intercom call lasts at most once it starts; default `intercom.default_timeout_seconds`), `chat` and `title` (instead of the settings). Sent again for the same node while waiting, the wait starts over. One call at a time: for another node it is refused as busy. |
+| `hangup` | Ends it at whatever point it is. `node_id` is optional. |
+
+| Event | Meaning |
+|---|---|
+| `telegram_call_waiting` | The voice chat is open and nobody is there yet. `data`: `chat`, `ring_seconds`, `started_voice_chat`. |
+| `telegram_call_answered` | Somebody came in and the intercom call started (`intercom_started`, or `intercom_joined` when the node already was in a call, is reported too). `data`: `chat`, `answered` (their names), `remote_id` (the voice chat's id in the intercom call, e.g. `telegram-3`). |
+| `telegram_call_ended` | It is over. `reason`: `unanswered` (nobody came in time), `hung_up` (everybody on Telegram left), `stopped` (`hangup`, or the intercom call was stopped), `timeout` (the intercom call reached its limit), `closed` (the voice chat was closed from Telegram), `left` (the voice chat was taken out of an intercom call that goes on), `shutdown`, or `error` with `message`. `data`: `chat`, `answered` (whether anybody came in), `duration_seconds`. |
+
+At the end the plugin leaves the voice chat, and closes it if it was the one
+that started it. A voice chat that was already going is used as it is: with
+people in it the call is answered at once, and afterwards it is left open.
+
+Telegram does not ring anybody for a voice chat: members see it at the top of
+the group, with a notification according to their settings for that group. To
+make it ring, have the flow also send a message to the group when it sends
+`call`.
 
 ### Local multi-device audio simulator
 
