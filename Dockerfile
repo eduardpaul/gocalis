@@ -5,7 +5,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM golang:1.24.13-bookworm AS go-base
+FROM golang:1.26.5-bookworm AS go-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
     alsa-utils libopus-dev libopusfile-dev libspeexdsp-dev pkg-config bzip2 \
     && rm -rf /var/lib/apt/lists/*

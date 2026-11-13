@@ -44,3 +44,5 @@ models/*
 *.tar.gz
 *.zip
 
+# Telegram login of the telegram_call plugin: whoever has it has the account.
+*.session

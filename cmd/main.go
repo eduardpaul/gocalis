@@ -22,6 +22,7 @@ import (
 	"gocalis/internal/config"
 	"gocalis/internal/mqtt"
 	"gocalis/internal/plugin"
+	_ "gocalis/internal/plugins/telegramcall" // the "telegram_call" plugin type
 	"gocalis/internal/protocol"
 	"gocalis/internal/runtime"
 	"gocalis/internal/server"
