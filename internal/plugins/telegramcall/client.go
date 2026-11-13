@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
@@ -188,14 +189,38 @@ func (c *client) current(ctx context.Context, group *chat) (*voiceChat, error) {
 	return &voiceChat{ID: input.ID, AccessHash: input.AccessHash, Chat: group.title}, nil
 }
 
+// A join the media server refuses for no reason of ours is tried this many
+// times in all, a little longer apart each time.
+const (
+	joinAttempts   = 5
+	joinRetryDelay = 500 * time.Millisecond
+)
+
 // join implements telegramAPI.
 func (c *client) join(ctx context.Context, vc voiceChat, payload string) (string, error) {
-	result, err := c.api.PhoneJoinGroupCall(ctx, &tg.PhoneJoinGroupCallRequest{
-		Call:         vc.input(),
-		JoinAs:       &tg.InputPeerSelf{},
-		VideoStopped: true, // audio only
-		Params:       tg.DataJSON{Data: payload},
-	})
+	var (
+		result tg.UpdatesClass
+		err    error
+	)
+	for attempt := 1; ; attempt++ {
+		result, err = c.api.PhoneJoinGroupCall(ctx, &tg.PhoneJoinGroupCallRequest{
+			Call:         vc.input(),
+			JoinAs:       &tg.InputPeerSelf{},
+			VideoStopped: true, // audio only
+			Params:       tg.DataJSON{Data: payload},
+		})
+		// A voice chat started a moment ago can refuse its first participant
+		// with this (a 500); the same request is taken shortly after.
+		if !tgerr.Is(err, "GROUPCALL_ADD_PARTICIPANTS_FAILED") || attempt == joinAttempts {
+			break
+		}
+		log.Printf("[telegram_call] The voice chat of %q is not taking participants yet, trying again (%d/%d)\n", vc.Chat, attempt, joinAttempts-1)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Duration(attempt) * joinRetryDelay):
+		}
+	}
 	if err != nil {
 		return "", closedOr(err)
 	}
