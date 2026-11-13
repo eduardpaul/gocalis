@@ -87,6 +87,7 @@ button {
 .badge.processing { background: #fef3c7; color: #92400e; }
 .badge.challenging { background: #fee2e2; color: #991b1b; }
 .badge.ringing { background: #ede9fe; color: #5b21b6; }
+.badge.intercom { background: #ccfbf1; color: #115e59; }
 
 @media (prefers-color-scheme: dark) {
   .badge.idle { background: #374151; color: #d1d5db; }
@@ -95,6 +96,7 @@ button {
   .badge.processing { background: #78350f; color: #fde68a; }
   .badge.challenging { background: #7f1d1d; color: #fecaca; }
   .badge.ringing { background: #4c1d95; color: #ddd6fe; }
+  .badge.intercom { background: #134e4a; color: #99f6e4; }
 }
 
 input, textarea, select {

@@ -251,6 +251,10 @@ func main() {
 		// Cancel admissions and active work, then join every user of native models.
 		// HTTP shutdown has a deadline; model ownership never does.
 		cancel()
+		// End the intercom calls now, while their nodes and the transports that
+		// announce it are still there, instead of letting them fail one by one as
+		// the nodes close under them.
+		executor.IntercomEngine.Shutdown()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := wsServer.Shutdown(shutdownCtx); err != nil {

@@ -208,3 +208,24 @@ func TestAPhoneNobodyAnswersLeavesARunningCallAlone(t *testing.T) {
 	rig.never(t, "intercom_joined", "P")
 	rig.waitForState(t, "A", node.StateIntercom)
 }
+
+// A call's time only starts with the answer: whoever joins while the phone
+// rings and asks for a longer call must still get it then.
+func TestAJoinWhileThePhoneRingsKeepsItsDuration(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{})
+	phone, _ := rig.addPhone(t, 0)
+
+	if err := rig.engine.Connect([]string{"A", "P"}, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	rig.waitForEvent(t, "intercom_ringing", "")
+	if err := rig.engine.ConnectRemote(rig.engine.NewRemote(nil), "A", false, 5*time.Minute); err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+
+	phone.PickUp()
+	started := rig.waitForEvent(t, "intercom_started", "")
+	if started.RemainingSeconds < 200 {
+		t.Fatalf("the call starts with %.0fs left, want the 300s the page asked for", started.RemainingSeconds)
+	}
+}

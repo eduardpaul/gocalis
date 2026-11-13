@@ -315,14 +315,16 @@ function closeMic(s) {
 }
 
 // render sets the two buttons for where the page is: out of a call they join it
-// (to talk, or to listen); in a call they hang up and work the microphone.
+// (to talk, or to listen); in a call they hang up and work the microphone. On
+// its way into a call (connecting, or waiting for somebody to answer) the page
+// can already hang up.
 function render() {
   const talk = $("talk"), mic = $("mic");
   const live = !!(session && session.me);
   const none = !config || !$("node").value;
-  talk.textContent = live ? "Colgar" : "Hablar";
-  talk.classList.toggle("live", live);
-  talk.disabled = none || (!live && (busy || !!session));
+  talk.textContent = session ? "Colgar" : "Hablar";
+  talk.classList.toggle("live", !!session);
+  talk.disabled = none || (!session && busy);
   mic.textContent = !live ? "Escuchar" : (session.mic ? "Cerrar micro" : "Abrir micro");
   mic.classList.toggle("open", live && !!session.mic);
   mic.disabled = none || busy || (!live && !!session);
@@ -378,10 +380,10 @@ function leave(text) {
   clearInterval(s.timer);
   closeMic(s);
   s.ctx.close();
-  if (s.ws.readyState === WebSocket.OPEN) {
-    s.ws.send(JSON.stringify({ action: "leave" }));
-    s.ws.close();
-  }
+  // A socket that is still connecting is closed too, or the page would enter
+  // the call after having left it.
+  if (s.ws.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify({ action: "leave" }));
+  if (s.ws.readyState <= WebSocket.OPEN) s.ws.close();
   $("who").textContent = "";
   render();
   setStatus(text || "Has salido de la llamada.");

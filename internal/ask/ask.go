@@ -144,19 +144,8 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 	defer handle.Node.SetState(node.StateIdle)
 	handle.Node.SetState(node.StateProcessing)
 
-	// Each turn owns an isolated Session registered on the brain so the audio
-	// ingestion path fans captured speech (and barge-in) into it. A unique ID lets
-	// concurrent turns coexist on the same node even if they share a context ID.
-	sessID := cfg.ContextID
-	if sessID == "" {
-		sessID = "ask"
-	}
-	sess := session.New(fmt.Sprintf("%s-%d", sessID, time.Now().UnixNano()), cfg.NodeID)
-	e.Brain.Sessions().Add(sess)
-	defer func() {
-		sess.ToDone()
-		e.Brain.Sessions().Remove(sess)
-	}()
+	sess, closeSession := e.openSession(cfg)
+	defer closeSession()
 
 	// Phase 1: Speak the prompt, allowing barge-in to cancel playback.
 	barged := false
@@ -266,16 +255,8 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 
 	timings["capture_open_offset"] = time.Since(startedAt)
 	captureAt := time.Now()
-	timeout := time.Duration(cfg.VADTimeoutSeconds * float64(time.Second))
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-
-	postSpeechSilence := cfg.PostSpeechSilenceSeconds
-	if postSpeechSilence <= 0 {
-		postSpeechSilence = handle.Config.GetPostSpeechSilenceSeconds(1.5)
-	}
-	waitForEndpoint(ctx, sess, timeout, time.Duration(postSpeechSilence*float64(time.Second)))
+	timeout, postSpeechSilence := listenWindow(cfg, handle)
+	waitForEndpoint(ctx, sess, timeout, postSpeechSilence)
 
 	captured := sess.StopCapture()
 	timings["capture"] = time.Since(captureAt)
@@ -387,7 +368,7 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 			sess.StartCapture()
 			handle.Node.SetState(node.StateListening)
 
-			waitForEndpoint(ctx, sess, timeout, time.Duration(postSpeechSilence*float64(time.Second)))
+			waitForEndpoint(ctx, sess, timeout, postSpeechSilence)
 
 			secondaryCaptured := sess.StopCapture()
 			if ctx.Err() != nil {
@@ -446,6 +427,38 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 	}
 }
 
+// openSession registers the turn's own Session on the brain, so the audio
+// ingestion path fans captured speech (and barge-in) into it; the returned func
+// ends it. A unique ID lets concurrent turns coexist on the same node even if
+// they share a context ID.
+func (e *Engine) openSession(cfg Config) (*session.Session, func()) {
+	sessID := cfg.ContextID
+	if sessID == "" {
+		sessID = "ask"
+	}
+	sess := session.New(fmt.Sprintf("%s-%d", sessID, time.Now().UnixNano()), cfg.NodeID)
+	e.Brain.Sessions().Add(sess)
+	return sess, func() {
+		sess.ToDone()
+		e.Brain.Sessions().Remove(sess)
+	}
+}
+
+// listenWindow resolves how long a turn waits for speech to start (10s unless
+// the request says) and how much silence after it ends the turn (the request's,
+// or the node's).
+func listenWindow(cfg Config, handle *brain.NodeHandle) (timeout, postSpeechSilence time.Duration) {
+	timeout = time.Duration(cfg.VADTimeoutSeconds * float64(time.Second))
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	silence := cfg.PostSpeechSilenceSeconds
+	if silence <= 0 {
+		silence = handle.Config.GetPostSpeechSilenceSeconds(1.5)
+	}
+	return timeout, time.Duration(silence * float64(time.Second))
+}
+
 // transcribe keeps the captured speech for diagnostics and runs ASR on it.
 func (e *Engine) transcribe(ctx context.Context, cfg Config, handle *brain.NodeHandle, captured []float32) (string, error) {
 	if err := handle.Recorder.Save(captured); err != nil {
@@ -494,16 +507,8 @@ func (e *Engine) runInCall(ctx context.Context, cfg Config, line brain.CallLine)
 		return result("error", err.Error())
 	}
 
-	sessID := cfg.ContextID
-	if sessID == "" {
-		sessID = "ask"
-	}
-	sess := session.New(fmt.Sprintf("%s-%d", sessID, time.Now().UnixNano()), cfg.NodeID)
-	e.Brain.Sessions().Add(sess)
-	defer func() {
-		sess.ToDone()
-		e.Brain.Sessions().Remove(sess)
-	}()
+	sess, closeSession := e.openSession(cfg)
+	defer closeSession()
 
 	// The prompt, then the "listening" chime, as one clip.
 	cue, rate := chimePCM(chimeStart), chimeSampleRate
@@ -531,15 +536,8 @@ func (e *Engine) runInCall(ctx context.Context, cfg Config, line brain.CallLine)
 
 	sess.ToListening()
 	sess.StartCapture()
-	timeout := time.Duration(cfg.VADTimeoutSeconds * float64(time.Second))
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	postSpeechSilence := cfg.PostSpeechSilenceSeconds
-	if postSpeechSilence <= 0 {
-		postSpeechSilence = handle.Config.GetPostSpeechSilenceSeconds(1.5)
-	}
-	waitForEndpoint(ctx, sess, timeout, time.Duration(postSpeechSilence*float64(time.Second)))
+	timeout, postSpeechSilence := listenWindow(cfg, handle)
+	waitForEndpoint(ctx, sess, timeout, postSpeechSilence)
 	captured := sess.StopCapture()
 	if ctx.Err() != nil {
 		return failed(ctx.Err())

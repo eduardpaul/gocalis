@@ -263,7 +263,7 @@ func newRig(t *testing.T) *rig {
 	}
 	online, offline := context.WithCancel(context.Background())
 	r.offline = offline
-	p.connect = func(ready func(context.Context, telegramAPI, string) error) error {
+	p.connect = func(_ context.Context, ready func(context.Context, telegramAPI, string) error) error {
 		if online.Err() != nil {
 			return errors.New("no route to Telegram")
 		}
@@ -707,7 +707,7 @@ func TestRunWaitsForTheLogin(t *testing.T) {
 		t.Fatal(err)
 	}
 	connected := make(chan struct{})
-	p.connect = func(ready func(context.Context, telegramAPI, string) error) error {
+	p.connect = func(_ context.Context, ready func(context.Context, telegramAPI, string) error) error {
 		close(connected)
 		return ready(context.Background(), newFakeTelegram(), "Portero")
 	}

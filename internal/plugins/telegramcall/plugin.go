@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gocalis/internal/config"
@@ -77,10 +78,10 @@ const (
 )
 
 // connectFunc logs in to Telegram and calls ready with the account once it is
-// usable. The connection lasts until ready returns, or until it is lost for
-// good, which ends the context ready was given. errNotLoggedIn means the
-// session file holds no login.
-type connectFunc func(ready func(ctx context.Context, api telegramAPI, account string) error) error
+// usable. The connection lasts until ready returns, until ctx ends, or until it
+// is lost for good, which ends the context ready was given. errNotLoggedIn
+// means the session file holds no login.
+type connectFunc func(ctx context.Context, ready func(ctx context.Context, api telegramAPI, account string) error) error
 
 var errNotLoggedIn = errors.New("not logged in to Telegram")
 
@@ -132,8 +133,8 @@ func New(cfg config.PluginConfig, host plugin.Host) (*Plugin, error) {
 		idleFor:   time.Duration(settings.IdleSeconds * float64(time.Second)),
 		detail:    "starting",
 	}
-	p.connect = func(ready func(context.Context, telegramAPI, string) error) error {
-		return connectTelegram(context.Background(), settings, nil, ready)
+	p.connect = func(ctx context.Context, ready func(context.Context, telegramAPI, string) error) error {
+		return connectTelegram(ctx, settings, nil, ready)
 	}
 	return p, nil
 }
@@ -160,7 +161,18 @@ func (p *Plugin) Run(ctx context.Context) error {
 			continue
 		}
 		p.setDetail("connecting to Telegram")
-		err := p.connect(func(online context.Context, api telegramAPI, account string) error {
+		// Once the account is usable the connection outlives ctx for as long as
+		// a call in progress takes to leave the voice chat. Until then ctx ends
+		// the attempt, which Telegram being out of reach never does.
+		connCtx, stopConn := context.WithCancel(context.Background())
+		var loggedIn atomic.Bool
+		unwatch := context.AfterFunc(ctx, func() {
+			if !loggedIn.Load() {
+				stopConn()
+			}
+		})
+		err := p.connect(connCtx, func(online context.Context, api telegramAPI, account string) error {
+			loggedIn.Store(true)
 			log.Printf("[Plugin %s] Logged in to Telegram as %s\n", p.host.ID, account)
 			retry = 5 * time.Second
 			p.setAPI(api, "logged in as "+account)
@@ -174,6 +186,8 @@ func (p *Plugin) Run(ctx context.Context) error {
 				return online.Err()
 			}
 		})
+		unwatch()
+		stopConn()
 		if ctx.Err() != nil {
 			return nil
 		}

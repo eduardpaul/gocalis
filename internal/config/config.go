@@ -501,6 +501,10 @@ func (c *Config) normalizeAndValidate() error {
 		if p.ID == "" || len(p.ID) > 64 || strings.ContainsAny(p.ID, " \t/#+") {
 			return fmt.Errorf("plugin %d: id is required, without spaces or any of / # +", i)
 		}
+		// Like a node's: "all" addresses a broadcast.
+		if p.ID == "all" {
+			return fmt.Errorf("plugin %d: id must not be \"all\"", i)
+		}
 		if pluginIDs[p.ID] {
 			return fmt.Errorf("plugin %s: id is used twice", p.ID)
 		}

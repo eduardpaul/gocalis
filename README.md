@@ -189,6 +189,27 @@ Publish JSON payloads to:
       "audio_file": "received_audio.wav"
     }
     ```
+*   `gocalis/cmd/ask` and `gocalis/cmd/play` take the same payloads as over WebSocket.
+*   `gocalis/cmd/intercom`
+    ```json
+    {
+      "node_ids": ["front_door", "telegram"],
+      "duration_seconds": 120
+    }
+    ```
+*   `gocalis/cmd/intercom_leave` (one node leaves its call) and `gocalis/cmd/intercom_stop` (the call of that node ends)
+    ```json
+    {
+      "node_id": "front_door"
+    }
+    ```
+*   `gocalis/cmd/plugin`
+    ```json
+    {
+      "plugin": "telegram",
+      "command": "hangup"
+    }
+    ```
 
 ### Event Topics (Gocalis -> Node-RED/HA)
 

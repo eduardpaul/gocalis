@@ -184,8 +184,14 @@ func (m *mixer) tick() {
 	m.clips = live
 
 	sum := make([]int32, m.frame)
+	mixed := make([]int16, m.frame) // push copies it, so one serves every listener
 	for id, l := range m.listeners {
-		copy(sum, shared)
+		if m.aside[id] {
+			// Set aside: only the clips played for it alone.
+			clear(sum)
+		} else {
+			copy(sum, shared)
+		}
 		for i, v := range private[id] {
 			sum[i] += v
 		}
@@ -196,7 +202,6 @@ func (m *mixer) tick() {
 			}
 			addInto(sum, frame)
 		}
-		mixed := make([]int16, m.frame)
 		for i, v := range sum {
 			mixed[i] = clampInt16(v)
 		}

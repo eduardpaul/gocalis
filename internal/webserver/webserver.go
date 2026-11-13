@@ -361,6 +361,10 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// An ask outlasts the server's write timeout as soon as its node has to be
+	// answered first (it rings for up to minutes): the request's own context
+	// bounds it instead.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	result := s.executor.AskEngine.Run(r.Context(), s.executor.AskConfig(req))
 	var audioBase64 string
 	if (req.OutputFormat == "audio" || req.OutputFormat == "both") && len(result.Audio) > 0 {

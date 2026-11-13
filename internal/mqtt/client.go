@@ -63,7 +63,7 @@ func NewClient(ctx context.Context, cfg Config, executor *protocol.Executor) (*C
 		SetOnConnectHandler(func(client paho.Client) {
 			_ = c.tasks.Go(func(ctx context.Context) {
 				topics := map[string]byte{}
-				for _, action := range []string{"tts", "asr", "speaker_id", "ask", "play"} {
+				for _, action := range []string{"tts", "asr", "speaker_id", "ask", "play", "intercom", "intercom_leave", "intercom_stop", "plugin"} {
 					topics[c.cmdTopic(action)] = c.cfg.QoS
 				}
 				token := client.SubscribeMultiple(topics, c.onMessage)

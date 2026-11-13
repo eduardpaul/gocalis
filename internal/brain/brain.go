@@ -493,7 +493,17 @@ func (b *Brain) IsCallee(nodeID string) bool {
 // exactly once; it also lets the line go, hanging up at once after an
 // exclusive turn.
 func (b *Brain) take(ctx context.Context, handle *NodeHandle, priority int, exclusive bool) (context.Context, func(), error) {
-	turnCtx, release, err := handle.queue.acquireMode(ctx, priority, exclusive)
+	var (
+		turnCtx context.Context
+		release func()
+		err     error
+	)
+	if exclusive {
+		// Ahead of every ordinary waiter, whatever its priority.
+		turnCtx, release, err = handle.queue.acquireExclusive(ctx)
+	} else {
+		turnCtx, release, err = handle.queue.acquire(ctx, priority)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

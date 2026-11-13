@@ -465,6 +465,11 @@ func (c *call) admit(n int) error {
 
 // extend pushes the deadline back so the call lasts at least duration from now.
 func (c *call) extend(duration time.Duration) {
+	// A call that has not started counts its time from the answer (goLive):
+	// keep the longest it was asked to last.
+	if c.waiting && c.e.timeout(duration) > c.e.timeout(c.duration) {
+		c.duration = duration
+	}
 	if d := time.Now().Add(c.e.timeout(duration)); d.After(c.deadline) {
 		c.deadline = d
 	}
