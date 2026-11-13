@@ -41,7 +41,7 @@ func TestBroadcastSynthesizesOnceAndKeepsSharedPCMImmutable(t *testing.T) {
 		b.RegisterNode(id, &NodeHandle{Node: p, Audio: a, Config: config.NodeConfig{RTCStream: config.RTCStreamConfig{OutputGainDb: float32(i) * 6}}})
 		defer b.UnregisterNode(id)
 	}
-	if err := b.SpeakAll(context.Background(), "one phrase", 0); err != nil {
+	if err := b.SpeakAll(context.Background(), "one phrase", 0, CallReject); err != nil {
 		t.Fatal(err)
 	}
 	if tts.calls.Load() != 1 {
@@ -62,10 +62,10 @@ func TestBroadcastReturnsPlaybackFailures(t *testing.T) {
 	defer p.Close()
 	b.RegisterNode("failed", &NodeHandle{Node: p, Audio: &failedAudio{err: want}})
 	defer b.UnregisterNode("failed")
-	if err := b.SpeakAll(context.Background(), "hello", 0); !errors.Is(err, want) {
+	if err := b.SpeakAll(context.Background(), "hello", 0, CallReject); !errors.Is(err, want) {
 		t.Fatalf("broadcast error = %v", err)
 	}
-	if err := b.PlaySamplesAll(context.Background(), []int16{1}, 16000, 0); !errors.Is(err, want) {
+	if err := b.PlaySamplesAll(context.Background(), []int16{1}, 16000, 0, CallReject); !errors.Is(err, want) {
 		t.Fatalf("recording broadcast error = %v", err)
 	}
 }

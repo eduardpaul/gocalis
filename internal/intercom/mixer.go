@@ -1,6 +1,7 @@
 package intercom
 
 import (
+	"slices"
 	"sync"
 	"time"
 )
@@ -13,8 +14,12 @@ const mixFrameMs = 20
 // and go. Each talker pushes its microphone into an input buffer; on a fixed
 // wall-clock cadence the mixer pulls one frame from every talker and, for each
 // listener, sums every OTHER talker's frame (a participant never hears itself)
-// plus the clips being played (join/leave chimes), then pushes the result to
-// that listener's output buffer, which its transport drains.
+// plus the clips being played (chimes, the assistant's voice), then pushes the
+// result to that listener's output buffer, which its transport drains.
+//
+// A participant can be set aside for a private exchange with the assistant:
+// until it is back, the others do not get its microphone and it gets only the
+// clips played for it alone.
 //
 // A single mix clock is what keeps N independent, drifting capture streams time
 // aligned: inputs are read non-blocking with silence substituted on underrun,
@@ -25,6 +30,7 @@ type mixer struct {
 	mu        sync.Mutex
 	talkers   map[string]*bridge
 	listeners map[string]*listener
+	aside     map[string]bool
 	clips     []*clip
 
 	quit chan struct{}
@@ -40,10 +46,12 @@ type listener struct {
 	skip string
 }
 
-// clip is a one-shot sound mixed to every listener until it runs out.
+// clip is a one-shot sound mixed in until it runs out.
 type clip struct {
-	pcm []int16
-	pos int
+	pcm  []int16
+	pos  int
+	to   string        // the only listener that gets it; empty for everyone
+	done chan struct{} // closed once it has played out or was dropped
 }
 
 func newMixer(rate int) *mixer {
@@ -51,6 +59,7 @@ func newMixer(rate int) *mixer {
 		frame:     rate * mixFrameMs / 1000,
 		talkers:   make(map[string]*bridge),
 		listeners: make(map[string]*listener),
+		aside:     make(map[string]bool),
 		quit:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -70,20 +79,55 @@ func (m *mixer) addListener(id string, out *bridge, skip string) {
 	m.mu.Unlock()
 }
 
-// remove drops the participant from the mix, as a talker and as a listener. Its
-// output buffer is left to the caller, which closes it once the tail is in.
+// remove drops the participant from the mix, as a talker and as a listener,
+// along with the clips that were for it alone. Its output buffer is left to the
+// caller, which closes it once the tail is in.
 func (m *mixer) remove(id string) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.talkers, id)
 	delete(m.listeners, id)
-	m.mu.Unlock()
+	delete(m.aside, id)
+	m.clips = slices.DeleteFunc(m.clips, func(c *clip) bool {
+		if c.to != id {
+			return false
+		}
+		close(c.done)
+		return true
+	})
 }
 
-// play mixes a one-shot sound to every listener, starting on the next tick.
-func (m *mixer) play(pcm []int16) {
+// setAside takes the participant out of the conversation (or puts it back)
+// without taking it out of the mix.
+func (m *mixer) setAside(id string, aside bool) {
 	m.mu.Lock()
-	m.clips = append(m.clips, &clip{pcm: pcm})
+	defer m.mu.Unlock()
+	if aside {
+		m.aside[id] = true
+	} else {
+		delete(m.aside, id)
+	}
+}
+
+// play mixes a one-shot sound in, starting on the next tick: for the listener
+// `to` alone, or for every listener when `to` is empty. The returned clip's done
+// channel closes when it has played out.
+func (m *mixer) play(pcm []int16, to string) *clip {
+	c := &clip{pcm: pcm, to: to, done: make(chan struct{})}
+	m.mu.Lock()
+	m.clips = append(m.clips, c)
 	m.mu.Unlock()
+	return c
+}
+
+// drop stops a clip that is still playing.
+func (m *mixer) drop(c *clip) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i := slices.Index(m.clips, c); i >= 0 {
+		m.clips = slices.Delete(m.clips, i, i+1)
+		close(c.done)
+	}
 }
 
 // run mixes on a fixed cadence until stop is called.
@@ -117,29 +161,37 @@ func (m *mixer) tick() {
 		frames[id] = in.takeFrame(m.frame)
 	}
 
-	// The clips sound the same for everyone: sum them once.
-	var shared []int32
-	if len(m.clips) > 0 {
-		shared = make([]int32, m.frame)
-		live := m.clips[:0]
-		for _, c := range m.clips {
-			c.pos += addInto(shared, c.pcm[c.pos:])
-			if c.pos < len(c.pcm) {
-				live = append(live, c)
+	// Sum the clips once: the ones for everyone, and the ones for one listener.
+	shared := make([]int32, m.frame)
+	private := make(map[string][]int32)
+	live := m.clips[:0]
+	for _, c := range m.clips {
+		into := shared
+		if c.to != "" {
+			if private[c.to] == nil {
+				private[c.to] = make([]int32, m.frame)
 			}
+			into = private[c.to]
 		}
-		clear(m.clips[len(live):])
-		m.clips = live
+		c.pos += addInto(into, c.pcm[c.pos:])
+		if c.pos < len(c.pcm) {
+			live = append(live, c)
+		} else {
+			close(c.done)
+		}
 	}
+	clear(m.clips[len(live):])
+	m.clips = live
 
 	sum := make([]int32, m.frame)
 	for id, l := range m.listeners {
-		clear(sum)
-		if shared != nil {
-			copy(sum, shared)
+		copy(sum, shared)
+		for i, v := range private[id] {
+			sum[i] += v
 		}
 		for talker, frame := range frames {
-			if talker == id || talker == l.skip {
+			// Mix-minus, and nothing to or from whoever is set aside.
+			if talker == id || talker == l.skip || m.aside[talker] || m.aside[id] {
 				continue
 			}
 			addInto(sum, frame)

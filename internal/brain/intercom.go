@@ -9,34 +9,112 @@ import (
 	"gocalis/internal/node"
 )
 
-// SetRawAudioTap installs a continuous-microphone sink for a node. While set,
-// every mic chunk delivered to ForwardRawAudio for that node is handed to fn
-// (raw float32, model rate, NOT VAD-gated). The intercom engine uses this to
-// mix the node's live mic into its call. Installing a tap does not affect the
-// wake/VAD/session paths.
-func (b *Brain) SetRawAudioTap(nodeID string, fn func(samples []float32)) {
-	b.rawTapsMu.Lock()
-	defer b.rawTapsMu.Unlock()
-	b.rawTaps[nodeID] = fn
+// ErrCallLeft is returned to an in-call speak, play or ask whose node went out
+// of its intercom call before it was done.
+var ErrCallLeft = errors.New("node left the intercom call")
+
+// CallMode says what a speak or play request does when its node is in an
+// intercom call, where the call owns the node's speaker.
+type CallMode int
+
+const (
+	// CallReject fails the request with ErrIntercomActive.
+	CallReject CallMode = iota
+	// CallNode plays it in the call for that node alone, on top of what the
+	// node hears from the call.
+	CallNode
+	// CallAll plays it in the call for every participant.
+	CallAll
+)
+
+// CallLine is a node's line into the intercom call it is in: the way to reach
+// the node, or its whole call, while the call owns the node's speaker and
+// microphone. One thing at a time uses a node's line; the rest wait.
+type CallLine interface {
+	// Play mixes a clip (PCM16 at sampleRate) into the call, for the node alone
+	// or for everyone in the call, and returns once it has played.
+	Play(ctx context.Context, pcm []int16, sampleRate int, everyone bool) error
+
+	// Hold sets the node aside from its call for a private exchange (an ask):
+	// until the hold is released the others do not hear the node's microphone
+	// and the node does not hear them.
+	Hold(ctx context.Context) (CallHold, error)
 }
 
-// ClearRawAudioTap removes the continuous-mic sink for a node (if any).
-func (b *Brain) ClearRawAudioTap(nodeID string) {
-	b.rawTapsMu.Lock()
-	defer b.rawTapsMu.Unlock()
-	delete(b.rawTaps, nodeID)
+// CallHold is a node set aside from its intercom call.
+type CallHold interface {
+	// Context ends when the hold is released, when the context it was taken on
+	// ends, or (cause ErrCallLeft) when the node goes out of the call.
+	Context() context.Context
+	// Play plays a clip for the node alone and returns once it has played.
+	Play(pcm []int16, sampleRate int) error
+	// Release puts the node back in its call. It may be called more than once.
+	Release()
 }
 
-// ForwardRawAudio delivers a raw mic chunk to the node's installed tap, if any.
-// It is called from the capture path for every chunk; with no tap installed it
-// is a cheap map lookup and returns immediately.
+// callSeat is what the intercom engine registers for a node in a call.
+type callSeat struct {
+	tap  func(samples []float32)
+	line CallLine
+}
+
+// EnterCall registers a node as being in an intercom call. Until LeaveCall,
+// every mic chunk delivered to ForwardRawAudio for that node is handed to tap
+// (raw float32, model rate, NOT VAD-gated), which mixes it into the call, and
+// line reaches the node inside the call.
+func (b *Brain) EnterCall(nodeID string, tap func(samples []float32), line CallLine) {
+	b.callsMu.Lock()
+	defer b.callsMu.Unlock()
+	b.calls[nodeID] = callSeat{tap: tap, line: line}
+}
+
+// LeaveCall removes the node's intercom call registration (if any).
+func (b *Brain) LeaveCall(nodeID string) {
+	b.callsMu.Lock()
+	defer b.callsMu.Unlock()
+	delete(b.calls, nodeID)
+}
+
+// CallLine returns the node's line into the intercom call it is in, or nil when
+// it is in none.
+func (b *Brain) CallLine(nodeID string) CallLine {
+	b.callsMu.RLock()
+	defer b.callsMu.RUnlock()
+	// A missing seat yields the zero value, whose line is a nil interface.
+	return b.calls[nodeID].line
+}
+
+// ForwardRawAudio delivers a raw mic chunk to the call the node is in, if any.
+// It is called from the capture path for every chunk of a node in a call; with
+// no call registered it is a cheap map lookup and returns immediately.
 func (b *Brain) ForwardRawAudio(nodeID string, samples []float32) {
-	b.rawTapsMu.RLock()
-	fn := b.rawTaps[nodeID]
-	b.rawTapsMu.RUnlock()
-	if fn != nil {
-		fn(samples)
+	b.callsMu.RLock()
+	tap := b.calls[nodeID].tap
+	b.callsMu.RUnlock()
+	if tap != nil {
+		tap(samples)
 	}
+}
+
+// playInCall plays a clip in the intercom call the node is in, as mode says. It
+// reports false when the request is not for the call: the mode rejects calls,
+// or the node is in none.
+func (b *Brain) playInCall(ctx context.Context, nodeID string, mode CallMode, clip func() ([]int16, int, error)) (bool, error) {
+	if mode == CallReject {
+		return false, nil
+	}
+	line := b.CallLine(nodeID)
+	if line == nil {
+		return false, nil
+	}
+	samples, rate, err := clip()
+	if err != nil || len(samples) == 0 {
+		return true, err
+	}
+	if err := line.Play(ctx, samples, rate, mode == CallAll); err != nil {
+		return true, fmt.Errorf("node '%s': %w", nodeID, err)
+	}
+	return true, nil
 }
 
 // StreamOut plays a live PCM16 source on the turn's node for the duration of an

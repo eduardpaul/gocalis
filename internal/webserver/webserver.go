@@ -320,6 +320,7 @@ type AskResponse struct {
 	Speaker        string `json:"speaker"`
 	AudioWavBase64 string `json:"audio_wav_base64"`
 	ErrorMessage   string `json:"error_message"`
+	InCall         bool   `json:"in_call,omitempty"` // the ask ran inside the node's intercom call
 }
 
 func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
@@ -352,6 +353,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		Speaker:        result.Speaker,
 		AudioWavBase64: audioBase64,
 		ErrorMessage:   result.ErrorMessage,
+		InCall:         result.InCall,
 	})
 }
 

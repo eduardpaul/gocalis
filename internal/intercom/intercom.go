@@ -165,6 +165,11 @@ type nodeMember struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// seat ends (cause brain.ErrCallLeft) when the node goes out of the mix,
+	// which is when whatever the assistant was doing with it has to stop.
+	seat   context.Context
+	unseat context.CancelCauseFunc
+
 	turn     *brain.Turn   // the takeover, once the node has been acquired
 	out      *bridge       // the node's mix, once it is in the mix
 	aec      EchoCanceller // its echo canceller, if enabled
@@ -318,7 +323,7 @@ func (e *Engine) ConnectRemote(r *Remote, nodeID string, playsNode bool, duratio
 	c.announce(c.event("intercom_joined", r.ID))
 	if c.live {
 		c.attachRemote(r)
-		c.mix.play(c.e.joinChime)
+		c.mix.play(c.e.joinChime, "")
 	}
 	return nil
 }
@@ -434,7 +439,8 @@ func (c *call) extend(duration time.Duration) {
 
 func (c *call) addNode(id string) *nodeMember {
 	ctx, cancel := context.WithCancel(c.e.baseCtx)
-	m := &nodeMember{id: id, ctx: ctx, cancel: cancel, streamed: make(chan struct{})}
+	seat, unseat := context.WithCancelCause(ctx)
+	m := &nodeMember{id: id, ctx: ctx, cancel: cancel, seat: seat, unseat: unseat, streamed: make(chan struct{})}
 	c.nodes = append(c.nodes, m)
 	c.e.calls[id] = c
 	return m
@@ -528,7 +534,7 @@ func (c *call) remove(id, failure string) {
 	switch {
 	case len(c.nodes)+len(c.remotes) >= 2:
 		if c.live {
-			c.mix.play(c.e.leaveChime)
+			c.mix.play(c.e.leaveChime, "")
 		}
 	case failure != "":
 		c.failure = failure
@@ -547,7 +553,7 @@ func (c *call) goLive() {
 	for _, r := range c.remotes {
 		c.attachRemote(r)
 	}
-	c.mix.play(c.e.joinChime)
+	c.mix.play(c.e.joinChime, "")
 	go c.mix.run()
 
 	aec := "OFF"
@@ -558,7 +564,8 @@ func (c *call) goLive() {
 }
 
 // attachNode puts an acquired node in the mix: its microphone (echo-cancelled
-// when enabled) becomes a talker and its speaker plays its mix-minus.
+// when enabled) becomes a talker and its speaker plays its mix-minus. From here
+// on the brain reaches the node through its line into the call.
 func (c *call) attachNode(m *nodeMember) {
 	m.aec = c.e.newCanceller(m.id)
 	in := newBridgeBuffer(bridgeRate, bridgeRate/2)
@@ -567,13 +574,13 @@ func (c *call) attachNode(m *nodeMember) {
 	c.mix.addListener(m.id, m.out, "")
 
 	aec := m.aec
-	c.e.brain.SetRawAudioTap(m.id, func(samples []float32) {
+	c.e.brain.EnterCall(m.id, func(samples []float32) {
 		pcm := audio.FloatToPCM16(samples)
 		if aec != nil {
 			pcm = aec.Capture(pcm)
 		}
 		in.push(pcm)
-	})
+	}, newLine(c.mix, m.id, m.seat))
 	go c.stream(m)
 }
 
@@ -594,7 +601,8 @@ func (c *call) detachNode(m *nodeMember, tail []int16) {
 		}
 		return
 	}
-	c.e.brain.ClearRawAudioTap(m.id)
+	c.e.brain.LeaveCall(m.id)
+	m.unseat(brain.ErrCallLeft)
 	c.mix.remove(m.id)
 	m.out.push(tail)
 	m.out.close()
@@ -646,7 +654,7 @@ func (c *call) acquire(m *nodeMember) {
 		m.turn = turn
 		if c.live {
 			c.attachNode(m)
-			c.mix.play(c.e.joinChime)
+			c.mix.play(c.e.joinChime, "")
 		}
 	}
 }

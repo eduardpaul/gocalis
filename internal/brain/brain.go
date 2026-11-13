@@ -48,12 +48,11 @@ type Brain struct {
 	nodesMutex sync.RWMutex
 	sessions   *session.Registry
 
-	// rawTaps holds a per-node continuous-mic sink used by the intercom bridge.
-	// The capture path calls ForwardRawAudio for every mic chunk; when a tap is
-	// installed for that node the raw (non-VAD-gated) audio is forwarded to it.
-	// Empty map / no tap installed = zero overhead on the hot capture path.
-	rawTaps   map[string]func(samples []float32)
-	rawTapsMu sync.RWMutex
+	// calls holds what the intercom engine registered for each node that is in
+	// a call: the sink for its microphone and its line into the call. No entry
+	// = the node is in no call, and zero overhead on the hot capture path.
+	calls   map[string]callSeat
+	callsMu sync.RWMutex
 }
 
 // New creates a new Brain backed by the given TTS engine.
@@ -62,7 +61,7 @@ func New(ttsEngine ai.Synthesizer) *Brain {
 		ttsEngine: ttsEngine,
 		nodes:     make(map[string]*NodeHandle),
 		sessions:  session.NewRegistry(),
-		rawTaps:   make(map[string]func(samples []float32)),
+		calls:     make(map[string]callSeat),
 	}
 }
 
@@ -134,8 +133,9 @@ func (b *Brain) ListNodes() []NodeInfo {
 	return infos
 }
 
-// Speak routes a TTS utterance to a single node.
-func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority int) error {
+// Speak routes a TTS utterance to a single node. inCall says what happens when
+// the node is in an intercom call.
+func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority int, inCall CallMode) error {
 	b.nodesMutex.RLock()
 	handle, ok := b.nodes[nodeID]
 	b.nodesMutex.RUnlock()
@@ -149,10 +149,16 @@ func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority 
 		return nil
 	}
 
+	if done, err := b.playInCall(ctx, nodeID, inCall, func() ([]int16, int, error) {
+		return b.Synthesize(ctx, text, priority)
+	}); done {
+		return err
+	}
+
 	// Wait for this node's turn (higher-priority work runs first) instead of
-	// being rejected when the node is busy. A node in an intercom call rejects
-	// the request (ErrIntercomActive) and a call starting mid-utterance cuts it
-	// off (ErrPreempted).
+	// being rejected when the node is busy. A node that enters an intercom call
+	// rejects the request (ErrIntercomActive), and a call starting mid-utterance
+	// cuts it off (ErrPreempted).
 	turnCtx, release, err := handle.queue.acquire(ctx, priority)
 	if err != nil {
 		return fmt.Errorf("node '%s': %w", nodeID, err)
@@ -163,8 +169,8 @@ func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority 
 }
 
 // PlaySamples plays a pre-recorded PCM16 clip on a single node, honoring the
-// node's turn queue and priority exactly like Speak.
-func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16, sampleRate int, priority int) error {
+// node's turn queue and priority, and its intercom call, exactly like Speak.
+func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16, sampleRate int, priority int, inCall CallMode) error {
 	b.nodesMutex.RLock()
 	handle, ok := b.nodes[nodeID]
 	b.nodesMutex.RUnlock()
@@ -181,6 +187,12 @@ func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16,
 		return nil
 	}
 
+	if done, err := b.playInCall(ctx, nodeID, inCall, func() ([]int16, int, error) {
+		return samples, sampleRate, nil
+	}); done {
+		return err
+	}
+
 	turnCtx, release, err := handle.queue.acquire(ctx, priority)
 	if err != nil {
 		return fmt.Errorf("node '%s': %w", nodeID, err)
@@ -194,7 +206,7 @@ func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16,
 // driven independently through its own turn queue at the given priority, exactly
 // like SpeakAll: free nodes play immediately, busy nodes queue behind their
 // current turn, and nodes never block one another.
-func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate int, priority int) error {
+func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate int, priority int, inCall CallMode) error {
 	if len(samples) == 0 {
 		return nil
 	}
@@ -204,7 +216,7 @@ func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate 
 		return fmt.Errorf("no nodes registered")
 	}
 
-	return b.playAll(ctx, handles, samples, sampleRate, priority)
+	return b.playAll(ctx, handles, samples, sampleRate, priority, inCall)
 }
 
 // playSamplesToHandle plays pre-recorded samples on a single node with the same
@@ -268,7 +280,7 @@ func (b *Brain) AcquireNodeIntercom(ctx context.Context, nodeID string) (*Turn, 
 //
 // The utterance is synthesized once. Each node then waits independently for
 // its turn and applies its own gain without changing the shared recording.
-func (b *Brain) SpeakAll(ctx context.Context, text string, priority int) error {
+func (b *Brain) SpeakAll(ctx context.Context, text string, priority int, inCall CallMode) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
@@ -280,10 +292,18 @@ func (b *Brain) SpeakAll(ctx context.Context, text string, priority int) error {
 	if err != nil {
 		return err
 	}
-	return b.playAll(ctx, handles, samples, rate, priority)
+	return b.playAll(ctx, handles, samples, rate, priority, inCall)
 }
 
-func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []int16, rate, priority int) error {
+// playAll plays the clip on every given node at once. A node in an intercom
+// call gets it inside the call, for itself alone, unless inCall rejects calls:
+// then the broadcast skips it rather than failing for every other node.
+func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []int16, rate, priority int, inCall CallMode) error {
+	if inCall == CallAll {
+		// One copy per node of a call would play several times over for the
+		// whole call.
+		inCall = CallNode
+	}
 	errs := make([]error, len(handles))
 	skipped := make([]bool, len(handles))
 	var wg sync.WaitGroup
@@ -291,10 +311,14 @@ func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []in
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if done, err := b.playInCall(ctx, handle.Node.NodeID, inCall, func() ([]int16, int, error) {
+				return samples, rate, nil
+			}); done {
+				errs[i] = err
+				return
+			}
 			turnCtx, release, err := handle.queue.acquire(ctx, priority)
 			if errors.Is(err, ErrIntercomActive) {
-				// A broadcast skips a node that is in an intercom call rather
-				// than failing for every other node.
 				log.Printf("[Brain] broadcast skips node '%s': %v\n", handle.Node.NodeID, err)
 				skipped[i] = true
 				return

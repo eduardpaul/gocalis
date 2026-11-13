@@ -197,7 +197,7 @@ func TestIntercomRejectsSpeak(t *testing.T) {
 	}
 	rig.waitForState(t, "A", node.StateIntercom)
 
-	err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0)
+	err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0, brain.CallReject)
 	if !errors.Is(err, brain.ErrIntercomActive) {
 		t.Fatalf("PlaySamples during the call = %v, want ErrIntercomActive", err)
 	}
@@ -206,7 +206,7 @@ func TestIntercomRejectsSpeak(t *testing.T) {
 	}
 
 	rig.waitForEvent(t, "intercom_ended", "")
-	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0); err != nil {
+	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0, brain.CallReject); err != nil {
 		t.Fatalf("PlaySamples after the call: %v", err)
 	}
 }
@@ -296,7 +296,7 @@ func TestIntercomRemoteAndNode(t *testing.T) {
 		t.Fatal("node A did not play the page's voice")
 	}
 	rig.waitForState(t, "A", node.StateIdle)
-	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0); err != nil {
+	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0, brain.CallReject); err != nil {
 		t.Fatalf("PlaySamples after the call: %v", err)
 	}
 }
@@ -391,7 +391,7 @@ func TestIntercomNodeJoinsAndLeaves(t *testing.T) {
 	}
 	// C is free again and played what A said while it was in the call.
 	rig.waitForState(t, "C", node.StateIdle)
-	if err := rig.brain.PlaySamples(context.Background(), "C", []int16{1}, 16000, 0); err != nil {
+	if err := rig.brain.PlaySamples(context.Background(), "C", []int16{1}, 16000, 0, brain.CallReject); err != nil {
 		t.Fatalf("PlaySamples on the node that left: %v", err)
 	}
 	if !contains(rig.played("C"), audio.FloatToPCM16(micA)) {
@@ -471,6 +471,125 @@ func TestIntercomChimes(t *testing.T) {
 	}
 }
 
+// TestIntercomPlaysInCall verifies a clip played for a node in a call goes
+// through the call: to that node alone, or to everyone.
+func TestIntercomPlaysInCall(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	rig.waitForState(t, "B", node.StateIntercom)
+	page := rig.engine.NewRemote(nil)
+	if err := rig.engine.ConnectRemote(page, "A", false, 0); err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+
+	private, public := tone(4000, 640), tone(-4000, 640)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := rig.brain.PlaySamples(ctx, "A", private, 16000, 0, brain.CallNode); err != nil {
+		t.Fatalf("PlaySamples for the node in its call: %v", err)
+	}
+	if err := rig.brain.PlaySamples(ctx, "A", public, 16000, 0, brain.CallAll); err != nil {
+		t.Fatalf("PlaySamples for the whole call: %v", err)
+	}
+	heard := readRemote(t, page, func(got []int16) bool { return contains(got, public) })
+	if !contains(heard, public) || contains(heard, private[:20]) {
+		t.Fatal("the page did not get exactly the clip that was for everyone")
+	}
+
+	rig.engine.Stop("A")
+	rig.waitForEvent(t, "intercom_ended", "")
+	if a := rig.played("A"); !contains(a, private) || !contains(a, public) {
+		t.Fatal("node A did not hear both clips")
+	}
+	if b := rig.played("B"); contains(b, private[:20]) || !contains(b, public) {
+		t.Fatal("node B did not get exactly the clip that was for everyone")
+	}
+	// Once out of the call the node plays by itself again.
+	if rig.brain.CallLine("A") != nil {
+		t.Fatal("node A kept its line after the call")
+	}
+	if err := rig.brain.PlaySamples(ctx, "A", private, 16000, 0, brain.CallNode); err != nil {
+		t.Fatalf("PlaySamples after the call: %v", err)
+	}
+}
+
+// TestIntercomHoldSetsNodeAside verifies a held node neither talks to the call
+// nor hears it, still hears what is played for it, and is back in the
+// conversation once released.
+func TestIntercomHoldSetsNodeAside(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	rig.waitForState(t, "A", node.StateIntercom)
+	rig.waitForState(t, "B", node.StateIntercom)
+	say := func(id string, level float32) int16 {
+		rig.brain.ForwardRawAudio(id, []float32{level, level, level})
+		time.Sleep(80 * time.Millisecond)
+		return audio.FloatToPCM16([]float32{level})[0]
+	}
+
+	hold, err := rig.brain.CallLine("A").Hold(context.Background())
+	if err != nil {
+		t.Fatalf("Hold failed: %v", err)
+	}
+	secret := say("A", 0.3) // the command, for the assistant only
+	missed := say("B", 0.5) // said to a node that is not listening
+	cue := tone(6000, 320)  // the assistant's chime
+	if err := hold.Play(cue, 16000); err != nil {
+		t.Fatalf("Play on the hold: %v", err)
+	}
+	// A spoken reply waits for the ask to be over: the line is busy.
+	waited := make(chan error, 1)
+	go func() {
+		waited <- rig.brain.PlaySamples(context.Background(), "A", tone(7000, 320), 16000, 0, brain.CallNode)
+	}()
+	select {
+	case err := <-waited:
+		t.Fatalf("a clip played on a held line (err=%v)", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	hold.Release()
+	hold.Release() // harmless
+	if err := <-waited; err != nil {
+		t.Fatalf("the clip that waited for the line: %v", err)
+	}
+	back := say("A", 0.7)
+
+	// A hold ends with the node's place in the call.
+	hold, err = rig.brain.CallLine("A").Hold(context.Background())
+	if err != nil {
+		t.Fatalf("second Hold failed: %v", err)
+	}
+	rig.engine.Stop("A")
+	select {
+	case <-hold.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the hold outlived the node's place in the call")
+	}
+	if cause := context.Cause(hold.Context()); !errors.Is(cause, brain.ErrCallLeft) {
+		t.Fatalf("hold ended with %v, want ErrCallLeft", cause)
+	}
+	hold.Release()
+
+	rig.waitForEvent(t, "intercom_ended", "")
+	a, b := rig.played("A"), rig.played("B")
+	if slices.Contains(b, secret) {
+		t.Fatal("the call heard a node that was set aside")
+	}
+	if slices.Contains(a, missed) {
+		t.Fatal("a node that was set aside heard the call")
+	}
+	if !contains(a, cue) || !contains(a, tone(7000, 320)) {
+		t.Fatal("the held node did not hear what was played for it")
+	}
+	if !slices.Contains(b, back) {
+		t.Fatal("the node was not back in the conversation after the hold")
+	}
+}
+
 // TestIntercomStopImmediatelyAfterStart verifies Stop is safe before the call's
 // background goroutine has run.
 func TestIntercomStopImmediatelyAfterStart(t *testing.T) {
@@ -487,7 +606,7 @@ func TestIntercomStopImmediatelyAfterStart(t *testing.T) {
 		t.Fatalf("expected stopped/success, got %q/%q", ended.Reason, ended.Status)
 	}
 	rig.waitForState(t, "A", node.StateIdle)
-	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0); err != nil {
+	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0, brain.CallReject); err != nil {
 		t.Fatalf("PlaySamples after the call: %v", err)
 	}
 	if rig.engine.Stop("A") || rig.engine.Leave("A") {
@@ -690,7 +809,7 @@ func TestMixerClampsAndSkips(t *testing.T) {
 		outs[id] = newBridgeBuffer(1000, 1000)
 		m.addListener(id, outs[id], skip)
 	}
-	m.play([]int16{7, 7, 7})
+	m.play([]int16{7, 7, 7}, "")
 	m.tick()
 	m.tick()
 

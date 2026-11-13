@@ -268,6 +268,15 @@ type KWSConfig struct {
 	// captured user speech to the combined wake event (published to MQTT/WS/etc).
 	AutoAskRecord bool `yaml:"auto_ask_record"`
 
+	// WakeInCall keeps the wake word armed while the node is in an intercom
+	// call. Saying it sets the node aside from the call (the others stop hearing
+	// it, and it stops hearing them) while the assistant listens to the command,
+	// as it would outside a call; the "wake" event then carries in_call. Off by
+	// default: enable it only on nodes whose microphone does not pick up their
+	// own speaker (hardware echo cancellation), or anyone in the call can wake
+	// the assistant through that speaker.
+	WakeInCall bool `yaml:"wake_in_call"`
+
 	Priority      int      `yaml:"priority"`
 	WakeResponses []string `yaml:"wake_responses"`
 	NumThreads    int      `yaml:"num_threads"`

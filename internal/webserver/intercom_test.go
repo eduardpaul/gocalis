@@ -207,7 +207,7 @@ func TestIntercomWSPagesShareACall(t *testing.T) {
 	}
 
 	// The call goes on for the first page and the node.
-	if err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0); !errors.Is(err, brain.ErrIntercomActive) {
+	if err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0, brain.CallReject); !errors.Is(err, brain.ErrIntercomActive) {
 		t.Fatalf("PlaySamples during the call = %v, want ErrIntercomActive", err)
 	}
 
@@ -220,7 +220,7 @@ func TestIntercomWSPagesShareACall(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0)
+		err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0, brain.CallReject)
 		if err == nil {
 			break
 		}

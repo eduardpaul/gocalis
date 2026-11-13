@@ -67,6 +67,11 @@ func TestValidateIntercomActions(t *testing.T) {
 		{"intercom_leave without node", Request{Action: "intercom_leave"}, true},
 		{"intercom_stop", Request{Action: "intercom_stop", NodeID: "a"}, false},
 		{"intercom_stop without node", Request{Action: "intercom_stop"}, true},
+		{"tts in call for the node", Request{Action: "tts", NodeID: "a", Text: "hi", CallMode: "node"}, false},
+		{"tts in call for all", Request{Action: "tts", NodeID: "a", Text: "hi", CallMode: "all"}, false},
+		{"tts unknown call mode", Request{Action: "tts", NodeID: "a", Text: "hi", CallMode: "everyone"}, true},
+		{"ask in call", Request{Action: "ask", NodeID: "a", CallMode: "node"}, false},
+		{"ask in call for all", Request{Action: "ask", NodeID: "a", CallMode: "all"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

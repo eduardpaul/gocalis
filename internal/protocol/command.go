@@ -140,10 +140,10 @@ func (e *Executor) executeTTS(ctx context.Context, req Request) {
 	var err error
 	if req.NodeID == "all" {
 		log.Printf("[Executor] TTS to all nodes: \"%s\"\n", req.Text)
-		err = e.Brain.SpeakAll(ctx, req.Text, req.Priority)
+		err = e.Brain.SpeakAll(ctx, req.Text, req.Priority, req.callMode())
 	} else {
 		log.Printf("[Executor] TTS to node '%s': \"%s\"\n", req.NodeID, req.Text)
-		err = e.Brain.Speak(ctx, req.NodeID, req.Text, req.Priority)
+		err = e.Brain.Speak(ctx, req.NodeID, req.Text, req.Priority, req.callMode())
 	}
 
 	if err != nil {
@@ -185,10 +185,10 @@ func (e *Executor) executePlay(ctx context.Context, req Request) {
 
 	if req.NodeID == "all" {
 		log.Printf("[Executor] Play recording on all nodes (%d samples @ %dHz)\n", len(samples), sampleRate)
-		err = e.Brain.PlaySamplesAll(ctx, samples, sampleRate, req.Priority)
+		err = e.Brain.PlaySamplesAll(ctx, samples, sampleRate, req.Priority, req.callMode())
 	} else {
 		log.Printf("[Executor] Play recording on node '%s' (%d samples @ %dHz)\n", req.NodeID, len(samples), sampleRate)
-		err = e.Brain.PlaySamples(ctx, req.NodeID, samples, sampleRate, req.Priority)
+		err = e.Brain.PlaySamples(ctx, req.NodeID, samples, sampleRate, req.Priority, req.callMode())
 	}
 
 	if err != nil {
@@ -264,6 +264,7 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 		Status:  result.Status,
 		Speaker: result.Speaker,
 		Message: result.ErrorMessage,
+		InCall:  result.InCall,
 	}
 
 	switch req.OutputFormat {
@@ -342,7 +343,18 @@ func (r Request) AskConfig() ask.Config {
 	if r.CaptureDelaySeconds != nil {
 		captureDelay = *r.CaptureDelaySeconds
 	}
-	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: captureDelay, Priority: r.Priority}
+	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: captureDelay, Priority: r.Priority, InCall: r.CallMode == "node"}
+}
+
+// callMode converts the request's call_mode for the brain.
+func (r Request) callMode() brain.CallMode {
+	switch r.CallMode {
+	case "node":
+		return brain.CallNode
+	case "all":
+		return brain.CallAll
+	}
+	return brain.CallReject
 }
 
 // AskConfig resolves an ask request for execution. When the request omits
@@ -369,6 +381,15 @@ func (r Request) Validate() error {
 	}
 	if r.OutputFormat != "" && r.OutputFormat != "text" && r.OutputFormat != "audio" && r.OutputFormat != "both" {
 		return fmt.Errorf("output_format must be text, audio or both")
+	}
+	switch r.CallMode {
+	case "", "node":
+	case "all":
+		if r.Action == "ask" {
+			return fmt.Errorf("an ask in a call is for its node: call_mode must be node")
+		}
+	default:
+		return fmt.Errorf("call_mode must be node or all")
 	}
 	switch r.Action {
 	case "tts":

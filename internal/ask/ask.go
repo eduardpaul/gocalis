@@ -43,6 +43,12 @@ type Config struct {
 	// user stop-speaking and the end chime, at the cost of more aggressive turn
 	// cutting. Defaults to 1.5s when unset.
 	PostSpeechSilenceSeconds float64
+
+	// InCall lets the ask run while the node is in an intercom call, inside
+	// the call: the node is set aside from the conversation for as long as the
+	// ask plays its prompt and listens. Without it an ask for a node in a call
+	// fails, as the call owns the node.
+	InCall bool
 }
 
 // Result is the outcome of an ask session.
@@ -59,6 +65,9 @@ type Result struct {
 	// recording (e.g. a PCM16 WAV).
 	Audio      []float32
 	SampleRate int
+
+	// InCall tells that the ask ran inside the intercom call the node is in.
+	InCall bool
 }
 
 // Engine runs ask sessions against the central brain.
@@ -85,6 +94,11 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 	timings := make(map[string]time.Duration)
 	if err := cfg.Validate(); err != nil {
 		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: "error", ErrorMessage: err.Error()}
+	}
+	if cfg.InCall {
+		if line := e.Brain.CallLine(cfg.NodeID); line != nil {
+			return e.runInCall(ctx, cfg, line)
+		}
 	}
 	turn, err := e.Brain.AcquireNode(ctx, cfg.NodeID, cfg.Priority)
 	if err != nil {
@@ -263,15 +277,8 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 		}
 	}
 
-	if err := handle.Recorder.Save(captured); err != nil {
-		log.Printf("[Ask:%s] recording: %v", cfg.NodeID, err)
-	}
 	asrAt := time.Now()
-	transcription, err := e.ASR.TranscribeSamples(ctx, captured, 16000, ai.JobOptions{Priority: cfg.Priority, OnTiming: func(wait, inference time.Duration) {
-		if handle.Config.Diagnostics.Enabled {
-			log.Printf("[Ask:%s] ASR queue=%s inference=%s", cfg.NodeID, wait, inference)
-		}
-	}})
+	transcription, err := e.transcribe(ctx, cfg, handle, captured)
 	timings["asr_total"] = time.Since(asrAt)
 	if err != nil {
 		return Result{
@@ -415,6 +422,134 @@ func (e *Engine) Run(ctx context.Context, cfg Config) (result Result) {
 		Audio:         captured,
 		SampleRate:    16000,
 	}
+}
+
+// transcribe keeps the captured speech for diagnostics and runs ASR on it.
+func (e *Engine) transcribe(ctx context.Context, cfg Config, handle *brain.NodeHandle, captured []float32) (string, error) {
+	if err := handle.Recorder.Save(captured); err != nil {
+		log.Printf("[Ask:%s] recording: %v", cfg.NodeID, err)
+	}
+	return e.ASR.TranscribeSamples(ctx, captured, 16000, ai.JobOptions{Priority: cfg.Priority, OnTiming: func(wait, inference time.Duration) {
+		if handle.Config.Diagnostics.Enabled {
+			log.Printf("[Ask:%s] ASR queue=%s inference=%s", cfg.NodeID, wait, inference)
+		}
+	}})
+}
+
+// runInCall is the ask flow for a node that is in an intercom call. The call
+// keeps the node (its state stays INTERCOM and its speaker keeps playing the
+// call's mix), so the ask goes through the node's line into the call: the node
+// is set aside from the conversation, hears the prompt and the chimes alone, and
+// is put back as soon as it has been listened to. The others never hear the
+// question, and whatever they say meanwhile reaches neither the node's speaker
+// nor, through it, the captured answer.
+//
+// There is no barge-in and no voice challenge in a call: a speaker that cannot
+// be verified on what it said fails the ask.
+func (e *Engine) runInCall(ctx context.Context, cfg Config, line brain.CallLine) Result {
+	result := func(status, message string) Result {
+		return Result{ContextID: cfg.ContextID, NodeID: cfg.NodeID, Status: status, ErrorMessage: message, InCall: true}
+	}
+	handle := e.Brain.GetNodeHandle(cfg.NodeID)
+	if handle == nil {
+		return result("error", fmt.Sprintf("node '%s' not registered", cfg.NodeID))
+	}
+	hold, err := line.Hold(ctx)
+	if err != nil {
+		return result("error", err.Error())
+	}
+	defer hold.Release()
+	// While the node is held the ask runs on the hold's context, which also
+	// ends when the node goes out of the call.
+	request := ctx
+	ctx = hold.Context()
+	// failed reports why the ask stopped short: the node left the call, or the
+	// request was cancelled.
+	failed := func(err error) Result {
+		if cause := context.Cause(hold.Context()); cause != nil {
+			err = cause
+		}
+		return result("error", err.Error())
+	}
+
+	sessID := cfg.ContextID
+	if sessID == "" {
+		sessID = "ask"
+	}
+	sess := session.New(fmt.Sprintf("%s-%d", sessID, time.Now().UnixNano()), cfg.NodeID)
+	e.Brain.Sessions().Add(sess)
+	defer func() {
+		sess.ToDone()
+		e.Brain.Sessions().Remove(sess)
+	}()
+
+	// The prompt, then the "listening" chime, as one clip.
+	cue, rate := chimePCM(chimeStart), chimeSampleRate
+	if strings.TrimSpace(cfg.TTSText) != "" {
+		prompt, promptRate, err := e.Brain.Synthesize(ctx, cfg.TTSText, cfg.Priority)
+		if err != nil {
+			return failed(err)
+		}
+		if len(prompt) > 0 {
+			cue, rate = append(prompt, renderChimeAt(chimeStart, promptRate)...), promptRate
+		}
+	}
+	if err := hold.Play(cue, rate); err != nil {
+		return failed(err)
+	}
+	// Let the node's speaker play the chime out before listening, so a
+	// half-duplex device does not capture it as speech.
+	if cfg.CaptureDelaySeconds > 0 {
+		select {
+		case <-time.After(time.Duration(cfg.CaptureDelaySeconds * float64(time.Second))):
+		case <-ctx.Done():
+			return failed(ctx.Err())
+		}
+	}
+
+	sess.ToListening()
+	sess.StartCapture()
+	timeout := time.Duration(cfg.VADTimeoutSeconds * float64(time.Second))
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	postSpeechSilence := cfg.PostSpeechSilenceSeconds
+	if postSpeechSilence <= 0 {
+		postSpeechSilence = handle.Config.GetPostSpeechSilenceSeconds(1.5)
+	}
+	waitForEndpoint(ctx, sess, timeout, time.Duration(postSpeechSilence*float64(time.Second)))
+	captured := sess.StopCapture()
+	if ctx.Err() != nil {
+		return failed(ctx.Err())
+	}
+	if err := hold.Play(chimePCM(chimeStop), chimeSampleRate); err != nil {
+		return failed(err)
+	}
+	// The node goes back to its call while what it said is worked out.
+	hold.Release()
+	ctx = request
+	sess.ToProcessing()
+
+	if len(captured) == 0 {
+		return result("silence_timeout", "")
+	}
+	transcription, err := e.transcribe(ctx, cfg, handle, captured)
+	if err != nil {
+		return result("error", "ASR failed: "+err.Error())
+	}
+	res := result("success", "")
+	res.Transcription = transcription
+	res.Audio = captured
+	res.SampleRate = 16000
+	if cfg.RequireSpeakerID {
+		if float64(len(captured))/16000 >= float64(e.SpeakerCfg.MinAudioDurationSeconds) {
+			res.Speaker, _ = e.SpeakerID.IdentifySamples(captured, 16000)
+		}
+		if res.Speaker == "" {
+			return result("verification_failed", "")
+		}
+	}
+	return res
 }
 
 // silencePCMAt returns mono PCM16 silence for the given sample rate and

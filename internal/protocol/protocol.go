@@ -17,6 +17,15 @@ type Request struct {
 	// node_id of "all" broadcasts to every node, and Priority orders the turn.
 	AudioWavBase64 string `json:"audio_wav_base64,omitempty"`
 
+	// CallMode says what "tts", "play" and "ask" do when the node is in an
+	// intercom call, where the call owns the node. Omitted, the request fails
+	// with "node is in an intercom call". "node" runs it inside the call for
+	// that node alone: a tts/play is heard by the node on top of the call, an
+	// ask sets the node aside from the call while it prompts and listens.
+	// "all" (tts/play only) plays it for everyone in the call. It has no effect
+	// on a node that is not in a call.
+	CallMode string `json:"call_mode,omitempty"`
+
 	// Ask-specific fields (used when action == "ask").
 	ContextID         string  `json:"context_id,omitempty"`
 	BargeIn           bool    `json:"barge_in,omitempty"`
@@ -58,6 +67,11 @@ type Response struct {
 	Recording  string `json:"recording,omitempty"`   // base64-encoded WAV (PCM16) of the captured speech
 	SampleRate int    `json:"sample_rate,omitempty"` // sample rate of the recording
 	Timestamp  int64  `json:"timestamp,omitempty"`   // unix seconds when the event was raised
+
+	// InCall marks a "wake" or "ask_completed" event that happened while the
+	// node was in an intercom call: the wake word was said in the call, or the
+	// ask ran inside it.
+	InCall bool `json:"in_call,omitempty"`
 
 	// Intercom event fields (event == "intercom_started" / "intercom_joined" /
 	// "intercom_left" / "intercom_ended"). NodeIDs and RemoteIDs (intercom

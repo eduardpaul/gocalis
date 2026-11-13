@@ -201,7 +201,11 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		if pNode.GetState() != node.StateIdle {
+		// The wake word starts a turn on an idle node, or, where the node opted
+		// in (kws.wake_in_call), on a node that is in an intercom call.
+		state := pNode.GetState()
+		inCall := state == node.StateIntercom && nodeCfg.KWS.WakeInCall
+		if state != node.StateIdle && !inCall {
 			finish()
 			return
 		}
@@ -243,6 +247,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 						VADTimeoutSeconds:   nodeCfg.GetAutoAskTimeoutSeconds(10),
 						CaptureDelaySeconds: nodeCfg.GetAutoAskCaptureDelaySeconds(1.5),
 						Priority:            nodeCfg.KWS.Priority,
+						InCall:              inCall,
 					})
 
 					event := protocol.Response{
@@ -253,6 +258,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 						Status:    result.Status,
 						Text:      result.Transcription,
 						Speaker:   result.Speaker,
+						InCall:    result.InCall,
 						Timestamp: time.Now().Unix(),
 					}
 
@@ -283,6 +289,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 				Event:     "wake",
 				NodeID:    pNode.NodeID,
 				Keyword:   keyword,
+				InCall:    inCall,
 				Timestamp: time.Now().Unix(),
 			})
 
@@ -290,7 +297,8 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 				return
 			}
 			log.Printf("[Node:%s] TTS: Routing wake reply through brain: \"%s\"\n", nodeCfg.NodeID, replyText)
-			if err := r.brain.Speak(wakeCtx, nodeCfg.NodeID, replyText, nodeCfg.KWS.Priority); err != nil {
+			// In a call the reply is for the node alone.
+			if err := r.brain.Speak(wakeCtx, nodeCfg.NodeID, replyText, nodeCfg.KWS.Priority, brain.CallNode); err != nil {
 				log.Printf("[Node:%s] TTS: Failed to play wake reply: %v\n", nodeCfg.NodeID, err)
 			}
 		}()
@@ -304,12 +312,22 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 	// speaker ID and ask/capture are routed through the VAD Gate.
 	halfDuplex := !nodeCfg.RTCStream.EchoCancellation
 	previousState := node.StateIdle
-	wakeActive := false // whether the wake stream is currently being fed (node IDLE)
+	wakeActive := false // whether the wake stream is currently being fed
+	askInCall := false  // whether an ask was listening to the node on the last chunk of a call
 	// After an intercom call the device keeps playing the tail of the human's
 	// voice from its jitter buffer for a moment; that echo must not reach the
 	// wake word detector or a new ask either.
 	intercomTail := time.Duration(nodeCfg.GetAutoAskCaptureDelaySeconds(1.5) * float64(time.Second))
 	var intercomGuardUntil time.Time
+	// feedSessions runs the VAD on a chunk and hands it, with the VAD's verdict,
+	// to the turns capturing on this node.
+	feedSessions := func(samples []float32) {
+		vadGate.AcceptWaveform(samples)
+		r.brain.Sessions().FeedPCM(nodeCfg.NodeID, samples, vadGate.IsSpeech())
+		for !vadGate.IsEmpty() {
+			vadGate.Pop()
+		}
+	}
 	audioNode.OnAudio(func(samples []float32) {
 		handle.Recorder.Add(samples)
 		if len(samples) == 0 {
@@ -333,15 +351,37 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 		}
 
 		// Intercom: while the node is in a call its microphone carries the people
-		// talking on the intercom, including the echo of the human's own voice on
-		// the device speaker. It goes ONLY to the intercom tap (installed when a
-		// peer node listens; no tap = a cheap map lookup), never to wake word
-		// detection, VAD/ask capture, ASR or the assistant. The half-duplex gate
-		// above does not apply (the node is INTERCOM, not SPEAKING), so the call
-		// stays full duplex.
+		// talking on the intercom, including the echo of the others' voices on
+		// the device speaker. It goes to the call, and by default to nothing
+		// else: not to wake word detection, VAD/ask capture, ASR or the
+		// assistant. The half-duplex gate above does not apply (the node is
+		// INTERCOM, not SPEAKING), so the call stays full duplex.
+		//
+		// Two things reach the assistant from a call, both opted into. The wake
+		// word, on a node with kws.wake_in_call. And what the node says while an
+		// ask is listening to it inside the call (the one the wake word starts,
+		// or one requested with call_mode), during which the call has set the
+		// node aside.
 		if state == node.StateIntercom {
 			r.brain.ForwardRawAudio(nodeCfg.NodeID, samples)
-			wakeActive = false
+			if nodeCfg.KWS.WakeInCall && !wakePending.Load() {
+				if !wakeActive {
+					wakeStream.Reset()
+					wakeActive = true
+				}
+				wakeStream.AcceptAudio(samples)
+			} else {
+				wakeActive = false
+			}
+			listening := r.brain.Sessions().ActiveCount(nodeCfg.NodeID) > 0
+			if listening {
+				if !askInCall {
+					// The VAD last ran before the call, or for an earlier ask.
+					vadGate.Reset()
+				}
+				feedSessions(samples)
+			}
+			askInCall = listening
 			return
 		}
 		if time.Now().Before(intercomGuardUntil) {
@@ -373,12 +413,7 @@ func (r *NodeRuntime) Run(ctx context.Context) {
 			wakeActive = false
 		}
 
-		vadGate.AcceptWaveform(samples)
-		r.brain.Sessions().FeedPCM(nodeCfg.NodeID, samples, vadGate.IsSpeech())
-		for !vadGate.IsEmpty() {
-			vadGate.Pop()
-		}
-
+		feedSessions(samples)
 	})
 
 	// Connect to the transport.
