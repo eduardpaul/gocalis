@@ -61,6 +61,47 @@ models:
         - "Esta es mi clave vocal de seguridad para hoy."
         - "Reconoce mis patrones de voz y ejecuta el comando."
 
+# Intercom calls: conferences that nodes and intercom pages (/intercom) join
+# and leave. While a node is in a call it plays only the call: TTS/ask/play
+# requests for it fail with "node is in an intercom call" and an ask in progress
+# is ended.
+# intercom:
+#   # How long a call lasts after the last join when the request does not say.
+#   default_timeout_seconds: 60
+#   echo_cancellation:
+#     enabled: false
+#   # go2rtc viewer the intercom page embeds for each node (a plain go2rtc
+#   # viewer: the page never talks to go2rtc). The page hears that node through
+#   # the viewer, and the rest of the call through gocalis. Must be reachable
+#   # from the browser over HTTPS when the page is served over HTTPS.
+#   viewers:
+#     front_door: "https://go2rtc.example/stream.html?src=doorbell_tv&mode=webrtc"
+
+# Plugins: optional parts of gocalis, switched on here. Each has an id (how API
+# requests address it, and the id of the node it adds), a type (the plugin
+# code) and settings of its own.
+# plugins:
+#   # telegram_call: makes a Telegram group's voice chat a node, one somebody
+#   # has to answer. tts, play, ask and intercom on node "telegram" open the
+#   # group's voice chat and wait there; they happen when somebody of the group
+#   # comes in. For the doorbell: an intercom call between the doorbell node
+#   # and this one. It logs in as a Telegram user (a bot cannot be in a voice
+#   # chat): use an account of its own, not the one you answer with, and log it
+#   # in once with `gocalis -config config.yaml -plugin-setup telegram`.
+#   - id: telegram
+#     type: telegram_call
+#     settings:
+#       api_id: 123456                 # from https://my.telegram.org
+#       api_hash: "0123456789abcdef0123456789abcdef"
+#       phone: "+34600000000"          # the account; only the setup uses it
+#       # The login. Whoever has this file has the account: keep it on a
+#       # volume that outlives the container and out of backups you share.
+#       session_file: "data/telegram.session"
+#       chat: "Casa"                   # the group: @username, numeric id or exact title
+#       title: "Timbre"                # name of a voice chat the plugin starts
+#       ring_seconds: 60               # how long it waits for somebody to come in
+#       idle_seconds: 15               # how long it stays after a tts/ask, for a reply
+
 mqtt:
   enabled: false
   broker: "tcp://localhost:1883"
@@ -89,6 +130,12 @@ nodes:
       threshold: 0.25
       auto_ask: true
       auto_ask_capture_delay_seconds: 1.5
+      # Keep the wake word armed while this node is in an intercom call: saying
+      # it sets the node aside from the call while the assistant listens, and
+      # the "wake" event carries in_call. Only for nodes whose microphone does
+      # not pick up their own speaker (hardware echo cancellation); otherwise
+      # anyone in the call can wake the assistant through that speaker.
+      # wake_in_call: true
       priority: 10
       wake_responses: []
       num_threads: 1

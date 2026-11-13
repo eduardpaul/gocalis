@@ -1,8 +1,10 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -12,20 +14,26 @@ import (
 	"gocalis/internal/ai"
 	"gocalis/internal/ask"
 	"gocalis/internal/audio"
+	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
+	"gocalis/internal/intercom"
+	"gocalis/internal/plugin"
 	"gocalis/internal/taskgroup"
 )
 
 // Executor runs actions requested by any transport adapter using the central brain
 // and the AI engines, then publishes the results back through EventPublisher.
 type Executor struct {
-	Tasks         *taskgroup.Group
-	Brain         *brain.Brain
-	ASREngine     ai.Transcriber
-	SpeakerEngine ai.SpeakerIdentifier
-	Publisher     EventPublisher
-	AskEngine     *ask.Engine
+	Tasks          *taskgroup.Group
+	Brain          *brain.Brain
+	ASREngine      ai.Transcriber
+	SpeakerEngine  ai.SpeakerIdentifier
+	Publisher      EventPublisher
+	AskEngine      *ask.Engine
+	IntercomEngine *intercom.Engine
+	// Plugins is set by StartPlugins; nil when no plugin is configured.
+	Plugins *plugin.Manager
 
 	// AudioBaseDir constrains where transport-supplied audio_file paths may point.
 	// It defaults to the process working directory. Requests referencing paths
@@ -34,8 +42,8 @@ type Executor struct {
 }
 
 // NewExecutor creates a command executor backed by the given engines and publisher.
-func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig) *Executor {
-	return &Executor{
+func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, speaker ai.SpeakerIdentifier, publisher EventPublisher, speakerIDCfg config.SpeakerIDConfig, intercomCfg config.IntercomConfig) *Executor {
+	e := &Executor{
 		Tasks:         taskgroup.New(ctx, 32),
 		Brain:         brain,
 		ASREngine:     asr,
@@ -44,6 +52,50 @@ func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, sp
 		AskEngine:     ask.NewEngine(brain, asr, speaker, speakerIDCfg),
 		AudioBaseDir:  ".",
 	}
+	// The intercom engine reports the life of its calls asynchronously;
+	// translate its events onto the shared event bus.
+	e.IntercomEngine = intercom.NewEngine(brain, intercomCfg, func(ev intercom.Event) {
+		e.Publisher.Publish(Response{
+			Event:            ev.Event,
+			NodeIDs:          ev.NodeIDs,
+			RemoteIDs:        ev.RemoteIDs,
+			ParticipantID:    ev.ParticipantID,
+			Status:           ev.Status,
+			Reason:           ev.Reason,
+			Message:          ev.Message,
+			DurationSeconds:  ev.DurationSeconds,
+			RemainingSeconds: ev.RemainingSeconds,
+		})
+	}, intercom.NewSpeexEchoCanceller)
+	return e
+}
+
+// StartPlugins builds the configured plugins and runs them until ctx ends. They
+// report on this executor's event bus; addNode registers the nodes they bring
+// (see plugin.Services).
+func (e *Executor) StartPlugins(ctx context.Context, cfgs []config.PluginConfig, addNode func(id, typeName string, audio audionode.AudioNode) (func(), error)) error {
+	if len(cfgs) == 0 {
+		return nil
+	}
+	manager, err := plugin.Start(ctx, cfgs, plugin.Services{
+		AddNode: addNode,
+		Publish: func(pluginID string, ev plugin.Event) {
+			e.Publisher.Publish(Response{
+				Event:   ev.Name,
+				Plugin:  pluginID,
+				NodeID:  ev.NodeID,
+				Status:  ev.Status,
+				Reason:  ev.Reason,
+				Message: ev.Message,
+				Data:    ev.Data,
+			})
+		},
+	})
+	if err != nil {
+		return err
+	}
+	e.Plugins = manager
+	return nil
 }
 
 // resolveAudioFile validates a transport-supplied audio file path and returns a
@@ -98,6 +150,14 @@ func (e *Executor) Execute(ctx context.Context, req Request) {
 		e.executeAsk(ctx, req)
 	case "play":
 		e.executePlay(ctx, req)
+	case "intercom":
+		e.executeIntercom(req)
+	case "intercom_leave":
+		e.executeIntercomLeave(req)
+	case "intercom_stop":
+		e.executeIntercomStop(req)
+	case "plugin":
+		e.executePlugin(ctx, req)
 	default:
 		e.publishError(req.NodeID, fmt.Sprintf("unknown action: %s", req.Action))
 	}
@@ -116,14 +176,14 @@ func (e *Executor) executeTTS(ctx context.Context, req Request) {
 	var err error
 	if req.NodeID == "all" {
 		log.Printf("[Executor] TTS to all nodes: \"%s\"\n", req.Text)
-		err = e.Brain.SpeakAll(ctx, req.Text, req.Priority)
+		err = e.Brain.SpeakAll(ctx, req.Text, req.Priority, req.callMode())
 	} else {
 		log.Printf("[Executor] TTS to node '%s': \"%s\"\n", req.NodeID, req.Text)
-		err = e.Brain.Speak(ctx, req.NodeID, req.Text, req.Priority)
+		err = e.Brain.Speak(ctx, req.NodeID, req.Text, req.Priority, req.callMode())
 	}
 
 	if err != nil {
-		e.publishError(req.NodeID, err.Error())
+		e.publishFailure(req.NodeID, err)
 		return
 	}
 
@@ -161,14 +221,14 @@ func (e *Executor) executePlay(ctx context.Context, req Request) {
 
 	if req.NodeID == "all" {
 		log.Printf("[Executor] Play recording on all nodes (%d samples @ %dHz)\n", len(samples), sampleRate)
-		err = e.Brain.PlaySamplesAll(ctx, samples, sampleRate, req.Priority)
+		err = e.Brain.PlaySamplesAll(ctx, samples, sampleRate, req.Priority, req.callMode())
 	} else {
 		log.Printf("[Executor] Play recording on node '%s' (%d samples @ %dHz)\n", req.NodeID, len(samples), sampleRate)
-		err = e.Brain.PlaySamples(ctx, req.NodeID, samples, sampleRate, req.Priority)
+		err = e.Brain.PlaySamples(ctx, req.NodeID, samples, sampleRate, req.Priority, req.callMode())
 	}
 
 	if err != nil {
-		e.publishError(req.NodeID, err.Error())
+		e.publishFailure(req.NodeID, err)
 		return
 	}
 
@@ -229,9 +289,10 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 		return
 	}
 
-	log.Printf("[Executor] Ask on node '%s' (barge_in=%v)\n", req.NodeID, req.BargeIn)
+	cfg := e.AskConfig(req)
+	log.Printf("[Executor] Ask on node '%s' (barge_in=%v, capture_delay=%.2fs)\n", req.NodeID, req.BargeIn, cfg.CaptureDelaySeconds)
 
-	result := e.AskEngine.Run(ctx, req.AskConfig())
+	result := e.AskEngine.Run(ctx, cfg)
 
 	resp := Response{
 		Event:   "ask_completed",
@@ -239,6 +300,7 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 		Status:  result.Status,
 		Speaker: result.Speaker,
 		Message: result.ErrorMessage,
+		InCall:  result.InCall,
 	}
 
 	switch req.OutputFormat {
@@ -258,6 +320,56 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 	e.Publisher.Publish(resp)
 }
 
+// executeIntercom puts the nodes in 'node_ids' (two or more) in a call
+// together: it starts one, or brings the nodes that are not in a call into the
+// one the others are in. The call runs in the background and the engine
+// announces what happens to it ("intercom_started", "intercom_joined", ...).
+func (e *Executor) executeIntercom(req Request) {
+	duration := time.Duration(req.DurationSeconds * float64(time.Second))
+	log.Printf("[Executor] Intercom among [%s] (duration=%v)\n", strings.Join(req.NodeIDs, ", "), duration)
+	if err := e.IntercomEngine.Connect(req.NodeIDs, duration); err != nil {
+		e.publishError(req.NodeIDs[0], err.Error())
+	}
+}
+
+// executeIntercomLeave takes node_id out of the call it is in; the call goes on
+// for the others unless fewer than two remain.
+func (e *Executor) executeIntercomLeave(req Request) {
+	log.Printf("[Executor] Intercom leave requested for '%s'\n", req.NodeID)
+	if !e.IntercomEngine.Leave(req.NodeID) {
+		e.publishError(req.NodeID, "no active intercom call for node")
+	}
+}
+
+// executeIntercomStop ends the whole intercom call that node_id is in.
+func (e *Executor) executeIntercomStop(req Request) {
+	log.Printf("[Executor] Intercom stop requested for '%s'\n", req.NodeID)
+	if !e.IntercomEngine.Stop(req.NodeID) {
+		e.publishError(req.NodeID, "no active intercom call for node")
+	}
+}
+
+// executePlugin hands the command to the plugin. The plugin reports what comes
+// of it with its own events; a command it refuses is answered with an "error"
+// event that carries the plugin's id.
+func (e *Executor) executePlugin(ctx context.Context, req Request) {
+	log.Printf("[Executor] Plugin '%s' command '%s' (node: %s)\n", req.Plugin, req.Command, req.NodeID)
+	err := fmt.Errorf("no plugin '%s'", req.Plugin)
+	if e.Plugins != nil {
+		err = e.Plugins.Command(ctx, req.Plugin, plugin.Command{Name: req.Command, NodeID: req.NodeID, Args: req.Args})
+	}
+	if err != nil {
+		log.Printf("[Executor] Plugin '%s' refused '%s': %v\n", req.Plugin, req.Command, err)
+		e.Publisher.Publish(Response{
+			Event:   "error",
+			Plugin:  req.Plugin,
+			NodeID:  req.NodeID,
+			Status:  "error",
+			Message: err.Error(),
+		})
+	}
+}
+
 func (e *Executor) publishError(nodeID string, message string) {
 	log.Printf("[Executor] Error (node: %s): %s\n", nodeID, message)
 	e.Publisher.Publish(Response{
@@ -266,6 +378,21 @@ func (e *Executor) publishError(nodeID string, message string) {
 		Status:  "error",
 		Message: message,
 	})
+}
+
+// publishFailure reports why a tts or play did not happen. On a node somebody
+// has to answer the error also says, in reason, that nobody did ("unanswered")
+// or that they left before it was through ("hung_up").
+func (e *Executor) publishFailure(nodeID string, err error) {
+	log.Printf("[Executor] Error (node: %s): %v\n", nodeID, err)
+	resp := Response{Event: "error", NodeID: nodeID, Status: "error", Message: err.Error()}
+	switch {
+	case errors.Is(err, audionode.ErrUnanswered):
+		resp.Reason = "unanswered"
+	case errors.Is(err, audionode.ErrHungUp):
+		resp.Reason = "hung_up"
+	}
+	e.Publisher.Publish(resp)
 }
 
 // Submit admits detached commands into the application's bounded task lifetime.
@@ -280,8 +407,41 @@ func (e *Executor) Submit(req Request) error {
 	})
 }
 
+// AskConfig converts the request into an ask configuration. An omitted
+// capture_delay_seconds yields 0 here; use Executor.AskConfig to apply the
+// node's configured default.
 func (r Request) AskConfig() ask.Config {
-	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: r.CaptureDelaySeconds, Priority: r.Priority}
+	var captureDelay float64
+	if r.CaptureDelaySeconds != nil {
+		captureDelay = *r.CaptureDelaySeconds
+	}
+	return ask.Config{ContextID: r.ContextID, NodeID: r.NodeID, TTSText: r.Text, BargeIn: r.BargeIn, RequireSpeakerID: r.RequireSpeakerID, VADTimeoutSeconds: r.VADTimeoutSeconds, PostSpeechSilenceSeconds: r.PostSpeechSilenceSeconds, CaptureDelaySeconds: captureDelay, Priority: r.Priority, InCall: r.CallMode == "node"}
+}
+
+// callMode converts the request's call_mode for the brain.
+func (r Request) callMode() brain.CallMode {
+	switch r.CallMode {
+	case "node":
+		return brain.CallNode
+	case "all":
+		return brain.CallAll
+	}
+	return brain.CallReject
+}
+
+// AskConfig resolves an ask request for execution. When the request omits
+// capture_delay_seconds, the node's auto_ask_capture_delay_seconds applies, so
+// API asks get the same post-prompt guard as wake-triggered asks (it keeps a
+// half-duplex device from re-capturing its own prompt/chime tail). An explicit
+// value, including 0, always wins.
+func (e *Executor) AskConfig(req Request) ask.Config {
+	cfg := req.AskConfig()
+	if req.CaptureDelaySeconds == nil && e.Brain != nil {
+		if h := e.Brain.GetNodeHandle(req.NodeID); h != nil {
+			cfg.CaptureDelaySeconds = h.Config.GetAutoAskCaptureDelaySeconds(1.5)
+		}
+	}
+	return cfg
 }
 
 func (r Request) Validate() error {
@@ -293,6 +453,15 @@ func (r Request) Validate() error {
 	}
 	if r.OutputFormat != "" && r.OutputFormat != "text" && r.OutputFormat != "audio" && r.OutputFormat != "both" {
 		return fmt.Errorf("output_format must be text, audio or both")
+	}
+	switch r.CallMode {
+	case "", "node":
+	case "all":
+		if r.Action == "ask" {
+			return fmt.Errorf("an ask in a call is for its node: call_mode must be node")
+		}
+	default:
+		return fmt.Errorf("call_mode must be node or all")
 	}
 	switch r.Action {
 	case "tts":
@@ -312,6 +481,38 @@ func (r Request) Validate() error {
 		}
 	case "ask":
 		return r.AskConfig().Validate()
+	case "intercom":
+		if len(r.NodeIDs) < 2 {
+			return fmt.Errorf("intercom requires at least two node_ids")
+		}
+		if len(r.NodeIDs) > intercom.MaxParticipants {
+			return fmt.Errorf("intercom supports at most %d participants", intercom.MaxParticipants)
+		}
+		for _, id := range r.NodeIDs {
+			if id == "" || len(id) > 256 {
+				return fmt.Errorf("intercom node_ids must be non-empty identifiers")
+			}
+		}
+		if r.DurationSeconds < 0 {
+			return fmt.Errorf("duration_seconds must not be negative")
+		}
+	case "intercom_leave", "intercom_stop":
+		if r.NodeID == "" {
+			return fmt.Errorf("%s requires node_id", r.Action)
+		}
+	case "plugin":
+		if r.Plugin == "" || r.Command == "" {
+			return fmt.Errorf("plugin requires plugin and command")
+		}
+		if len(r.Plugin) > 64 || len(r.Command) > 64 {
+			return fmt.Errorf("plugin or command name is too long")
+		}
+		if len(r.Args) > 64<<10 {
+			return fmt.Errorf("args exceed 64 KiB")
+		}
+		if args := bytes.TrimSpace(r.Args); len(args) > 0 && args[0] != '{' {
+			return fmt.Errorf("args must be a JSON object")
+		}
 	default:
 		return fmt.Errorf("unknown action: %s", r.Action)
 	}

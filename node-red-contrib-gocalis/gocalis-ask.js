@@ -35,7 +35,15 @@ module.exports = function(RED) {
         this.requireSpeakerId = !!config.requireSpeakerId;
         this.outputFormat = config.outputFormat || "both";
         this.vadTimeout = parseFloat(config.vadTimeout) || 10.0;
+        // Left blank by default so the server applies the node's configured
+        // capture delay (auto_ask_capture_delay_seconds).
+        this.captureDelay = (config.captureDelay !== undefined && String(config.captureDelay).trim() !== "")
+            ? parseFloat(config.captureDelay)
+            : undefined;
         this.priority = parseInt(config.priority) || 0;
+        // What to do when the node is in an intercom call: "" fails, "node"
+        // runs inside the call for the node alone, "all" for the whole call.
+        this.callMode = config.callMode || "";
 
         const node = this;
 
@@ -144,6 +152,16 @@ module.exports = function(RED) {
                 postSpeechSilenceSeconds = parseFloat(msg.postSpeechSilenceSeconds);
             }
 
+            // Delay before capture starts after the prompt (guards half-duplex
+            // devices from re-capturing the prompt/chime tail). Left undefined
+            // unless configured or provided, so the server default applies.
+            let captureDelaySeconds = node.captureDelay;
+            if (msg.capture_delay_seconds !== undefined) {
+                captureDelaySeconds = parseFloat(msg.capture_delay_seconds);
+            } else if (msg.captureDelaySeconds !== undefined) {
+                captureDelaySeconds = parseFloat(msg.captureDelaySeconds);
+            }
+
             const payload = {
                 action: "ask",
                 context_id: contextId,
@@ -154,6 +172,8 @@ module.exports = function(RED) {
                 output_format: outputFormat,
                 vad_timeout_seconds: vadTimeout,
                 post_speech_silence_seconds: Number.isFinite(postSpeechSilenceSeconds) ? postSpeechSilenceSeconds : undefined,
+                capture_delay_seconds: Number.isFinite(captureDelaySeconds) ? captureDelaySeconds : undefined,
+                call_mode: (msg.call_mode !== undefined ? String(msg.call_mode) : node.callMode) || undefined,
                 priority: msg.priority !== undefined ? parseInt(msg.priority) : node.priority
             };
 
@@ -167,6 +187,7 @@ module.exports = function(RED) {
                 msg.status = result.status;
                 msg.transcription = result.text;
                 msg.speaker = result.speaker;
+                msg.in_call = result.in_call === true;
                 msg.audio_wav_base64 = result.audio_wav_base64;
                 msg.recording = result.audio_wav_base64 || result.recording;
                 msg.node_id = result.node_id || resolvedNodeId;
@@ -184,6 +205,12 @@ module.exports = function(RED) {
                     done();
                 } else if (result.status === "silence_timeout") {
                     node.status({ fill: "yellow", shape: "ring", text: "silence timeout" });
+                    send([null, msg]);
+                    done();
+                } else if (result.status === "unanswered" || result.status === "hung_up") {
+                    // A node somebody has to answer: nobody did, or they left
+                    // before giving an answer.
+                    node.status({ fill: "yellow", shape: "ring", text: result.status.replace("_", " ") });
                     send([null, msg]);
                     done();
                 } else if (result.status === "verification_failed") {

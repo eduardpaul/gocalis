@@ -18,7 +18,10 @@ function NodeGrid({ nodes }) {
             <span className={`badge ${node.state?.toLowerCase() || 'idle'}`}>
               {node.state || 'IDLE'}
             </span>
-            <span className="node-meta">Type: {node.type || 'unknown'}</span>
+            <span className="node-meta">
+              Type: {node.type || 'unknown'}
+              {node.answer === 'call' ? ' (has to be answered)' : ''}
+            </span>
           </div>
         ))}
       </div>

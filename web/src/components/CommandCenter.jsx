@@ -6,17 +6,28 @@ import { useState } from 'react'
 //  - ask        -> POST /api/ask                      (prompt -> listen -> ASR, returns text)
 //  - asr        -> POST /api/execute {action:'asr'}
 //  - speaker_id -> POST /api/execute {action:'speaker_id'}
+//  - plugin     -> POST /api/execute {action:'plugin'} (a command for a plugin from GET /api/plugins)
 const TABS = [
   { id: 'say', label: 'Say', hint: 'Speak text on a node' },
   { id: 'tts', label: 'TTS', hint: 'Render text to a WAV file (no playback)' },
   { id: 'ask', label: 'Ask', hint: 'Speak a prompt, listen, and transcribe the reply' },
+  { id: 'intercom', label: 'Intercom', hint: 'Put nodes in a live call together' },
+  { id: 'plugin', label: 'Plugin', hint: 'Send a command to a plugin' },
   { id: 'asr', label: 'ASR', hint: 'Transcribe an audio file' },
   { id: 'speaker_id', label: 'Speaker ID', hint: 'Identify the speaker in an audio file' },
 ]
 
-function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers }) {
+function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers, onLoadPlugins }) {
   const [activeTab, setActiveTab] = useState('say')
   const [nodeId, setNodeId] = useState('all')
+  const [intercomNodes, setIntercomNodes] = useState([])
+  const [intercomDuration, setIntercomDuration] = useState(60)
+  const [callMode, setCallMode] = useState('')
+  const [plugins, setPlugins] = useState([])
+  const [pluginId, setPluginId] = useState('')
+  const [pluginCommand, setPluginCommand] = useState('hangup')
+  const [pluginNode, setPluginNode] = useState('')
+  const [pluginArgs, setPluginArgs] = useState('')
   const [text, setText] = useState('')
   const [filename, setFilename] = useState('')
   const [audioFile, setAudioFile] = useState('')
@@ -34,6 +45,37 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
 
   const activeMeta = TABS.find((t) => t.id === activeTab)
 
+  // selectTab switches tabs, seeding the intercom participant set with the first
+  // two available nodes (connecting takes at least two).
+  const selectTab = (id) => {
+    if (id === 'intercom' && intercomNodes.length < 2) {
+      setIntercomNodes(singleNodeOptions.slice(0, 2).map((o) => o.value))
+    }
+    if (id === 'plugin') {
+      refreshPlugins()
+    }
+    setActiveTab(id)
+    setLastResult(null)
+  }
+
+  // refreshPlugins reads the configured plugins and what each is doing.
+  const refreshPlugins = async () => {
+    try {
+      const list = await onLoadPlugins()
+      setPlugins(list)
+      setPluginId((current) => (list.some((p) => p.id === current) ? current : list[0]?.id ?? ''))
+    } catch (err) {
+      setLastResult({ status: 'error', error_message: err.message })
+    }
+  }
+
+  // toggleIntercomNode adds or removes a node from the participant set.
+  const toggleIntercomNode = (value) => {
+    setIntercomNodes((prev) =>
+      prev.includes(value) ? prev.filter((v) => v !== value) : [...prev, value]
+    )
+  }
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     setLoading(true)
@@ -42,7 +84,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     try {
       let result
       if (activeTab === 'say') {
-        result = await onExecute('tts', { node_id: nodeId, text, priority: Number(priority) })
+        result = await onExecute('tts', { node_id: nodeId, text, priority: Number(priority), call_mode: callMode || undefined })
       } else if (activeTab === 'tts') {
         result = await onSynthesize({ text, filename, priority: Number(priority) })
       } else if (activeTab === 'ask') {
@@ -52,7 +94,35 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           require_speaker_id: requireSpeakerId,
           vad_timeout_seconds: Number(vadTimeout),
           priority: Number(priority),
+          call_mode: callMode === 'node' ? 'node' : undefined,
         })
+      } else if (activeTab === 'intercom') {
+        if (intercomNodes.length < 2) {
+          throw new Error('Select at least two nodes to connect')
+        }
+        result = await onExecute('intercom', {
+          node_ids: intercomNodes,
+          duration_seconds: Number(intercomDuration),
+        })
+      } else if (activeTab === 'plugin') {
+        if (!pluginId) {
+          throw new Error('No plugin is configured on the server')
+        }
+        let args
+        if (pluginArgs.trim() !== '') {
+          try {
+            args = JSON.parse(pluginArgs)
+          } catch (err) {
+            throw new Error(`Args are not valid JSON: ${err.message}`)
+          }
+        }
+        result = await onExecute('plugin', {
+          plugin: pluginId,
+          command: pluginCommand.trim(),
+          node_id: pluginNode || undefined,
+          args,
+        })
+        refreshPlugins()
       } else {
         // asr / speaker_id
         result = await onExecute(activeTab, {
@@ -81,6 +151,27 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     }
   }
 
+  // handleIntercomExit takes the first selected node out of its call
+  // ('intercom_leave': the call goes on for the others) or ends that call for
+  // everyone ('intercom_stop').
+  const handleIntercomExit = async (action) => {
+    const a = intercomNodes[0]
+    if (!a) {
+      setLastResult({ status: 'error', error_message: 'Select a node that is in the call' })
+      return
+    }
+    setLoading(true)
+    setLastResult(null)
+    try {
+      const result = await onExecute(action, { node_id: a })
+      setLastResult(result)
+    } catch (err) {
+      setLastResult({ status: 'error', error_message: err.message })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="card command-center">
       <h2>Command Center</h2>
@@ -90,10 +181,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           <button
             key={tab.id}
             className={activeTab === tab.id ? 'active' : ''}
-            onClick={() => {
-              setActiveTab(tab.id)
-              setLastResult(null)
-            }}
+            onClick={() => selectTab(tab.id)}
           >
             {tab.label}
           </button>
@@ -197,6 +285,110 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           </>
         )}
 
+        {activeTab === 'intercom' && (
+          <>
+            <label>
+              Participants <span className="hint">(select two or more nodes to connect)</span>
+              <div className="intercom-participants">
+                {singleNodeOptions.length === 0 && <span className="hint">No nodes available</span>}
+                {singleNodeOptions.map((opt) => (
+                  <label key={opt.value} className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={intercomNodes.includes(opt.value)}
+                      onChange={() => toggleIntercomNode(opt.value)}
+                    />
+                    {opt.label}
+                  </label>
+                ))}
+              </div>
+            </label>
+            <label>
+              Lasts at least (seconds) <span className="hint">(from now; 0 = server default)</span>
+              <input
+                type="number"
+                value={intercomDuration}
+                onChange={(e) => setIntercomDuration(e.target.value)}
+                min={0}
+                max={3600}
+              />
+            </label>
+            <p className="hint">
+              Connecting starts a call, or brings the selected nodes into the call one of them is
+              already in. While a node is in a call, the call is its only audio: whatever it was
+              saying is cut off, and any Say/Ask targeting it fails until it leaves. Each
+              participant hears all the others, and a chime marks every join and leave. Leave takes
+              the first selected node out of its call; Stop ends that call for everyone. To join a
+              call from a browser or a phone, use the intercom page (/intercom).
+            </p>
+          </>
+        )}
+
+        {activeTab === 'plugin' && (
+          <>
+            <label>
+              Plugin
+              <select value={pluginId} onChange={(e) => setPluginId(e.target.value)}>
+                {plugins.length === 0 && <option value="">No plugins configured</option>}
+                {plugins.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.id} ({p.type})
+                  </option>
+                ))}
+              </select>
+            </label>
+            {plugins
+              .filter((p) => p.id === pluginId)
+              .map((p) => (
+                <p key={p.id} className="hint">
+                  {p.ready ? 'Ready' : 'Not ready'}: {p.detail}
+                </p>
+              ))}
+            <div className="form-row">
+              <label>
+                Command
+                <input
+                  type="text"
+                  value={pluginCommand}
+                  onChange={(e) => setPluginCommand(e.target.value)}
+                  placeholder="hangup"
+                  list="plugin-commands"
+                  required
+                />
+                <datalist id="plugin-commands">
+                  <option value="hangup" />
+                </datalist>
+              </label>
+              <label>
+                Node
+                <select value={pluginNode} onChange={(e) => setPluginNode(e.target.value)}>
+                  <option value="">(none)</option>
+                  {singleNodeOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label>
+              Args <span className="hint">(JSON object, optional)</span>
+              <input
+                type="text"
+                value={pluginArgs}
+                onChange={(e) => setPluginArgs(e.target.value)}
+                placeholder='{}'
+              />
+            </label>
+            <p className="hint">
+              A plugin reports with events: watch the event feed. The node a plugin adds is used
+              from the other tabs: for telegram_call, TTS, Ask and Intercom on its node ring the
+              group and happen when somebody comes in; &quot;hangup&quot; here takes gocalis out of the
+              voice chat.
+            </p>
+          </>
+        )}
+
         {(activeTab === 'asr' || activeTab === 'speaker_id') && (
           <>
             <label>
@@ -223,26 +415,50 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           </>
         )}
 
-        <div className="form-row">
+        {(activeTab === 'say' || activeTab === 'ask') && (
           <label>
-            Priority
-            <input
-              type="number"
-              value={priority}
-              onChange={(e) => setPriority(e.target.value)}
-              min={0}
-              max={100}
-            />
+            If the node is in an intercom call <span className="hint">(the call owns its speaker)</span>
+            <select value={callMode} onChange={(e) => setCallMode(e.target.value)}>
+              <option value="">Fail</option>
+              <option value="node">Inside the call, for the node alone</option>
+              {activeTab === 'say' && <option value="all">Inside the call, for everyone</option>}
+            </select>
           </label>
-        </div>
+        )}
+
+        {activeTab !== 'intercom' && activeTab !== 'plugin' && (
+          <div className="form-row">
+            <label>
+              Priority
+              <input
+                type="number"
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                min={0}
+                max={100}
+              />
+            </label>
+          </div>
+        )}
 
         <div className="command-actions">
           <button type="submit" className="btn" disabled={loading}>
-            {loading ? 'Sending...' : `Run ${activeMeta?.label ?? activeTab}`}
+            {loading ? 'Sending...' : activeTab === 'intercom' ? 'Connect' : activeTab === 'plugin' ? 'Send' : `Run ${activeMeta?.label ?? activeTab}`}
           </button>
-          <button type="button" className="btn btn-secondary" onClick={handleReload} disabled={loading}>
-            Reload Speakers
-          </button>
+          {activeTab === 'intercom' ? (
+            <>
+              <button type="button" className="btn btn-secondary" onClick={() => handleIntercomExit('intercom_leave')} disabled={loading}>
+                Leave
+              </button>
+              <button type="button" className="btn btn-secondary" onClick={() => handleIntercomExit('intercom_stop')} disabled={loading}>
+                Stop
+              </button>
+            </>
+          ) : (
+            <button type="button" className="btn btn-secondary" onClick={handleReload} disabled={loading}>
+              Reload Speakers
+            </button>
+          )}
         </div>
       </form>
 

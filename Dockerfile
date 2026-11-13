@@ -5,9 +5,9 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM golang:1.24.13-bookworm AS go-base
+FROM golang:1.26.5-bookworm AS go-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    alsa-utils libopus-dev libopusfile-dev pkg-config bzip2 \
+    alsa-utils libopus-dev libopusfile-dev libspeexdsp-dev pkg-config bzip2 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
@@ -37,7 +37,7 @@ CMD ["go", "test", "-race", "-timeout=2m", "./..."]
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    alsa-utils ca-certificates libopus0 libopusfile0 libgomp1 \
+    alsa-utils ca-certificates libopus0 libopusfile0 libspeexdsp1 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /out/gocalis /usr/local/bin/gocalis

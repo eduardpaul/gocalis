@@ -23,6 +23,7 @@ import (
 	"gocalis/internal/audio"
 	"gocalis/internal/brain"
 	"gocalis/internal/httpsec"
+	"gocalis/internal/plugin"
 	"gocalis/internal/protocol"
 	"gocalis/internal/taskgroup"
 	"gocalis/internal/wshub"
@@ -42,6 +43,14 @@ type Server struct {
 	startTime     time.Time
 	authToken     string
 
+	// intercomViewers maps a node id to the go2rtc viewer the intercom page
+	// embeds (config intercom.viewers).
+	intercomViewers map[string]string
+
+	// intercomPing and intercomIdle are how often an intercom page is pinged
+	// and how long it may go without answering before it is dropped.
+	intercomPing, intercomIdle time.Duration
+
 	hub      *wshub.Hub
 	upgrader websocket.Upgrader
 
@@ -60,6 +69,8 @@ func NewServer(addr string, b *brain.Brain, executor *protocol.Executor, speaker
 		speakerEngine: speakerEngine,
 		startTime:     time.Now(),
 		authToken:     authToken,
+		intercomPing:  intercomPingInterval,
+		intercomIdle:  intercomIdleTimeout,
 		hub:           wshub.New(),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
@@ -77,12 +88,19 @@ func (s *Server) Start() error {
 	// without embedding credentials; control endpoints require the auth token.
 	mux.HandleFunc("/api/status", s.withCORS(s.handleStatus))
 	mux.HandleFunc("/api/nodes", s.withCORS(s.handleNodes))
+	mux.HandleFunc("/api/plugins", s.withCORS(httpsec.RequireToken(s.authToken, s.handlePlugins)))
 	mux.HandleFunc("/api/execute", s.withCORS(httpsec.RequireToken(s.authToken, s.handleExecute)))
 	mux.HandleFunc("/api/synthesize", s.control(s.handleSynthesize))
 	mux.HandleFunc("/api/ask", s.control(s.handleAsk))
 	mux.HandleFunc("/ask", s.control(s.handleAsk))
 	mux.HandleFunc("/api/reload-speakers", s.control(s.handleReloadSpeakers))
 	mux.HandleFunc("/api/events", s.handleEvents)
+
+	// Intercom page: the browser joins the call of a node. It plays the node
+	// from go2rtc and exchanges the rest of the call's audio with gocalis.
+	mux.HandleFunc("/intercom", s.handleIntercomPage)
+	mux.HandleFunc("/api/intercom/config", s.withCORS(httpsec.RequireToken(s.authToken, s.handleIntercomConfig)))
+	mux.HandleFunc("/api/intercom/ws", s.handleIntercomWS)
 
 	// Static files from embedded React build
 	staticFS, err := fs.Sub(distFS, "dist")
@@ -176,6 +194,20 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, s.brain.ListNodes())
+}
+
+// handlePlugins lists the configured plugins and whether each can take
+// commands right now.
+func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	plugins := []plugin.Info{}
+	if s.executor != nil && s.executor.Plugins != nil {
+		plugins = s.executor.Plugins.List()
+	}
+	s.writeJSON(w, plugins)
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -310,6 +342,7 @@ type AskResponse struct {
 	Speaker        string `json:"speaker"`
 	AudioWavBase64 string `json:"audio_wav_base64"`
 	ErrorMessage   string `json:"error_message"`
+	InCall         bool   `json:"in_call,omitempty"` // the ask ran inside the node's intercom call
 }
 
 func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
@@ -328,7 +361,11 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	result := s.executor.AskEngine.Run(r.Context(), req.AskConfig())
+	// An ask outlasts the server's write timeout as soon as its node has to be
+	// answered first (it rings for up to minutes): the request's own context
+	// bounds it instead.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	result := s.executor.AskEngine.Run(r.Context(), s.executor.AskConfig(req))
 	var audioBase64 string
 	if (req.OutputFormat == "audio" || req.OutputFormat == "both") && len(result.Audio) > 0 {
 		audioBase64 = base64.StdEncoding.EncodeToString(audio.EncodeWAVFloat32(result.Audio, result.SampleRate))
@@ -342,6 +379,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		Speaker:        result.Speaker,
 		AudioWavBase64: audioBase64,
 		ErrorMessage:   result.ErrorMessage,
+		InCall:         result.InCall,
 	})
 }
 

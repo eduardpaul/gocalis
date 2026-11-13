@@ -13,7 +13,9 @@
             requireSpeakerId: { value: false },
             outputFormat: { value: "both" },
             vadTimeout: { value: 10.0, validate: RED.validators.number() },
-            priority: { value: 0, validate: RED.validators.number() }
+            captureDelay: { value: "", validate: function(v) { return v === "" || !isNaN(parseFloat(v)); } },
+            priority: { value: 0, validate: RED.validators.number() },
+            callMode: { value: "" }
         },
         inputs: 1,
         outputs: 2,
@@ -80,7 +82,29 @@
         <input type="number" id="node-input-vadTimeout" placeholder="10.0" step="0.5" min="1">
     </div>
     <div class="form-row">
+        <label for="node-input-captureDelay"><i class="fa fa-hourglass-start"></i> Capture Delay</label>
+        <input type="number" id="node-input-captureDelay" placeholder="node default (auto_ask_capture_delay_seconds)" step="0.1" min="0">
+    </div>
+    <div class="form-row">
         <label for="node-input-priority"><i class="fa fa-sort-amount-desc"></i> Priority</label>
         <input type="number" id="node-input-priority" placeholder="0" min="0" step="1">
     </div>
+    <div class="form-row">
+        <label for="node-input-callMode"><i class="fa fa-phone"></i> In a call</label>
+        <select id="node-input-callMode" style="width: 70%;">
+            <option value="">Fail (the call owns the node)</option>
+            <option value="node">Ask the node, set aside from the call</option>
+        </select>
+    </div>
+</script>
+
+<script type="text/html" data-help-name="gocalis-ask">
+    <h3>During an intercom call</h3>
+    <p>By default an ask fails for a node in an intercom call
+    (<code>"node is in an intercom call"</code>). <b>In a call</b> (or
+    <code>msg.call_mode = "node"</code>) runs it inside the call: the node is set
+    aside from the conversation while it hears the prompt and answers, so the
+    others hear neither, and is put back as soon as it has been listened to.
+    There is no barge-in or voice challenge in a call. The result carries
+    <code>msg.in_call</code>.</p>
 </script>

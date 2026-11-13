@@ -10,7 +10,8 @@
             text: { value: "" },
             textType: { value: "str" },
             bargeIn: { value: false },
-            priority: { value: 0, validate: RED.validators.number() }
+            priority: { value: 0, validate: RED.validators.number() },
+            callMode: { value: "" }
         },
         inputs: 1,
         outputs: 1,
@@ -62,4 +63,22 @@
         <label for="node-input-priority"><i class="fa fa-sort-amount-desc"></i> Priority</label>
         <input type="number" id="node-input-priority" placeholder="0" min="0" step="1">
     </div>
+    <div class="form-row">
+        <label for="node-input-callMode"><i class="fa fa-phone"></i> In a call</label>
+        <select id="node-input-callMode" style="width: 70%;">
+            <option value="">Fail (the call owns the node)</option>
+            <option value="node">Say it to the node, inside the call</option>
+            <option value="all">Say it to everyone in the call</option>
+        </select>
+    </div>
+</script>
+
+<script type="text/html" data-help-name="gocalis-say">
+    <h3>During an intercom call</h3>
+    <p>A node in an intercom call plays only the call, so by default saying
+    something on it fails with <code>"node is in an intercom call"</code>.
+    <b>In a call</b> (or <code>msg.call_mode</code>: <code>"node"</code> /
+    <code>"all"</code>) speaks inside the call instead: to that node alone, on
+    top of what it hears, or to every participant. It changes nothing for a node
+    that is not in a call.</p>
 </script>

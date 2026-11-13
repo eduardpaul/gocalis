@@ -86,9 +86,11 @@ module.exports = function(RED) {
         };
 
         // Send an action Request over the WebSocket and resolve with the
-        // correlated completion event. Correlation is by (event name, node_id):
-        // the returned Promise resolves on the first event whose `event` is in
-        // opts.expectEvents (or is "error") and whose node_id matches opts.nodeId.
+        // correlated completion event. By default correlation is by (event
+        // name, node_id): the returned Promise resolves on the first event whose
+        // `event` is in opts.expectEvents (or is "error") and whose node_id
+        // matches opts.nodeId. A request that is not answered about a single
+        // node passes opts.match, a predicate that picks its answer instead.
         // The synchronous "{action}_accepted" ack is ignored. Rejects on timeout
         // or if the socket is not open.
         node.request = function(payload, opts) {
@@ -103,13 +105,13 @@ module.exports = function(RED) {
                     return;
                 }
 
-                const match = (m) => {
+                const match = opts.match || ((m) => {
                     if (nodeId !== undefined && nodeId !== null && m.node_id !== nodeId) {
                         return false;
                     }
                     if (m.event === 'error') return true;
                     return expect.indexOf(m.event) !== -1;
-                };
+                });
 
                 const entry = { match, resolve, timer: null };
                 entry.timer = setTimeout(() => {

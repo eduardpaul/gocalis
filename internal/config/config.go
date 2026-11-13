@@ -19,7 +19,99 @@ type Config struct {
 	Models           ModelsConfig   `yaml:"models"`
 	MQTT             MQTTConfig     `yaml:"mqtt"`
 	Security         SecurityConfig `yaml:"security"`
+	Intercom         IntercomConfig `yaml:"intercom"`
+	Plugins          []PluginConfig `yaml:"plugins"`
 	Nodes            []NodeConfig   `yaml:"nodes"`
+}
+
+// PluginConfig switches one plugin on. ID is how API requests address it; Type
+// selects the plugin code compiled into this build; Settings belong to that
+// type, which reads them with DecodeSettings.
+type PluginConfig struct {
+	ID       string    `yaml:"id"`
+	Type     string    `yaml:"type"`
+	Settings yaml.Node `yaml:"settings"`
+}
+
+// DecodeSettings reads the plugin's settings into its own struct. Like the
+// rest of the configuration, a key the struct does not have is an error.
+// Without settings the struct is left as it is.
+func (p PluginConfig) DecodeSettings(into any) error {
+	if p.Settings.Kind == 0 {
+		return nil
+	}
+	raw, err := yaml.Marshal(&p.Settings)
+	if err != nil {
+		return err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(into); err != nil {
+		return fmt.Errorf("settings: %w", err)
+	}
+	return nil
+}
+
+// IntercomConfig holds settings for intercom calls: conferences that nodes and
+// intercom web pages (/intercom) join and leave.
+type IntercomConfig struct {
+	// DefaultTimeoutSeconds is how long a call lasts after the last join when
+	// the request does not say. A call always ends by its deadline unless it
+	// ends earlier. Defaults to 60s when unset (<=0).
+	DefaultTimeoutSeconds float64 `yaml:"default_timeout_seconds"`
+
+	// EchoCancellation controls the software acoustic echo canceller applied to
+	// each node's mic before it is mixed into the call, so a device without
+	// hardware echo cancellation does not feed its own speaker output (the
+	// others' voices) back into the call.
+	EchoCancellation IntercomAECConfig `yaml:"echo_cancellation"`
+
+	// Viewers maps a node id to the go2rtc page the intercom web page embeds to
+	// show and play that node's camera and microphone, e.g.
+	// "https://go2rtc.example/stream.html?src=doorbell_tv&mode=webrtc". The page
+	// is a plain go2rtc viewer (go2rtc fans the stream out); gocalis does not
+	// relay that node's audio or video to the page, only the rest of the call.
+	// It must be reachable from the browser (over HTTPS when the intercom page
+	// is). Optional: a node without a viewer is heard through gocalis.
+	Viewers map[string]string `yaml:"viewers"`
+}
+
+// IntercomAECConfig configures the per-node software echo canceller.
+type IntercomAECConfig struct {
+	// Enabled turns the software echo canceller on. When false, mics are bridged
+	// verbatim (safe only when the devices do hardware AEC or are acoustically
+	// isolated).
+	Enabled bool `yaml:"enabled"`
+	// TailMs is the adaptive-filter length in milliseconds: the echo-path delay
+	// budget (network + speaker + acoustic + mic). Defaults to 250ms when unset.
+	TailMs int `yaml:"tail_ms"`
+	// FrameMs is the processing frame size in milliseconds. Defaults to 20ms.
+	FrameMs int `yaml:"frame_ms"`
+}
+
+// GetDefaultTimeoutSeconds returns the configured default intercom timeout,
+// falling back to 60s when unset (<=0).
+func (c IntercomConfig) GetDefaultTimeoutSeconds() float64 {
+	if c.DefaultTimeoutSeconds > 0 {
+		return c.DefaultTimeoutSeconds
+	}
+	return 60
+}
+
+// GetTailMs returns the configured AEC filter tail length, defaulting to 250ms.
+func (a IntercomAECConfig) GetTailMs() int {
+	if a.TailMs > 0 {
+		return a.TailMs
+	}
+	return 250
+}
+
+// GetFrameMs returns the configured AEC frame size, defaulting to 20ms.
+func (a IntercomAECConfig) GetFrameMs() int {
+	if a.FrameMs > 0 {
+		return a.FrameMs
+	}
+	return 20
 }
 
 // SecurityConfig holds transport hardening settings for the HTTP/WebSocket APIs.
@@ -204,6 +296,15 @@ type KWSConfig struct {
 	// AutoAskRecord, when true, attaches a base64-encoded WAV recording of the
 	// captured user speech to the combined wake event (published to MQTT/WS/etc).
 	AutoAskRecord bool `yaml:"auto_ask_record"`
+
+	// WakeInCall keeps the wake word armed while the node is in an intercom
+	// call. Saying it sets the node aside from the call (the others stop hearing
+	// it, and it stops hearing them) while the assistant listens to the command,
+	// as it would outside a call; the "wake" event then carries in_call. Off by
+	// default: enable it only on nodes whose microphone does not pick up their
+	// own speaker (hardware echo cancellation), or anyone in the call can wake
+	// the assistant through that speaker.
+	WakeInCall bool `yaml:"wake_in_call"`
 
 	Priority      int      `yaml:"priority"`
 	WakeResponses []string `yaml:"wake_responses"`
@@ -392,6 +493,30 @@ func (c *Config) normalizeAndValidate() error {
 			if len(text) > 4000 {
 				return fmt.Errorf("node %s: wake response exceeds 4000 bytes", n.NodeID)
 			}
+		}
+	}
+	pluginIDs := make(map[string]bool)
+	for i := range c.Plugins {
+		p := &c.Plugins[i]
+		if p.ID == "" || len(p.ID) > 64 || strings.ContainsAny(p.ID, " \t/#+") {
+			return fmt.Errorf("plugin %d: id is required, without spaces or any of / # +", i)
+		}
+		// Like a node's: "all" addresses a broadcast.
+		if p.ID == "all" {
+			return fmt.Errorf("plugin %d: id must not be \"all\"", i)
+		}
+		if pluginIDs[p.ID] {
+			return fmt.Errorf("plugin %s: id is used twice", p.ID)
+		}
+		pluginIDs[p.ID] = true
+		// A plugin can add a node, whose id is the plugin's.
+		for _, n := range c.Nodes {
+			if n.NodeID == p.ID {
+				return fmt.Errorf("plugin %s: id is also the id of a node", p.ID)
+			}
+		}
+		if p.Type == "" {
+			return fmt.Errorf("plugin %s: type is required", p.ID)
 		}
 	}
 	return nil

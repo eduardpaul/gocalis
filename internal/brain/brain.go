@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -34,9 +35,12 @@ type NodeHandle struct {
 
 // NodeInfo is a read-only snapshot of a registered node for dashboards/APIs.
 type NodeInfo struct {
-	NodeID      string `json:"node_id"`
-	Type        string `json:"type"`
-	State       string `json:"state"`
+	NodeID string `json:"node_id"`
+	Type   string `json:"type"`
+	State  string `json:"state"`
+	// Answer is "auto" for a node that is always there (a speaker, a doorbell)
+	// and "call" for one somebody has to answer before anything plays on it.
+	Answer      string `json:"answer"`
 	Diagnostics any    `json:"diagnostics,omitempty"`
 }
 
@@ -46,6 +50,12 @@ type Brain struct {
 	nodes      map[string]*NodeHandle
 	nodesMutex sync.RWMutex
 	sessions   *session.Registry
+
+	// calls holds what the intercom engine registered for each node that is in
+	// a call: the sink for its microphone and its line into the call. No entry
+	// = the node is in no call, and zero overhead on the hot capture path.
+	calls   map[string]callSeat
+	callsMu sync.RWMutex
 }
 
 // New creates a new Brain backed by the given TTS engine.
@@ -54,6 +64,7 @@ func New(ttsEngine ai.Synthesizer) *Brain {
 		ttsEngine: ttsEngine,
 		nodes:     make(map[string]*NodeHandle),
 		sessions:  session.NewRegistry(),
+		calls:     make(map[string]callSeat),
 	}
 }
 
@@ -118,6 +129,7 @@ func (b *Brain) ListNodes() []NodeInfo {
 			NodeID:      h.Node.NodeID,
 			Type:        h.Node.Type,
 			State:       string(h.Node.GetState()),
+			Answer:      h.answer(),
 			Diagnostics: diagnostics,
 		})
 	}
@@ -125,8 +137,9 @@ func (b *Brain) ListNodes() []NodeInfo {
 	return infos
 }
 
-// Speak routes a TTS utterance to a single node.
-func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority int) error {
+// Speak routes a TTS utterance to a single node. inCall says what happens when
+// the node is in an intercom call.
+func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority int, inCall CallMode) error {
 	b.nodesMutex.RLock()
 	handle, ok := b.nodes[nodeID]
 	b.nodesMutex.RUnlock()
@@ -140,20 +153,28 @@ func (b *Brain) Speak(ctx context.Context, nodeID string, text string, priority 
 		return nil
 	}
 
-	// Wait for this node's turn (higher-priority work runs first) instead of
-	// being rejected when the node is busy.
-	release, err := handle.queue.acquire(ctx, priority)
-	if err != nil {
+	if done, err := b.playInCall(ctx, nodeID, inCall, func() ([]int16, int, error) {
+		return b.Synthesize(ctx, text, priority)
+	}); done {
 		return err
+	}
+
+	// Wait for this node's turn (higher-priority work runs first) instead of
+	// being rejected when the node is busy. A node that enters an intercom call
+	// rejects the request (ErrIntercomActive), and a call starting mid-utterance
+	// cuts it off (ErrPreempted).
+	turnCtx, release, err := b.take(ctx, handle, priority, false)
+	if err != nil {
+		return fmt.Errorf("node '%s': %w", nodeID, err)
 	}
 	defer release()
 
-	return b.speakToHandle(ctx, handle, text, priority)
+	return turnErr(turnCtx, b.speakToHandle(turnCtx, handle, text, priority))
 }
 
 // PlaySamples plays a pre-recorded PCM16 clip on a single node, honoring the
-// node's turn queue and priority exactly like Speak.
-func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16, sampleRate int, priority int) error {
+// node's turn queue and priority, and its intercom call, exactly like Speak.
+func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16, sampleRate int, priority int, inCall CallMode) error {
 	b.nodesMutex.RLock()
 	handle, ok := b.nodes[nodeID]
 	b.nodesMutex.RUnlock()
@@ -170,30 +191,37 @@ func (b *Brain) PlaySamples(ctx context.Context, nodeID string, samples []int16,
 		return nil
 	}
 
-	release, err := handle.queue.acquire(ctx, priority)
-	if err != nil {
+	if done, err := b.playInCall(ctx, nodeID, inCall, func() ([]int16, int, error) {
+		return samples, sampleRate, nil
+	}); done {
 		return err
+	}
+
+	turnCtx, release, err := b.take(ctx, handle, priority, false)
+	if err != nil {
+		return fmt.Errorf("node '%s': %w", nodeID, err)
 	}
 	defer release()
 
-	return b.playSamplesToHandle(ctx, handle, samples, sampleRate)
+	return turnErr(turnCtx, b.playSamplesToHandle(turnCtx, handle, samples, sampleRate))
 }
 
-// PlaySamplesAll plays the same recording on every registered node. Each node is
+// PlaySamplesAll plays the same recording on every node a broadcast reaches
+// (see SpeakAll). Each node is
 // driven independently through its own turn queue at the given priority, exactly
 // like SpeakAll: free nodes play immediately, busy nodes queue behind their
 // current turn, and nodes never block one another.
-func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate int, priority int) error {
+func (b *Brain) PlaySamplesAll(ctx context.Context, samples []int16, sampleRate int, priority int, inCall CallMode) error {
 	if len(samples) == 0 {
 		return nil
 	}
 
-	handles := b.snapshotHandles()
+	handles := b.broadcastHandles()
 	if len(handles) == 0 {
 		return fmt.Errorf("no nodes registered")
 	}
 
-	return b.playAll(ctx, handles, samples, sampleRate, priority)
+	return b.playAll(ctx, handles, samples, sampleRate, priority, inCall)
 }
 
 // playSamplesToHandle plays pre-recorded samples on a single node with the same
@@ -221,27 +249,53 @@ func (b *Brain) playSamplesToHandle(ctx context.Context, handle *NodeHandle, bas
 }
 
 // AcquireNode reserves a node for an exclusive turn, in priority/FIFO order.
+// The turn must run on Turn.Context(), which an intercom call cancels (cause
+// ErrPreempted) when it takes the node over. A node in an intercom call rejects
+// the request with ErrIntercomActive. A node somebody has to answer is called
+// first: the turn starts once they did, fails with audionode.ErrUnanswered when
+// nobody does, and its context ends (cause audionode.ErrHungUp) when they hang
+// up.
 func (b *Brain) AcquireNode(ctx context.Context, nodeID string, priority int) (*Turn, error) {
 	handle := b.GetNodeHandle(nodeID)
 	if handle == nil {
 		return nil, fmt.Errorf("node '%s' not registered", nodeID)
 	}
-	release, err := handle.queue.acquire(ctx, priority)
+	turnCtx, release, err := b.take(ctx, handle, priority, false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("node '%s': %w", nodeID, err)
 	}
-	return &Turn{Handle: handle, release: release}, nil
+	return &Turn{Handle: handle, ctx: turnCtx, release: release}, nil
 }
 
-// SpeakAll routes the same TTS utterance to every registered node.
+// AcquireNodeIntercom takes a node over for an intercom call. It preempts the
+// turn in progress (TTS, prompt or a whole ask flow, which see ErrPreempted),
+// and until the returned turn is released every other turn request for the node
+// fails with ErrIntercomActive. It is the only way to hold a node exclusively,
+// so the call is the single source of audio on that node's speaker. A node
+// somebody has to answer is called first, as in AcquireNode.
+func (b *Brain) AcquireNodeIntercom(ctx context.Context, nodeID string) (*Turn, error) {
+	handle := b.GetNodeHandle(nodeID)
+	if handle == nil {
+		return nil, fmt.Errorf("node '%s' not registered", nodeID)
+	}
+	turnCtx, release, err := b.take(ctx, handle, 0, true)
+	if err != nil {
+		return nil, fmt.Errorf("node '%s': %w", nodeID, err)
+	}
+	return &Turn{Handle: handle, ctx: turnCtx, release: release}, nil
+}
+
+// SpeakAll routes the same TTS utterance to every registered node that is
+// always there. A node somebody has to answer is not part of a broadcast: an
+// announcement for the house must not ring a phone.
 //
 // The utterance is synthesized once. Each node then waits independently for
 // its turn and applies its own gain without changing the shared recording.
-func (b *Brain) SpeakAll(ctx context.Context, text string, priority int) error {
+func (b *Brain) SpeakAll(ctx context.Context, text string, priority int, inCall CallMode) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
-	handles := b.snapshotHandles()
+	handles := b.broadcastHandles()
 	if len(handles) == 0 {
 		return fmt.Errorf("no nodes registered")
 	}
@@ -249,20 +303,40 @@ func (b *Brain) SpeakAll(ctx context.Context, text string, priority int) error {
 	if err != nil {
 		return err
 	}
-	return b.playAll(ctx, handles, samples, rate, priority)
+	return b.playAll(ctx, handles, samples, rate, priority, inCall)
 }
 
-func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []int16, rate, priority int) error {
+// playAll plays the clip on every given node at once. A node in an intercom
+// call gets it inside the call, for itself alone, unless inCall rejects calls:
+// then the broadcast skips it rather than failing for every other node.
+func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []int16, rate, priority int, inCall CallMode) error {
+	if inCall == CallAll {
+		// One copy per node of a call would play several times over for the
+		// whole call.
+		inCall = CallNode
+	}
 	errs := make([]error, len(handles))
+	skipped := make([]bool, len(handles))
 	var wg sync.WaitGroup
 	for i, handle := range handles {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			release, err := handle.queue.acquire(ctx, priority)
+			if done, err := b.playInCall(ctx, handle.Node.NodeID, inCall, func() ([]int16, int, error) {
+				return samples, rate, nil
+			}); done {
+				errs[i] = err
+				return
+			}
+			turnCtx, release, err := b.take(ctx, handle, priority, false)
+			if errors.Is(err, ErrIntercomActive) {
+				log.Printf("[Brain] broadcast skips node '%s': %v\n", handle.Node.NodeID, err)
+				skipped[i] = true
+				return
+			}
 			if err == nil {
 				defer release()
-				err = b.playSamplesToHandle(ctx, handle, samples, rate)
+				err = turnErr(turnCtx, b.playSamplesToHandle(turnCtx, handle, samples, rate))
 			}
 			if err != nil {
 				errs[i] = fmt.Errorf("node %s: %w", handle.Node.NodeID, err)
@@ -270,6 +344,13 @@ func (b *Brain) playAll(ctx context.Context, handles []*NodeHandle, samples []in
 		}()
 	}
 	wg.Wait()
+	allSkipped := true
+	for _, s := range skipped {
+		allSkipped = allSkipped && s
+	}
+	if allSkipped {
+		return ErrIntercomActive
+	}
 	return errors.Join(errs...)
 }
 
@@ -325,10 +406,27 @@ func (b *Brain) Synthesize(ctx context.Context, text string, priority int) ([]in
 // State-neutral playback is available only through a reserved turn.
 type Turn struct {
 	Handle  *NodeHandle
+	ctx     context.Context
 	release func()
 }
 
 func (t *Turn) Release() { t.release() }
+
+// Context is the context the turn must run on: it is cancelled when the turn is
+// released, when the acquiring context ends, or (cause ErrPreempted) when an
+// intercom call takes the node over.
+func (t *Turn) Context() context.Context { return t.ctx }
+
+// Preempted reports whether the turn was cut off by an intercom call.
+func (t *Turn) Preempted() bool {
+	return t.ctx != nil && errors.Is(context.Cause(t.ctx), ErrPreempted)
+}
+
+// HungUp reports whether the turn ended because whoever was on the node hung
+// up.
+func (t *Turn) HungUp() bool {
+	return t.ctx != nil && errors.Is(context.Cause(t.ctx), audionode.ErrHungUp)
+}
 
 func (t *Turn) Play(ctx context.Context, samples []int16, sampleRate int) error {
 	if err := ctx.Err(); err != nil {
@@ -343,16 +441,107 @@ func (t *Turn) Play(ctx context.Context, samples []int16, sampleRate int) error 
 	return t.Handle.Audio.Play(ctx, samples, sampleRate)
 }
 
-// snapshotHandles returns a copy of the current node handles slice.
-func (b *Brain) snapshotHandles() []*NodeHandle {
+// broadcastHandles returns the nodes a broadcast reaches: every registered one
+// that is always there.
+func (b *Brain) broadcastHandles() []*NodeHandle {
 	b.nodesMutex.RLock()
 	defer b.nodesMutex.RUnlock()
 
 	handles := make([]*NodeHandle, 0, len(b.nodes))
 	for _, h := range b.nodes {
-		handles = append(handles, h)
+		if _, callee := h.Audio.(audionode.Callee); !callee {
+			handles = append(handles, h)
+		}
 	}
 	return handles
+}
+
+// answer says how the node is reached, for NodeInfo.
+func (h *NodeHandle) answer() string {
+	if _, callee := h.Audio.(audionode.Callee); callee {
+		return "call"
+	}
+	return "auto"
+}
+
+// NeedsAnswer tells whether the node is one somebody has to answer and nobody
+// is on right now: a turn on it starts by ringing.
+func (b *Brain) NeedsAnswer(nodeID string) bool {
+	handle := b.GetNodeHandle(nodeID)
+	if handle == nil {
+		return false
+	}
+	callee, ok := handle.Audio.(audionode.Callee)
+	return ok && !callee.Answered()
+}
+
+// IsCallee tells whether the node is one somebody has to answer.
+func (b *Brain) IsCallee(nodeID string) bool {
+	handle := b.GetNodeHandle(nodeID)
+	if handle == nil {
+		return false
+	}
+	_, callee := handle.Audio.(audionode.Callee)
+	return callee
+}
+
+// take reserves the node for a turn. It waits for the node's turn slot (or,
+// exclusive, takes the node over for an intercom call) and then, on a node
+// somebody has to answer, calls it: the node is RINGING until they do. The
+// returned context is the turn's: besides what the queue ends it for, it ends
+// with cause audionode.ErrHungUp when the far side goes. release must be called
+// exactly once; it also lets the line go, hanging up at once after an
+// exclusive turn.
+func (b *Brain) take(ctx context.Context, handle *NodeHandle, priority int, exclusive bool) (context.Context, func(), error) {
+	var (
+		turnCtx context.Context
+		release func()
+		err     error
+	)
+	if exclusive {
+		// Ahead of every ordinary waiter, whatever its priority.
+		turnCtx, release, err = handle.queue.acquireExclusive(ctx)
+	} else {
+		turnCtx, release, err = handle.queue.acquire(ctx, priority)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	callee, ok := handle.Audio.(audionode.Callee)
+	if !ok {
+		return turnCtx, release, nil
+	}
+	if !callee.Answered() {
+		handle.Node.SetState(node.StateRinging)
+	}
+	line, err := callee.Call(turnCtx)
+	if err != nil {
+		handle.Node.SetState(node.StateIdle)
+		err = turnErr(turnCtx, err)
+		release()
+		return nil, nil, err
+	}
+	callCtx, cancel := context.WithCancelCause(turnCtx)
+	go func() {
+		select {
+		case <-line.Gone():
+			cancel(audionode.ErrHungUp)
+		case <-callCtx.Done():
+		}
+	}()
+	var once sync.Once
+	return callCtx, func() {
+		once.Do(func() {
+			cancel(nil)
+			// A turn that never set a state (it was cut off right after the
+			// answer) must not leave the node ringing.
+			if handle.Node.GetState() == node.StateRinging {
+				handle.Node.SetState(node.StateIdle)
+			}
+			line.Release(exclusive)
+			release()
+		})
+	}, nil
 }
 
 // readAllSamples drains an AudioStream into a single int16 slice.

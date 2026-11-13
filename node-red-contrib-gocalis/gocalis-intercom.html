@@ -1,0 +1,114 @@
+<script type="text/javascript">
+    RED.nodes.registerType('gocalis-intercom',{
+        category: 'Gocalis Voice',
+        color: '#a78bfa',
+        defaults: {
+            name: { value: "" },
+            server: { value: "", type: "gocalis-config", required: true },
+            nodeIds: { value: "" },
+            nodeIdsType: { value: "str" },
+            duration: { value: 0, validate: RED.validators.number() }
+        },
+        inputs: 1,
+        outputs: 3,
+        outputLabels: ["request sent", "someone joined / left", "call ended"],
+        icon: "font-awesome/fa-phone",
+        label: function() {
+            return this.name || "Gocalis Intercom";
+        },
+        paletteLabel: "gocalis intercom",
+        oneditprepare: function() {
+            $("#node-input-nodeIds").typedInput({
+                default: 'str',
+                typeField: $("#node-input-nodeIdsType"),
+                types: ['str', 'msg', 'flow', 'global', 'env', 'jsonata']
+            });
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="gocalis-intercom">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-server"><i class="fa fa-server"></i> Server</label>
+        <input type="text" id="node-input-server">
+    </div>
+    <div class="form-row">
+        <label for="node-input-nodeIds"><i class="fa fa-users"></i> Participants</label>
+        <input type="text" id="node-input-nodeIds" placeholder="e.g. kitchen, bedroom" style="width: 70%;">
+        <input type="hidden" id="node-input-nodeIdsType">
+    </div>
+    <div class="form-row">
+        <label for="node-input-duration"><i class="fa fa-clock-o"></i> Timeout (s)</label>
+        <input type="number" id="node-input-duration" placeholder="0 = server default" min="0" step="1">
+    </div>
+</script>
+
+<script type="text/html" data-help-name="gocalis-intercom">
+    <p>Runs live intercom calls between Gocalis nodes. A call is a conference:
+    nodes (and intercom pages) join and leave it while it runs, each one hears
+    all the others, and a chime tells the call that someone joined or left. It
+    ends when fewer than two participants remain, on its time limit, or when it
+    is stopped.</p>
+    <p>A node in a call is taken over: a <b>say</b>/<b>play</b> or <b>ask</b>
+    already running on it is cut off (an ask ends with
+    <code>"interrupted by an intercom call"</code>), and until it leaves the call
+    any <b>say</b>/<b>ask</b>/<b>play</b> targeting it fails at once with
+    <code>"node is in an intercom call"</code> (it is not queued). A broadcast to
+    <code>all</code> skips nodes in a call.</p>
+
+    <h3>Connecting</h3>
+    <p>Send any message to put the <b>Participants</b> in a call together. When
+    none of them is in a call, a new one starts. When some already are in one,
+    the others join it (naming a node that is in a call is how you add nodes to
+    that call). Nodes of two different calls cannot be connected.</p>
+    <dl class="message-properties">
+        <dt class="optional">node_ids <span class="property-type">array | string</span></dt>
+        <dd>Participants (two or more). Overrides the configured list. A
+        comma-separated string (<code>"kitchen, bedroom"</code>) is also
+        accepted.</dd>
+        <dt class="optional">duration_seconds <span class="property-type">number</span></dt>
+        <dd>How long the call lasts from now at least; every join pushes the
+        limit back. <code>0</code> uses the server default
+        (<code>intercom.default_timeout_seconds</code>).</dd>
+    </dl>
+
+    <h3>Leaving and stopping</h3>
+    <p>Send <code>msg.payload = "leave"</code> (or <code>msg.action =
+    "leave"</code>) to take one node out of its call: the call goes on for the
+    others, unless fewer than two remain. Send <code>"stop"</code> to end the
+    whole call for everyone. Both act on <code>msg.node_id</code>, or on the
+    first configured participant when it is not set.</p>
+
+    <h3>Outputs</h3>
+    <ol class="node-ports">
+        <li>Request sent: emits once the engine has the nodes in a call
+        (<code>msg.payload</code> is the <code>intercom_started</code> or
+        <code>intercom_joined</code> event, <code>msg.node_ids</code> who is in
+        the call), or when a leave or stop has been sent. With a node somebody
+        has to answer that is when they answered; when nobody does, nothing is
+        emitted here and output 3 tells.</li>
+        <li>Someone joined / left: emits for every <code>intercom_joined</code>
+        and <code>intercom_left</code> of a matching call.
+        <code>msg.event</code> tells which, <code>msg.participant_id</code> who,
+        and <code>msg.node_ids</code> / <code>msg.remote_ids</code> who is in the
+        call now (<code>remote_ids</code> are intercom pages). Also emits
+        <code>intercom_ringing</code> while a node somebody has to answer (a
+        Telegram group) is rung; such a node leaves with
+        <code>msg.reason</code> <code>unanswered</code> or
+        <code>hung_up</code>.</li>
+        <li>Call ended: emits when a matching call ends for any reason.
+        <code>msg.reason</code> is one of <code>timeout</code>,
+        <code>stopped</code>, <code>left</code> (the others left),
+        <code>unanswered</code> (nobody answered, so it never started),
+        <code>shutdown</code>, or <code>error</code>;
+        <code>msg.duration_seconds</code> is how long it lasted and
+        <code>msg.payload.status</code> is <code>success</code> or
+        <code>error</code> (with <code>msg.payload.message</code>).</li>
+    </ol>
+    <p>Outputs 2 and 3 also fire for matching calls that were started or changed
+    elsewhere (the intercom page, the dashboard, a timeout, another flow).</p>
+</script>

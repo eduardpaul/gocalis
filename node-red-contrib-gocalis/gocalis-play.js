@@ -5,6 +5,9 @@ module.exports = function(RED) {
         this.nodeId = config.nodeId || "default";
         this.nodeIdType = config.nodeIdType || "str";
         this.priority = parseInt(config.priority) || 0;
+        // What to do when the node is in an intercom call: "" fails, "node"
+        // runs inside the call for the node alone, "all" for the whole call.
+        this.callMode = config.callMode || "";
 
         const node = this;
 
@@ -60,6 +63,7 @@ module.exports = function(RED) {
                 action: "play",
                 node_id: resolvedNodeId,
                 audio_wav_base64: audioBase64,
+                call_mode: (msg.call_mode !== undefined ? String(msg.call_mode) : node.callMode) || undefined,
                 priority: msg.priority !== undefined ? parseInt(msg.priority) : node.priority
             };
 
@@ -75,7 +79,12 @@ module.exports = function(RED) {
                 msg.node_id = result.node_id || resolvedNodeId;
 
                 if (result.event === "error" || result.status === "error") {
-                    node.status({ fill: "red", shape: "ring", text: result.message || "error" });
+                    // On a node somebody has to answer: nobody did
+                    // ("unanswered"), or they left midway ("hung_up").
+                    msg.reason = result.reason;
+                    node.status(result.reason
+                        ? { fill: "yellow", shape: "ring", text: result.reason.replace("_", " ") }
+                        : { fill: "red", shape: "ring", text: result.message || "error" });
                     done(`Gocalis engine reported failure: ${result.message || "error"}`);
                     return;
                 }
