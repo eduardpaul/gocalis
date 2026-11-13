@@ -106,6 +106,7 @@ type Client struct {
 	tbMu           sync.Mutex
 	tb             *talkbackSender
 	tbCancel       context.CancelFunc
+	tbBackoff      routeBackoff // talkbackWatchdog only
 
 	reconnectMu  sync.Mutex
 	reconnecting bool
@@ -329,16 +330,29 @@ func (c *Client) Connect(ctx context.Context) error {
 	defer finish()
 	pc, gen := c.current()
 	if err := c.connect(ctx, pc, gen); err != nil {
-		return err
+		if ctx.Err() != nil {
+			return err
+		}
+		// Not fatal: at boot the host network or go2rtc may not be up yet. Hand
+		// over to the reconnect loop, which never gives up while the client is
+		// open, instead of leaving the node without audio for good.
+		log.Printf("[WebRTC] Initial connect failed: %v; retrying in the background", err)
+		c.scheduleReconnect(gen, "initial connect failed")
+		c.startWatchdogs()
+		return nil // the reconnect loop warms the talkback once audio flows
 	}
+	c.startWatchdogs()
+	c.warmTalkback(ctx)
+	return nil
+}
+
+func (c *Client) startWatchdogs() {
 	c.watchdog.Do(func() {
 		_ = c.tasks.Go(c.rxWatchdog)
 		if c.talkbackEnabled() {
 			_ = c.tasks.Go(c.talkbackWatchdog)
 		}
 	})
-	c.warmTalkback(ctx)
-	return nil
 }
 
 // warmTalkback brings the talkback backchannel up ahead of time (WHIP producer +
@@ -869,6 +883,11 @@ func (c *Client) rxWatchdog(lifetime context.Context) {
 // has failed (e.g. go2rtc restarted, which kills the WHIP producer and the
 // AAC-ELD route) or was never established, it is re-created right away so the
 // next spoken reply does not pay the producer + route setup latency.
+//
+// Every route POST makes go2rtc open the doorbell's HomeKit backchannel, so the
+// watchdog leaves the route alone while the doorbell sends no audio (its HomeKit
+// session is down; a POST could not work and only loads the device) and backs
+// off after failures instead of re-posting every few seconds.
 func (c *Client) talkbackWatchdog(lifetime context.Context) {
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
@@ -878,40 +897,83 @@ func (c *Client) talkbackWatchdog(lifetime context.Context) {
 			return
 		case <-t.C:
 		}
+		now := time.Now()
+		if !c.receiving(now) || !c.tbBackoff.ready(now) {
+			continue
+		}
 		if c.talkbackHealthy() {
-			c.ensureTalkbackRoute(lifetime)
+			c.tbBackoff.done(c.ensureTalkbackRoute(lifetime), now)
 			continue
 		}
 		ctx, cancel := context.WithTimeout(lifetime, 20*time.Second)
-		if _, err := c.ensureTalkback(ctx); err != nil {
-			log.Printf("[Talkback] re-warm failed: %v", err)
+		_, err := c.ensureTalkback(ctx)
+		cancel()
+		if wait := c.tbBackoff.done(err, now); err != nil {
+			log.Printf("[Talkback] re-warm failed: %v (next try in %v)", err, wait)
 		} else {
 			log.Printf("[Talkback] backchannel re-established")
 		}
-		cancel()
 	}
+}
+
+// receiving reports whether the doorbell's audio is arriving on the current
+// receive connection, i.e. its HomeKit session in go2rtc is up.
+func (c *Client) receiving(now time.Time) bool {
+	c.pcMu.Lock()
+	gen := c.gen
+	c.pcMu.Unlock()
+	return c.rtpGen.Load() == gen && now.Sub(time.Unix(0, c.lastRTP.Load())) < rxStallTimeout
+}
+
+// routeBackoff spaces out talkback route attempts after failures: 3 s, 6 s,
+// 12 s, ... up to a minute; a success resets it.
+type routeBackoff struct {
+	failures int
+	next     time.Time
+}
+
+const (
+	routeBackoffMin = 3 * time.Second
+	routeBackoffMax = time.Minute
+)
+
+func (b *routeBackoff) ready(now time.Time) bool { return !now.Before(b.next) }
+
+// done records an attempt's result and returns the wait before the next one.
+func (b *routeBackoff) done(err error, now time.Time) time.Duration {
+	if err == nil {
+		*b = routeBackoff{}
+		return 0
+	}
+	wait := routeBackoffMin << min(b.failures, 5)
+	wait = min(wait, routeBackoffMax)
+	b.failures++
+	b.next = now.Add(wait)
+	return wait
 }
 
 // ensureTalkbackRoute re-asserts the AAC-ELD bridge when go2rtc no longer lists
 // it (it dies silently if posted while the HomeKit session is still starting).
-func (c *Client) ensureTalkbackRoute(lifetime context.Context) {
+// It returns an error only when a re-assert was attempted and failed.
+func (c *Client) ensureTalkbackRoute(lifetime context.Context) error {
 	c.tbMu.Lock()
 	tb := c.tb
 	c.tbMu.Unlock()
 	if tb == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(lifetime, 5*time.Second)
 	defer cancel()
 	active, err := tb.routeActive(ctx)
 	if err != nil || active {
-		return
+		return nil
 	}
 	if err := tb.assertRoute(ctx); err != nil {
 		log.Printf("[Talkback] AAC-ELD route missing; re-assert failed: %v", err)
-		return
+		return err
 	}
 	log.Printf("[Talkback] AAC-ELD route was missing; re-asserted")
+	return nil
 }
 
 // talkbackHealthy reports whether a cached talkback sender exists and is usable.
