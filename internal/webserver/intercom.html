@@ -19,6 +19,8 @@
   button.live { background: var(--stop); }
   button:disabled { opacity: .5; cursor: default; }
   #status { color: var(--muted); flex: 1 1 200px; }
+  #who { color: var(--muted); margin: 0; padding: 0 4px; min-height: 1.4em; }
+  #who b { color: var(--fg); font-weight: 600; }
   meter { width: 120px; }
   .token { display: none; gap: 8px; }
   .token.show { display: flex; }
@@ -33,6 +35,7 @@
     <meter id="level" min="0" max="1" value="0" aria-label="Nivel del micrófono"></meter>
     <span id="status"></span>
   </div>
+  <p id="who" aria-live="polite"></p>
   <form class="bar token" id="tokenForm">
     <input id="token" type="password" placeholder="Token de la API" autocomplete="current-password">
     <button type="submit">Guardar</button>
@@ -40,14 +43,16 @@
 </main>
 <script>
 "use strict";
-// The doorbell is shown and heard through go2rtc's own viewer (iframe): this
-// page never sends anything to go2rtc. The microphone goes only to gocalis
-// (/api/intercom/ws), which puts it on the doorbell's single talkback path.
+// The page joins the call of a node. The node is shown, and heard, through
+// go2rtc's own viewer (iframe): this page never sends anything to go2rtc. The
+// microphone goes only to gocalis (/api/intercom/ws), which mixes it into the
+// call; gocalis sends back the rest of the call (the other pages and nodes, the
+// chimes), without the node the viewer already plays.
 const params = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 let token = params.get("token") || sessionStorage.getItem("gocalis-token") || "";
 let config = null;
-let session = null; // { ws, ctx, stream, node, timer, ending }
+let session = null; // { ws, ctx, stream, node, spk, timer, ending, me }
 
 function setStatus(text) { $("status").textContent = text; }
 
@@ -88,7 +93,7 @@ function showViewer() {
   box.innerHTML = "";
   if (!url) {
     const p = document.createElement("p");
-    p.textContent = "Sin visor configurado para este dispositivo (intercom.viewers).";
+    p.textContent = "Sin visor para este dispositivo (intercom.viewers): se oye al entrar en la llamada.";
     box.appendChild(p);
     return;
   }
@@ -98,10 +103,14 @@ function showViewer() {
   box.appendChild(f);
 }
 
-// AudioWorklet: downmix to mono, decimate to the server rate by averaging each
-// output period (a cheap anti-alias filter), and post 20 ms PCM16 frames.
-// Silence is sent too, so the server can tell a live page from a vanished one.
-const WORKLET = `
+// AudioWorklets, both at the server rate on the wire (mono PCM16).
+// Mic: downmix to mono, decimate by averaging each output period (a cheap
+// anti-alias filter), and post 20 ms frames. Silence is sent too, so the server
+// can tell a live page from a vanished one.
+// Speaker: play the frames the server sends, resampled by linear interpolation.
+// A short cushion absorbs network jitter; audio beyond the buffer drops the
+// oldest, so a stall cannot leave lasting delay.
+const WORKLETS = `
 class Mic extends AudioWorkletProcessor {
   constructor(o) {
     super();
@@ -134,7 +143,43 @@ class Mic extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor("gocalis-mic", Mic);`;
+registerProcessor("gocalis-mic", Mic);
+
+class Speaker extends AudioWorkletProcessor {
+  constructor(o) {
+    super();
+    const rate = o.processorOptions.rate;
+    this.step = rate / sampleRate;            // input samples per output sample
+    this.buf = new Float32Array(rate * 0.3);  // ring: at most 300 ms waiting
+    this.cushion = rate * 0.06;               // 60 ms before (re)starting
+    this.r = 0; this.n = 0; this.frac = 0; this.playing = false;
+    this.port.onmessage = (e) => {
+      const pcm = new Int16Array(e.data), size = this.buf.length;
+      for (let i = 0; i < pcm.length; i++) {
+        if (this.n === size) { this.r = (this.r + 1) % size; this.n--; }
+        this.buf[(this.r + this.n++) % size] = pcm[i] / 0x8000;
+      }
+    };
+  }
+  process(inputs, outputs) {
+    const out = outputs[0][0], size = this.buf.length;
+    if (!this.playing) {
+      if (this.n < this.cushion) return true;
+      this.playing = true;
+    }
+    for (let i = 0; i < out.length; i++) {
+      if (this.n < 2) { this.playing = false; break; }
+      const a = this.buf[this.r], b = this.buf[(this.r + 1) % size];
+      out[i] = a + (b - a) * this.frac;
+      this.frac += this.step;
+      while (this.frac >= 1 && this.n > 0) {
+        this.frac -= 1; this.r = (this.r + 1) % size; this.n--;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("gocalis-speaker", Speaker);`;
 
 async function start() {
   const node = $("node").value;
@@ -144,12 +189,12 @@ async function start() {
   let stream, ctx;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      // Echo cancellation keeps the doorbell audio this page plays out of the
-      // microphone, so the visitor does not hear themselves back.
+      // Echo cancellation keeps what this page plays (the viewer, the rest of
+      // the call) out of the microphone, so nobody hears themselves back.
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
     ctx = new AudioContext();
-    const blob = URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" }));
+    const blob = URL.createObjectURL(new Blob([WORKLETS], { type: "text/javascript" }));
     await ctx.audioWorklet.addModule(blob);
     URL.revokeObjectURL(blob);
     await ctx.resume();
@@ -167,10 +212,15 @@ async function start() {
   wsURL.searchParams.set("duration_seconds", String(config.default_duration_seconds || 300));
   const ws = new WebSocket(wsURL);
   ws.binaryType = "arraybuffer";
-  session = { ws, ctx, stream, node, timer: null, ending: null };
+  const rate = config.sample_rate || 16000;
+  const spk = new AudioWorkletNode(ctx, "gocalis-speaker", {
+    numberOfInputs: 0, outputChannelCount: [1], processorOptions: { rate },
+  });
+  spk.connect(ctx.destination);
+  session = { ws, ctx, stream, node, spk, timer: null, ending: null, me: "" };
 
   const src = ctx.createMediaStreamSource(stream);
-  const mic = new AudioWorkletNode(ctx, "gocalis-mic", { processorOptions: { rate: config.sample_rate || 16000 } });
+  const mic = new AudioWorkletNode(ctx, "gocalis-mic", { processorOptions: { rate } });
   mic.port.onmessage = (e) => {
     $("level").value = e.data.peak;
     if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) ws.send(e.data.pcm);
@@ -178,40 +228,70 @@ async function start() {
   src.connect(mic);
 
   ws.onmessage = (e) => {
+    if (typeof e.data !== "string") {
+      spk.port.postMessage(e.data, [e.data]);
+      return;
+    }
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
-    if (m.event === "intercom_started") {
-      session.ending = Date.now() + m.duration_seconds * 1000;
-      $("talk").textContent = "Colgar";
-      $("talk").classList.add("live");
-      $("talk").disabled = false;
-      tick();
-      session.timer = setInterval(tick, 1000);
-    } else if (m.event === "intercom_ended") {
-      stop(reasonText(m));
-    } else if (m.event === "error") {
-      stop("No se pudo hablar: " + m.message);
+    switch (m.event) {
+      case "intercom_started":
+      case "intercom_joined":
+      case "intercom_left":
+        inCall(m);
+        break;
+      case "intercom_ended":
+        stop(reasonText(m));
+        break;
+      case "error":
+        stop("No se pudo entrar: " + m.message);
+        break;
     }
   };
   ws.onclose = () => stop();
   ws.onerror = () => stop("Conexión perdida.");
 }
 
+// inCall reflects an event of the call this page is in: who is in it now and
+// how long it has left.
+function inCall(m) {
+  if (!session) return;
+  if (!session.me) {
+    session.me = m.remote_id;
+    $("talk").textContent = "Colgar";
+    $("talk").classList.add("live");
+    $("talk").disabled = false;
+    session.timer = setInterval(tick, 1000);
+  }
+  session.ending = Date.now() + (m.remaining_seconds || 0) * 1000;
+  tick();
+  const who = $("who");
+  who.textContent = "En la llamada: ";
+  const ids = (m.node_ids || []).concat(m.remote_ids || []);
+  ids.forEach((id, i) => {
+    const b = document.createElement("b");
+    b.textContent = id === session.me ? "tú" : id;
+    who.append(b, i < ids.length - 1 ? ", " : "");
+  });
+}
+
 function tick() {
   if (!session || !session.ending) return;
   const left = Math.max(0, Math.round((session.ending - Date.now()) / 1000));
-  setStatus(`Hablando con ${session.node} · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`);
+  setStatus(`En llamada con ${session.node} · ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`);
 }
 
 function reasonText(m) {
   switch (m.reason) {
     case "timeout": return "Llamada terminada (tiempo agotado).";
     case "stopped": return "Llamada terminada.";
+    case "left": return "Llamada terminada: no queda nadie más.";
     case "shutdown": return "Llamada terminada: gocalis se ha detenido.";
     default: return "Llamada terminada: " + (m.message || m.reason || "error");
   }
 }
 
+// stop takes this page out of the call; the call goes on for the others.
 function stop(text) {
   const s = session;
   if (!s) return;
@@ -220,14 +300,15 @@ function stop(text) {
   s.stream.getTracks().forEach((t) => t.stop());
   s.ctx.close();
   if (s.ws.readyState === WebSocket.OPEN) {
-    s.ws.send(JSON.stringify({ action: "stop" }));
+    s.ws.send(JSON.stringify({ action: "leave" }));
     s.ws.close();
   }
   $("level").value = 0;
+  $("who").textContent = "";
   $("talk").textContent = "Hablar";
   $("talk").classList.remove("live");
   $("talk").disabled = false;
-  setStatus(text || "Llamada terminada.");
+  setStatus(text || "Has salido de la llamada.");
 }
 
 $("talk").onclick = () => (session ? stop() : start());

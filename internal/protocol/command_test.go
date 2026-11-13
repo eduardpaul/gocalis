@@ -7,6 +7,7 @@ import (
 	"gocalis/internal/audionode"
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
+	"gocalis/internal/intercom"
 	"gocalis/internal/node"
 )
 
@@ -57,10 +58,13 @@ func TestValidateIntercomActions(t *testing.T) {
 		wantErr bool
 	}{
 		{"intercom node_ids", Request{Action: "intercom", NodeIDs: []string{"a", "b"}}, false},
-		{"intercom node_id+peer", Request{Action: "intercom", NodeID: "a", PeerNodeID: "b"}, false},
+		{"intercom single node", Request{Action: "intercom", NodeIDs: []string{"a"}}, true},
+		{"intercom empty node id", Request{Action: "intercom", NodeIDs: []string{"a", ""}}, true},
 		{"intercom with duration", Request{Action: "intercom", NodeIDs: []string{"a", "b"}, DurationSeconds: 30}, false},
 		{"intercom negative duration", Request{Action: "intercom", NodeIDs: []string{"a", "b"}, DurationSeconds: -1}, true},
-		{"intercom too many nodes", Request{Action: "intercom", NodeIDs: make([]string, maxIntercomNodes+1)}, true},
+		{"intercom too many nodes", Request{Action: "intercom", NodeIDs: make([]string, intercom.MaxParticipants+1)}, true},
+		{"intercom_leave", Request{Action: "intercom_leave", NodeID: "a"}, false},
+		{"intercom_leave without node", Request{Action: "intercom_leave"}, true},
 		{"intercom_stop", Request{Action: "intercom_stop", NodeID: "a"}, false},
 		{"intercom_stop without node", Request{Action: "intercom_stop"}, true},
 	}

@@ -2,8 +2,11 @@ package webserver
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -42,14 +45,55 @@ func dialIntercom(t *testing.T, srv *httptest.Server, query string) (*websocket.
 	return websocket.DefaultDialer.Dial(u, nil)
 }
 
-func readIntercom(t *testing.T, c *websocket.Conn) intercomMessage {
+// readIntercom returns the next JSON message on the socket, appending the audio
+// received before it to heard (when not nil).
+func readIntercom(t *testing.T, c *websocket.Conn, heard *[]int16) intercomMessage {
 	t.Helper()
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	var m intercomMessage
-	if err := c.ReadJSON(&m); err != nil {
-		t.Fatalf("read: %v", err)
+	for {
+		kind, data, err := c.ReadMessage()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if kind == websocket.BinaryMessage {
+			if heard != nil {
+				for i := 0; i+1 < len(data); i += 2 {
+					*heard = append(*heard, int16(binary.LittleEndian.Uint16(data[i:])))
+				}
+			}
+			continue
+		}
+		var m intercomMessage
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatalf("bad message %q: %v", data, err)
+		}
+		return m
 	}
-	return m
+}
+
+// micFrame is 100 ms of 16 kHz PCM16 with a recognisable value.
+func micFrame(value int16) []byte {
+	frame := make([]byte, 2*1600)
+	for i := 0; i < len(frame); i += 2 {
+		binary.LittleEndian.PutUint16(frame[i:], uint16(value))
+	}
+	return frame
+}
+
+// runLength is the longest run of value in samples. A long run is audio that
+// went through the mix verbatim, as opposed to a chime happening to pass by the
+// value.
+func runLength(samples []int16, value int16) int {
+	best, run := 0, 0
+	for _, v := range samples {
+		if v != value {
+			run = 0
+			continue
+		}
+		run++
+		best = max(best, run)
+	}
+	return best
 }
 
 func TestIntercomWSRejectsBadRequests(t *testing.T) {
@@ -73,74 +117,116 @@ func TestIntercomWSRejectsBadRequests(t *testing.T) {
 	}
 }
 
-// TestIntercomWSCarriesMicToNode verifies the page's microphone reaches the
-// node's output, and the page learns when and why the call ended.
-func TestIntercomWSCarriesMicToNode(t *testing.T) {
-	srv, stub, _ := newIntercomTestServer(t)
-	c, _, err := dialIntercom(t, srv, "node_id=door&token=secret&duration_seconds=0.5")
+// TestIntercomWSCarriesAudioBothWays verifies the page's microphone reaches the
+// node's output, the node's microphone reaches the page, and the page learns
+// when and why the call ended.
+func TestIntercomWSCarriesAudioBothWays(t *testing.T) {
+	srv, stub, b := newIntercomTestServer(t)
+	c, _, err := dialIntercom(t, srv, "node_id=door&token=secret&duration_seconds=1.5")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if m := readIntercom(t, c); m.Event != "intercom_started" || m.NodeID != "door" || m.RemoteID == "" {
+	m := readIntercom(t, c, nil)
+	if m.Event != "intercom_started" || m.RemoteID == "" || !slices.Equal(m.NodeIDs, []string{"door"}) || !slices.Equal(m.RemoteIDs, []string{m.RemoteID}) || m.RemainingSeconds <= 0 {
 		t.Fatalf("first message = %+v", m)
 	}
 
-	frame := make([]byte, 640*5) // 100 ms of 16 kHz PCM16
-	for i := 0; i < len(frame)/2; i++ {
-		binary.LittleEndian.PutUint16(frame[2*i:], uint16(int16(2000+i%5)))
-	}
-	if err := c.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+	// Let the chime of the call start play out, so the audio below is alone in
+	// the mix and arrives verbatim.
+	time.Sleep(700 * time.Millisecond)
+	if err := c.WriteMessage(websocket.BinaryMessage, micFrame(2000)); err != nil {
 		t.Fatal(err)
 	}
-	m := readIntercom(t, c)
+	b.ForwardRawAudio("door", []float32{0.5, 0.5, 0.5})
+
+	var heard []int16
+	m = readIntercom(t, c, &heard)
 	if m.Event != "intercom_ended" || m.Reason != "timeout" {
 		t.Fatalf("end message = %+v", m)
+	}
+	if runLength(heard, 16383) < 3 {
+		t.Fatal("the page did not hear the node's microphone")
+	}
+	if runLength(heard, 2000) > 2 {
+		t.Fatal("the page heard itself")
 	}
 	var played []int16
 	for _, p := range stub.Played {
 		played = append(played, p...)
 	}
-	found := false
-	for _, v := range played {
-		if v == 2000 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if runLength(played, 2000) < 100 {
 		t.Fatal("node did not play the page's microphone")
 	}
 }
 
-// TestIntercomWSStopFreesNode verifies a page stop ends the call and gives the
-// node back to TTS.
-func TestIntercomWSStopFreesNode(t *testing.T) {
+// TestIntercomWSPagesShareACall verifies a second page joins the call of the
+// first one, that they hear each other, and that the call outlives the page
+// that leaves first.
+func TestIntercomWSPagesShareACall(t *testing.T) {
 	srv, _, b := newIntercomTestServer(t)
-	c, _, err := dialIntercom(t, srv, "node_id=door&token=secret")
+	c1, _, err := dialIntercom(t, srv, "node_id=door&token=secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-	readIntercom(t, c)
+	defer c1.Close()
+	first := readIntercom(t, c1, nil).RemoteID
 
-	// A second page cannot open its own call to the same node.
 	c2, _, err := dialIntercom(t, srv, "node_id=door&token=secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m := readIntercom(t, c2); m.Event != "error" {
-		t.Fatalf("second page got %+v, want error", m)
+	defer c2.Close()
+	m := readIntercom(t, c2, nil)
+	if m.Event != "intercom_joined" || m.RemoteID == first || m.ParticipantID != m.RemoteID || !slices.Equal(m.RemoteIDs, []string{first, m.RemoteID}) {
+		t.Fatalf("second page got %+v", m)
 	}
-	c2.Close()
+	second := m.RemoteID
+	if m := readIntercom(t, c1, nil); m.Event != "intercom_joined" || m.ParticipantID != second || m.RemoteID != first {
+		t.Fatalf("first page got %+v", m)
+	}
 
-	if err := c.WriteJSON(map[string]string{"action": "stop"}); err != nil {
+	// The first page hears the second one (once the join chime is over).
+	time.Sleep(700 * time.Millisecond)
+	if err := c2.WriteMessage(websocket.BinaryMessage, micFrame(3000)); err != nil {
 		t.Fatal(err)
 	}
-	if m := readIntercom(t, c); m.Event != "intercom_ended" || m.Reason != "stopped" {
-		t.Fatalf("end message = %+v", m)
+	time.Sleep(300 * time.Millisecond)
+	if err := c2.WriteJSON(map[string]string{"action": "leave"}); err != nil {
+		t.Fatal(err)
 	}
-	if err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0); err != nil {
-		t.Fatalf("node not freed after the call: %v", err)
+	if m := readIntercom(t, c2, nil); m.Event != "intercom_left" || m.ParticipantID != second {
+		t.Fatalf("leaving page got %+v", m)
+	}
+	var heard []int16
+	if m := readIntercom(t, c1, &heard); m.Event != "intercom_left" || m.ParticipantID != second || !slices.Equal(m.RemoteIDs, []string{first}) {
+		t.Fatalf("remaining page got %+v", m)
+	}
+	if runLength(heard, 3000) < 100 {
+		t.Fatal("the first page did not hear the second one")
+	}
+
+	// The call goes on for the first page and the node.
+	if err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0); !errors.Is(err, brain.ErrIntercomActive) {
+		t.Fatalf("PlaySamples during the call = %v, want ErrIntercomActive", err)
+	}
+
+	// The last page leaves: the call ends and the node is free again.
+	if err := c1.WriteJSON(map[string]string{"action": "leave"}); err != nil {
+		t.Fatal(err)
+	}
+	if m := readIntercom(t, c1, nil); m.Event != "intercom_left" || m.ParticipantID != first {
+		t.Fatalf("last page got %+v", m)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := b.PlaySamples(t.Context(), "door", []int16{1}, 16000, 0)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node not freed after the call: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -1,6 +1,7 @@
 package webserver
 
 import (
+	"context"
 	_ "embed"
 	"encoding/binary"
 	"encoding/json"
@@ -16,8 +17,9 @@ import (
 	"gocalis/internal/intercom"
 )
 
-// The intercom page: a standalone page (no dashboard build needed) that embeds
-// the go2rtc viewer of a node and streams the browser microphone to gocalis.
+// The intercom page: a standalone page (no dashboard build needed) that joins
+// the call of a node. It embeds the go2rtc viewer of that node, streams the
+// browser microphone to gocalis and plays the rest of the call gocalis sends.
 //
 //go:embed intercom.html
 var intercomPage []byte
@@ -28,7 +30,7 @@ const (
 	intercomPageCallSeconds = 300
 	intercomMaxCallSeconds  = 1800
 
-	// intercomIdleTimeout ends a call whose page stopped sending: the page
+	// intercomIdleTimeout drops a page that stopped sending: the page
 	// streams microphone frames (silence included) every 20 ms, so a gap this
 	// long means the browser went away (tab closed, phone locked, network lost).
 	intercomIdleTimeout = 5 * time.Second
@@ -55,8 +57,8 @@ func (s *Server) handleIntercomPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(intercomPage)
 }
 
-// handleIntercomConfig tells the page which nodes it can talk to and which
-// go2rtc viewer to embed for each.
+// handleIntercomConfig tells the page which nodes it can call and which go2rtc
+// viewer to embed for each.
 func (s *Server) handleIntercomConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -83,28 +85,36 @@ func (s *Server) handleIntercomConfig(w http.ResponseWriter, r *http.Request) {
 
 // intercomMessage is a JSON message on the intercom socket.
 type intercomMessage struct {
-	Event           string  `json:"event,omitempty"` // server: intercom_started | intercom_ended | error
-	Action          string  `json:"action,omitempty"`
-	NodeID          string  `json:"node_id,omitempty"`
-	RemoteID        string  `json:"remote_id,omitempty"`
-	Status          string  `json:"status,omitempty"`
-	Reason          string  `json:"reason,omitempty"`
-	Message         string  `json:"message,omitempty"`
-	DurationSeconds float64 `json:"duration_seconds,omitempty"`
+	Action string `json:"action,omitempty"` // page: "leave"
+
+	// Server: "intercom_started" | "intercom_joined" | "intercom_left" |
+	// "intercom_ended" (the events of the call the page is in) | "error".
+	Event            string   `json:"event,omitempty"`
+	RemoteID         string   `json:"remote_id,omitempty"`      // the page's own id in the call
+	ParticipantID    string   `json:"participant_id,omitempty"` // who joined or left
+	NodeIDs          []string `json:"node_ids,omitempty"`       // nodes in the call
+	RemoteIDs        []string `json:"remote_ids,omitempty"`     // pages in the call
+	Status           string   `json:"status,omitempty"`
+	Reason           string   `json:"reason,omitempty"`
+	Message          string   `json:"message,omitempty"`
+	DurationSeconds  float64  `json:"duration_seconds,omitempty"`
+	RemainingSeconds float64  `json:"remaining_seconds,omitempty"`
 }
 
-// handleIntercomWS runs one intercom call from the page to a node:
+// handleIntercomWS puts the page in the call of a node:
 //
 //	GET /api/intercom/ws?node_id=front_door[&duration_seconds=300][&token=...]
 //
-// The call starts when the socket opens. The page sends its microphone as
-// binary messages of 16 kHz mono PCM16 little-endian; gocalis mixes it into the
-// node's output, which for the doorbell is the one WHIP talkback track and
-// AAC-ELD bridge that TTS uses. The page never gets a route of its own to the
-// doorbell, and it receives nothing but JSON status messages here: it plays the
-// doorbell from go2rtc directly. The call ends when the socket closes, when the
-// page sends {"action":"stop"} or stops sending, on its deadline, or when
-// something else stops it; the page is then told why ("intercom_ended").
+// The page joins the call the node is in, or starts one with it, when the
+// socket opens. It sends its microphone as binary messages of 16 kHz mono PCM16
+// little-endian; gocalis mixes it into the call, which reaches the node through
+// its normal output (for the doorbell, the one WHIP talkback track and AAC-ELD
+// bridge that TTS uses). The page gets binary messages in the same format with
+// the rest of the call (the other pages and nodes, the chimes), minus the node
+// it shows when that one has a go2rtc viewer: the page plays it from there. It
+// also gets the events of the call as JSON. The page leaves the call when the
+// socket closes, when it sends {"action":"leave"} or when it stops sending; the
+// call goes on for the others unless fewer than two remain.
 func (s *Server) handleIntercomWS(w http.ResponseWriter, r *http.Request) {
 	if !httpsec.TokenValid(r, s.authToken) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -138,33 +148,98 @@ func (s *Server) handleIntercomWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	var writeMu sync.Mutex
-	send := func(m intercomMessage) {
+	write := func(kind int, data []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		_ = conn.WriteJSON(m)
+		return conn.WriteMessage(kind, data)
+	}
+	send := func(m intercomMessage) {
+		if data, err := json.Marshal(m); err == nil {
+			_ = write(websocket.TextMessage, data)
+		}
 	}
 
+	// The engine must not be held up by a slow page: its events are queued
+	// here (each one carries the whole list of participants, so a dropped one
+	// is made up for by the next).
+	events := make(chan intercom.Event, 32)
 	engine := s.executor.IntercomEngine
-	remote := engine.NewRemote()
-	call, err := engine.StartRemote(remote, []string{nodeID}, time.Duration(seconds*float64(time.Second)))
-	if err != nil {
-		send(intercomMessage{Event: "error", NodeID: nodeID, Status: "error", Message: err.Error()})
+	remote := engine.NewRemote(func(ev intercom.Event) {
+		select {
+		case events <- ev:
+		default:
+		}
+	})
+	_, playsNode := s.intercomViewers[nodeID]
+	if err := engine.ConnectRemote(remote, nodeID, playsNode, time.Duration(seconds*float64(time.Second))); err != nil {
+		send(intercomMessage{Event: "error", Status: "error", Message: err.Error()})
 		return
 	}
-	log.Printf("[Intercom] page %s (%s) talks to '%s' for up to %.0fs\n", remote.ID, r.RemoteAddr, nodeID, seconds)
-	send(intercomMessage{Event: "intercom_started", NodeID: nodeID, RemoteID: remote.ID, Status: "success", DurationSeconds: seconds})
+	log.Printf("[Intercom] page %s (%s) joins the call of '%s'\n", remote.ID, r.RemoteAddr, nodeID)
+	sendEvent := func(ev intercom.Event) {
+		send(intercomMessage{
+			Event:            ev.Event,
+			RemoteID:         remote.ID,
+			ParticipantID:    ev.ParticipantID,
+			NodeIDs:          ev.NodeIDs,
+			RemoteIDs:        ev.RemoteIDs,
+			Status:           ev.Status,
+			Reason:           ev.Reason,
+			Message:          ev.Message,
+			DurationSeconds:  ev.DurationSeconds,
+			RemainingSeconds: ev.RemainingSeconds,
+		})
+	}
 
-	// When the call ends for any reason, tell the page and close the socket,
-	// which also unblocks the read loop below.
-	notified := make(chan struct{})
+	// Send the page the call's mix until the page is out of the call.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mixed := make(chan struct{})
 	go func() {
-		defer close(notified)
-		<-call.Done()
-		ev := call.Ended()
-		send(intercomMessage{Event: "intercom_ended", NodeID: nodeID, RemoteID: remote.ID, Status: ev.Status, Reason: ev.Reason, Message: ev.Message, DurationSeconds: ev.DurationSeconds})
+		defer close(mixed)
+		for {
+			pcm, err := remote.Read(ctx)
+			if len(pcm) > 0 {
+				data := make([]byte, 2*len(pcm))
+				for i, v := range pcm {
+					binary.LittleEndian.PutUint16(data[2*i:], uint16(v))
+				}
+				if write(websocket.BinaryMessage, data) != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Send the page the events of its call. Once it is out of the call (it left
+	// or the call ended) and it has been told, close the socket, which also
+	// unblocks the read loop below.
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		for out := false; !out; {
+			select {
+			case ev := <-events:
+				sendEvent(ev)
+			case <-remote.Left():
+				out = true
+			}
+		}
+		<-mixed
+		for more := true; more; {
+			select {
+			case ev := <-events:
+				sendEvent(ev)
+			default:
+				more = false
+			}
+		}
 		writeMu.Lock()
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ev.Reason), time.Now().Add(time.Second))
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 		writeMu.Unlock()
 		_ = conn.Close()
 	}()
@@ -185,10 +260,11 @@ func (s *Server) handleIntercomWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		var m intercomMessage
-		if json.Unmarshal(data, &m) == nil && m.Action == "stop" {
+		if json.Unmarshal(data, &m) == nil && m.Action == "leave" {
 			break
 		}
 	}
-	call.Stop()
-	<-notified
+	engine.Leave(remote.ID)
+	cancel()
+	<-closed
 }

@@ -3,6 +3,8 @@ package intercom
 import (
 	"context"
 	"errors"
+	"io"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -26,65 +28,122 @@ func (c *eventCollector) emit(ev Event) {
 	c.mu.Unlock()
 }
 
-func (c *eventCollector) find(name string) (Event, bool) {
+// find returns the first recorded event with that name about that participant
+// ("" for any).
+func (c *eventCollector) find(name, participant string) (Event, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, ev := range c.events {
-		if ev.Event == name {
+		if ev.Event == name && (participant == "" || ev.ParticipantID == participant) {
 			return ev, true
 		}
 	}
 	return Event{}, false
 }
 
-// testRig wires a brain with two stub audio nodes and an intercom engine.
+// testRig wires a brain with stub audio nodes A, B and C and an intercom engine
+// whose chimes are silent, so tests can follow microphone audio verbatim.
 type testRig struct {
 	brain  *brain.Brain
 	engine *Engine
 	events *eventCollector
-	stubA  *audionode.Stub
-	stubB  *audionode.Stub
-	nodeA  *node.PhysicalNode
-	nodeB  *node.PhysicalNode
+	stubs  map[string]*audionode.Stub
+	nodes  map[string]*node.PhysicalNode
 }
 
 func newTestRig(t *testing.T, cfg config.IntercomConfig) *testRig {
 	t.Helper()
-	b := brain.New(nil)
-	stubA, stubB := &audionode.Stub{}, &audionode.Stub{}
-	pA := node.NewPhysicalNode("A", "local")
-	pB := node.NewPhysicalNode("B", "local")
-	b.RegisterNode("A", &brain.NodeHandle{Node: pA, Audio: stubA, Config: config.NodeConfig{NodeID: "A", Type: "local"}})
-	b.RegisterNode("B", &brain.NodeHandle{Node: pB, Audio: stubB, Config: config.NodeConfig{NodeID: "B", Type: "local"}})
-
-	ec := &eventCollector{}
-	eng := NewEngine(b, cfg, ec.emit, nil) // nil AEC: verbatim bridge
-	return &testRig{brain: b, engine: eng, events: ec, stubA: stubA, stubB: stubB, nodeA: pA, nodeB: pB}
+	rig := &testRig{
+		brain:  brain.New(nil),
+		events: &eventCollector{},
+		stubs:  map[string]*audionode.Stub{},
+		nodes:  map[string]*node.PhysicalNode{},
+	}
+	for _, id := range []string{"A", "B", "C"} {
+		rig.stubs[id] = &audionode.Stub{}
+		rig.nodes[id] = node.NewPhysicalNode(id, "local")
+		t.Cleanup(rig.nodes[id].Close)
+		rig.brain.RegisterNode(id, &brain.NodeHandle{Node: rig.nodes[id], Audio: rig.stubs[id], Config: config.NodeConfig{NodeID: id, Type: "local"}})
+	}
+	rig.engine = NewEngine(rig.brain, cfg, rig.events.emit, nil) // nil AEC: verbatim bridge
+	rig.engine.joinChime, rig.engine.leaveChime = nil, nil
+	t.Cleanup(rig.engine.Shutdown)
+	return rig
 }
 
-func waitForState(t *testing.T, n *node.PhysicalNode, want node.NodeState, timeout time.Duration) {
+func (rig *testRig) waitForState(t *testing.T, id string, want node.NodeState) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if n.GetState() == want {
+		if rig.nodes[id].GetState() == want {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("node %s did not reach state %s (still %s)", n.NodeID, want, n.GetState())
+	t.Fatalf("node %s did not reach state %s (still %s)", id, want, rig.nodes[id].GetState())
 }
 
-func waitForEvent(t *testing.T, ec *eventCollector, name string, timeout time.Duration) Event {
+func (rig *testRig) waitForEvent(t *testing.T, name, participant string) Event {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if ev, ok := ec.find(name); ok {
+		if ev, ok := rig.events.find(name, participant); ok {
 			return ev
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("event %q not observed within %v", name, timeout)
+	t.Fatalf("event %q (participant %q) not observed", name, participant)
 	return Event{}
+}
+
+// played returns everything the node's speaker has finished playing.
+func (rig *testRig) played(id string) []int16 {
+	var out []int16
+	for _, buf := range rig.stubs[id].Played {
+		out = append(out, buf...)
+	}
+	return out
+}
+
+// tone returns n samples of a recognisable ramp starting at base.
+func tone(base int16, n int) []int16 {
+	out := make([]int16, n)
+	for i := range out {
+		out[i] = base + int16(i%7)
+	}
+	return out
+}
+
+// contains reports whether want appears as a contiguous run in got.
+func contains(got, want []int16) bool {
+	for i := 0; i+len(want) <= len(got); i++ {
+		if slices.Equal(got[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return len(want) == 0
+}
+
+// readRemote collects what the page is sent until stop reports true or the
+// page is out of the call.
+func readRemote(t *testing.T, r *Remote, stop func(got []int16) bool) []int16 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var got []int16
+	for {
+		pcm, err := r.Read(ctx)
+		got = append(got, pcm...)
+		if stop != nil && stop(got) {
+			return got
+		}
+		if errors.Is(err, io.EOF) {
+			return got
+		}
+		if err != nil {
+			t.Fatalf("remote read: %v (got %d samples)", err, len(got))
+		}
+	}
 }
 
 // TestIntercomBridgesMicToPeer verifies A's mic reaches B's speaker and the call
@@ -92,39 +151,39 @@ func waitForEvent(t *testing.T, ec *eventCollector, name string, timeout time.Du
 func TestIntercomBridgesMicToPeer(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 5})
 
-	if err := rig.engine.Start([]string{"A", "B"}, 300*time.Millisecond); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 300*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	started := rig.waitForEvent(t, "intercom_started", "")
+	if !slices.Equal(started.NodeIDs, []string{"A", "B"}) || started.RemainingSeconds <= 0 {
+		t.Fatalf("unexpected started event: %+v", started)
 	}
 
 	// Once both nodes are INTERCOM the taps are installed and streaming.
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
-	waitForState(t, rig.nodeB, node.StateIntercom, time.Second)
+	rig.waitForState(t, "A", node.StateIntercom)
+	rig.waitForState(t, "B", node.StateIntercom)
 
 	micA := []float32{0.1, -0.2, 0.3, -0.4, 0.5}
 	rig.brain.ForwardRawAudio("A", micA)
 
-	ended := waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
-	if ended.Reason != "timeout" {
-		t.Fatalf("expected reason timeout, got %q", ended.Reason)
-	}
-	if ended.NodeID != "A" || ended.PeerNodeID != "B" {
-		t.Fatalf("unexpected participants: %+v", ended)
+	ended := rig.waitForEvent(t, "intercom_ended", "")
+	if ended.Reason != "timeout" || ended.Status != "success" || !slices.Equal(ended.NodeIDs, []string{"A", "B"}) {
+		t.Fatalf("unexpected ended event: %+v", ended)
 	}
 
 	// B's stub should have played A's mic audio (converted to PCM16).
-	want := audio.FloatToPCM16(micA)
-	if !stubPlayedContains(rig.stubB, want) {
-		t.Fatalf("node B did not play A's mic audio; played=%v want-subseq=%v", flatten(rig.stubB), want)
+	if want := audio.FloatToPCM16(micA); !contains(rig.played("B"), want) {
+		t.Fatalf("node B did not play A's mic audio; played=%v want-subseq=%v", rig.played("B"), want)
 	}
 	// A's mix-minus feed (everyone but A) had no other talkers, so A played only
-	// silence — never any leaked audio.
-	if n := nonZeroCount(flatten(rig.stubA)); n != 0 {
-		t.Fatalf("node A played %d non-silent samples unexpectedly", n)
+	// silence: never its own microphone.
+	if slices.ContainsFunc(rig.played("A"), func(v int16) bool { return v != 0 }) {
+		t.Fatal("node A heard itself")
 	}
 
 	// Both nodes return to IDLE after the call.
-	waitForState(t, rig.nodeA, node.StateIdle, time.Second)
-	waitForState(t, rig.nodeB, node.StateIdle, time.Second)
+	rig.waitForState(t, "A", node.StateIdle)
+	rig.waitForState(t, "B", node.StateIdle)
 }
 
 // TestIntercomRejectsSpeak verifies a speak/play on a participating node fails
@@ -133,10 +192,10 @@ func TestIntercomBridgesMicToPeer(t *testing.T) {
 func TestIntercomRejectsSpeak(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 5})
 
-	if err := rig.engine.Start([]string{"A", "B"}, 250*time.Millisecond); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 250*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
+	rig.waitForState(t, "A", node.StateIntercom)
 
 	err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0)
 	if !errors.Is(err, brain.ErrIntercomActive) {
@@ -146,7 +205,7 @@ func TestIntercomRejectsSpeak(t *testing.T) {
 		t.Fatalf("AcquireNode during the call = %v, want ErrIntercomActive", err)
 	}
 
-	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	rig.waitForEvent(t, "intercom_ended", "")
 	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1, 2, 3}, 16000, 0); err != nil {
 		t.Fatalf("PlaySamples after the call: %v", err)
 	}
@@ -168,8 +227,8 @@ func TestIntercomPreemptsTurn(t *testing.T) {
 		turnDone <- turn.PlayStream(turn.Context(), endless)
 	}()
 
-	if err := rig.engine.Start([]string{"A", "B"}, 300*time.Millisecond); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 300*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
 	select {
 	case <-turnDone:
@@ -179,161 +238,342 @@ func TestIntercomPreemptsTurn(t *testing.T) {
 	if !turn.Preempted() {
 		t.Fatal("turn not marked preempted")
 	}
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
-	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	rig.waitForState(t, "A", node.StateIntercom)
+	rig.waitForEvent(t, "intercom_ended", "")
 }
 
-// TestIntercomRemoteTalksToNode verifies the intercom page's microphone reaches
-// the node through its normal output (the single talkback path) and that the
-// node's own microphone is not tapped (nobody in gocalis listens to it).
-func TestIntercomRemoteTalksToNode(t *testing.T) {
+// TestIntercomRemoteAndNode verifies a page and a node hear each other, and that
+// the call ends when the page leaves.
+func TestIntercomRemoteAndNode(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
 
-	remote := rig.engine.NewRemote()
-	call, err := rig.engine.StartRemote(remote, []string{"A"}, 400*time.Millisecond)
-	if err != nil {
-		t.Fatalf("StartRemote failed: %v", err)
+	var notified eventCollector
+	remote := rig.engine.NewRemote(notified.emit)
+	if err := rig.engine.ConnectRemote(remote, "A", false, 0); err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
 	}
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
-	if rig.nodeB.GetState() != node.StateIdle {
-		t.Fatalf("node B was drawn into the call: %s", rig.nodeB.GetState())
+	started := rig.waitForEvent(t, "intercom_started", "")
+	if !slices.Equal(started.NodeIDs, []string{"A"}) || !slices.Equal(started.RemoteIDs, []string{remote.ID}) {
+		t.Fatalf("unexpected started event: %+v", started)
+	}
+	rig.waitForState(t, "A", node.StateIntercom)
+	if rig.nodes["B"].GetState() != node.StateIdle {
+		t.Fatalf("node B was drawn into the call: %s", rig.nodes["B"].GetState())
 	}
 
-	// A's own microphone: no tap may be installed, so this must reach nothing.
-	leak := audio.FloatToPCM16([]float32{0.9})[0]
-	rig.brain.ForwardRawAudio("A", []float32{0.9, 0.9, 0.9})
-
-	voice := make([]int16, 1600) // 100 ms, above the jitter cushion
-	for i := range voice {
-		voice[i] = int16(1000 + i%7)
+	// The node's microphone reaches the page.
+	micA := []float32{0.1, -0.2, 0.3, -0.4, 0.5}
+	rig.brain.ForwardRawAudio("A", micA)
+	want := audio.FloatToPCM16(micA)
+	if got := readRemote(t, remote, func(got []int16) bool { return contains(got, want) }); !contains(got, want) {
+		t.Fatal("the page did not hear node A")
 	}
+
+	// The page's microphone reaches the node, never the page itself.
+	voice := tone(1000, 1600) // 100 ms, above the jitter cushion
 	remote.Push(voice)
+	time.Sleep(150 * time.Millisecond)
 
-	// A second caller cannot take the same node.
-	if _, err := rig.engine.StartRemote(rig.engine.NewRemote(), []string{"A"}, 0); err == nil {
-		t.Fatal("a second remote call took a node already in a call")
+	if !rig.engine.Leave(remote.ID) {
+		t.Fatal("Leave returned false for a participant")
 	}
-
 	select {
-	case <-call.Done():
+	case <-remote.Left():
 	case <-time.After(5 * time.Second):
-		t.Fatal("call did not end on its deadline")
+		t.Fatal("the page was not let go")
 	}
-	ended := call.Ended()
-	if ended.Reason != "timeout" || len(ended.RemoteIDs) != 1 || ended.RemoteIDs[0] != remote.ID || ended.NodeID != "A" || ended.PeerNodeID != "" {
+	if tail := readRemote(t, remote, nil); slices.Contains(tail, voice[0]) {
+		t.Fatal("the page heard itself")
+	}
+	if _, ok := notified.find("intercom_left", remote.ID); !ok {
+		t.Fatal("the page was not told it left")
+	}
+	ended := rig.waitForEvent(t, "intercom_ended", "")
+	if ended.Reason != "left" || !slices.Equal(ended.NodeIDs, []string{"A"}) || len(ended.RemoteIDs) != 0 {
 		t.Fatalf("unexpected ended event: %+v", ended)
 	}
-	if !stubPlayedContains(rig.stubA, voice[:320]) {
-		t.Fatalf("node A did not play the remote voice")
+	if !contains(rig.played("A"), voice[:320]) {
+		t.Fatal("node A did not play the page's voice")
 	}
-	for _, v := range flatten(rig.stubA) {
-		if v == leak {
-			t.Fatal("node A's own microphone leaked into its speaker")
-		}
-	}
-	waitForState(t, rig.nodeA, node.StateIdle, time.Second)
-}
-
-// TestIntercomRemoteStop verifies the page's transport can end its call through
-// the handle, and that the node is free again afterwards.
-func TestIntercomRemoteStop(t *testing.T) {
-	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
-	call, err := rig.engine.StartRemote(rig.engine.NewRemote(), []string{"A"}, 0)
-	if err != nil {
-		t.Fatalf("StartRemote failed: %v", err)
-	}
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
-	call.Stop()
-	select {
-	case <-call.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("call did not end after Stop")
-	}
-	if r := call.Ended().Reason; r != "stopped" {
-		t.Fatalf("reason = %q, want stopped", r)
-	}
+	rig.waitForState(t, "A", node.StateIdle)
 	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0); err != nil {
 		t.Fatalf("PlaySamples after the call: %v", err)
 	}
 }
 
-// TestIntercomStop verifies an external stop ends the call early with the
-// "stopped" reason.
-func TestIntercomStop(t *testing.T) {
+// TestIntercomRemotePlaysNodeItself verifies a page that plays the node from its
+// own viewer is not sent that node again, while it still gets everyone else.
+func TestIntercomRemotePlaysNodeItself(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
 
-	if err := rig.engine.Start([]string{"A", "B"}, 30*time.Second); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	viewer := rig.engine.NewRemote(nil)
+	if err := rig.engine.ConnectRemote(viewer, "A", true, 0); err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
 	}
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
+	rig.waitForState(t, "A", node.StateIntercom)
 
-	if !rig.engine.Stop("B") {
-		t.Fatal("Stop returned false for an active call")
+	// A second page joins the same call instead of being refused.
+	other := rig.engine.NewRemote(nil)
+	if err := rig.engine.ConnectRemote(other, "A", true, 0); err != nil {
+		t.Fatalf("second ConnectRemote failed: %v", err)
 	}
-	ended := waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
-	if ended.Reason != "stopped" {
-		t.Fatalf("expected reason stopped, got %q", ended.Reason)
+	joined := rig.waitForEvent(t, "intercom_joined", other.ID)
+	if !slices.Equal(joined.RemoteIDs, []string{viewer.ID, other.ID}) {
+		t.Fatalf("unexpected joined event: %+v", joined)
+	}
+
+	doorbell := audio.FloatToPCM16([]float32{0.9})[0]
+	rig.brain.ForwardRawAudio("A", []float32{0.9, 0.9, 0.9})
+	voice := tone(2000, 1600)
+	other.Push(voice)
+
+	got := readRemote(t, viewer, func(got []int16) bool { return contains(got, voice[:320]) })
+	if !contains(got, voice[:320]) {
+		t.Fatal("the first page did not hear the second one")
+	}
+	if slices.Contains(got, doorbell) {
+		t.Fatal("the page was sent the node it plays itself")
+	}
+
+	// One page leaves: the call goes on for the other one and the node.
+	rig.engine.Leave(other.ID)
+	left := rig.waitForEvent(t, "intercom_left", other.ID)
+	if !slices.Equal(left.RemoteIDs, []string{viewer.ID}) || !slices.Equal(left.NodeIDs, []string{"A"}) {
+		t.Fatalf("unexpected left event: %+v", left)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, ok := rig.events.find("intercom_ended", ""); ok {
+		t.Fatal("the call ended although two participants remain")
+	}
+	if rig.nodes["A"].GetState() != node.StateIntercom {
+		t.Fatal("node A dropped out of the call")
+	}
+
+	rig.engine.Leave(viewer.ID)
+	if ended := rig.waitForEvent(t, "intercom_ended", ""); ended.Reason != "left" {
+		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+}
+
+// TestIntercomNodeJoinsAndLeaves verifies a node can join a running call and
+// leave it again without ending it for the others.
+func TestIntercomNodeJoinsAndLeaves(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+
+	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	rig.waitForState(t, "B", node.StateIntercom)
+
+	// Naming a node of the running call brings the other ones into it.
+	if err := rig.engine.Connect([]string{"B", "C"}, 0); err != nil {
+		t.Fatalf("joining Connect failed: %v", err)
+	}
+	joined := rig.waitForEvent(t, "intercom_joined", "C")
+	if !slices.Equal(joined.NodeIDs, []string{"A", "B", "C"}) {
+		t.Fatalf("unexpected joined event: %+v", joined)
+	}
+	rig.waitForState(t, "C", node.StateIntercom)
+	if err := rig.engine.Connect([]string{"A", "C"}, 0); err == nil {
+		t.Fatal("expected an error connecting nodes that already share the call")
+	}
+
+	micA := []float32{0.2, -0.3, 0.4, -0.5, 0.6}
+	rig.brain.ForwardRawAudio("A", micA)
+	time.Sleep(100 * time.Millisecond)
+
+	if !rig.engine.Leave("C") {
+		t.Fatal("Leave returned false for a participant")
+	}
+	left := rig.waitForEvent(t, "intercom_left", "C")
+	if !slices.Equal(left.NodeIDs, []string{"A", "B"}) {
+		t.Fatalf("unexpected left event: %+v", left)
+	}
+	// C is free again and played what A said while it was in the call.
+	rig.waitForState(t, "C", node.StateIdle)
+	if err := rig.brain.PlaySamples(context.Background(), "C", []int16{1}, 16000, 0); err != nil {
+		t.Fatalf("PlaySamples on the node that left: %v", err)
+	}
+	if !contains(rig.played("C"), audio.FloatToPCM16(micA)) {
+		t.Fatal("node C did not hear A while it was in the call")
+	}
+	if rig.nodes["A"].GetState() != node.StateIntercom || rig.nodes["B"].GetState() != node.StateIntercom {
+		t.Fatal("the call did not go on for A and B")
+	}
+
+	rig.engine.Stop("A")
+	if ended := rig.waitForEvent(t, "intercom_ended", ""); ended.Reason != "stopped" || !slices.Equal(ended.NodeIDs, []string{"A", "B"}) {
+		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+}
+
+// TestIntercomJoinPushesDeadlineBack verifies a call lasts at least the asked
+// duration from the last join.
+func TestIntercomJoinPushesDeadlineBack(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+
+	if err := rig.engine.Connect([]string{"A", "B"}, 200*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	rig.waitForState(t, "A", node.StateIntercom)
+	if err := rig.engine.Connect([]string{"A", "C"}, 700*time.Millisecond); err != nil {
+		t.Fatalf("joining Connect failed: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, ok := rig.events.find("intercom_ended", ""); ok {
+		t.Fatal("the call ended on the deadline it had before the join")
+	}
+	ended := rig.waitForEvent(t, "intercom_ended", "")
+	if ended.Reason != "timeout" || ended.DurationSeconds < 0.7 {
+		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+}
+
+// TestIntercomChimes verifies the call rings when someone joins or leaves, and
+// when it ends.
+func TestIntercomChimes(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+	rig.engine.joinChime, rig.engine.leaveChime = tone(5000, 640), tone(-5000, 640)
+	join, leave := rig.engine.joinChime, rig.engine.leaveChime
+
+	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	rig.waitForState(t, "B", node.StateIntercom)
+	time.Sleep(100 * time.Millisecond) // the start chime plays out
+
+	page := rig.engine.NewRemote(nil)
+	if err := rig.engine.ConnectRemote(page, "A", false, 0); err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+	if got := readRemote(t, page, func(got []int16) bool { return contains(got, join) }); !contains(got, join) {
+		t.Fatal("the page did not hear the chime of its own join")
+	}
+
+	rig.engine.Leave("B")
+	if got := readRemote(t, page, func(got []int16) bool { return contains(got, leave) }); !contains(got, leave) {
+		t.Fatal("the page did not hear a node leave")
+	}
+	rig.waitForState(t, "B", node.StateIdle)
+	// B heard the call start, the page join, and its own leave.
+	b := rig.played("B")
+	if i := slices.Index(b, join[0]); i < 0 || !contains(b[i+len(join):], join) {
+		t.Fatal("node B did not hear two join chimes")
+	}
+	if !contains(b, leave) {
+		t.Fatal("node B did not hear its own leave chime")
+	}
+
+	rig.engine.Stop("A")
+	rig.waitForEvent(t, "intercom_ended", "")
+	if !contains(rig.played("A"), leave) {
+		t.Fatal("node A did not hear the call end")
 	}
 }
 
 // TestIntercomStopImmediatelyAfterStart verifies Stop is safe before the call's
-// background goroutine has run (the cancel func must already exist).
+// background goroutine has run.
 func TestIntercomStopImmediatelyAfterStart(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
 
-	if err := rig.engine.Start([]string{"A", "B"}, 30*time.Second); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 30*time.Second); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
 	if !rig.engine.Stop("A") {
 		t.Fatal("Stop returned false for a just-started call")
 	}
-	ended := waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	ended := rig.waitForEvent(t, "intercom_ended", "")
 	if ended.Reason != "stopped" || ended.Status != "success" {
 		t.Fatalf("expected stopped/success, got %q/%q", ended.Reason, ended.Status)
 	}
+	rig.waitForState(t, "A", node.StateIdle)
+	if err := rig.brain.PlaySamples(context.Background(), "A", []int16{1}, 16000, 0); err != nil {
+		t.Fatalf("PlaySamples after the call: %v", err)
+	}
+	if rig.engine.Stop("A") || rig.engine.Leave("A") {
+		t.Fatal("Stop/Leave found a call that is over")
+	}
 }
 
-// TestIntercomRejectsBusyNode verifies a node already in a call cannot join another.
-func TestIntercomRejectsBusyNode(t *testing.T) {
+// TestIntercomKeepsCallsApart verifies two calls cannot be merged by naming a
+// node of each.
+func TestIntercomKeepsCallsApart(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
-	// Third node so the second Start has a valid partner.
-	rig.brain.RegisterNode("C", &brain.NodeHandle{Node: node.NewPhysicalNode("C", "local"), Audio: &audionode.Stub{}, Config: config.NodeConfig{NodeID: "C", Type: "local"}})
 
-	if err := rig.engine.Start([]string{"A", "B"}, 5*time.Second); err != nil {
-		t.Fatalf("first Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
-	waitForState(t, rig.nodeA, node.StateIntercom, time.Second)
-
-	if err := rig.engine.Start([]string{"A", "C"}, 5*time.Second); err == nil {
-		t.Fatal("expected error starting a call with a node already in a call")
+	if err := rig.engine.ConnectRemote(rig.engine.NewRemote(nil), "C", false, 0); err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
 	}
-	rig.engine.Stop("A")
-	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	if err := rig.engine.Connect([]string{"A", "C"}, 0); err == nil {
+		t.Fatal("expected an error connecting nodes of two different calls")
+	}
 }
 
 func TestIntercomRejectsInvalid(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
-	if err := rig.engine.Start([]string{"A", "A"}, time.Second); err == nil {
+	if err := rig.engine.Connect([]string{"A", "A"}, time.Second); err == nil {
 		t.Fatal("expected error for identical nodes")
 	}
-	if err := rig.engine.Start([]string{"A", "ghost"}, time.Second); err == nil {
+	if err := rig.engine.Connect([]string{"A"}, time.Second); err == nil {
+		t.Fatal("expected error for a single node")
+	}
+	if err := rig.engine.Connect([]string{"A", "ghost"}, time.Second); err == nil {
 		t.Fatal("expected error for unregistered node")
+	}
+	if err := rig.engine.ConnectRemote(rig.engine.NewRemote(nil), "ghost", false, 0); err == nil {
+		t.Fatal("expected error for a page calling an unregistered node")
 	}
 }
 
-// fakeCanceller is a test EchoCanceller that records use and can transform the
-// near-end so tests can prove the AEC actually sits in the stream.
+// failingNode is an audio node whose playback fails at once.
+type failingNode struct{ audionode.Stub }
+
+func (*failingNode) PlayStream(context.Context, audionode.PCM16Source) error {
+	return errors.New("speaker unplugged")
+}
+
+// TestIntercomDropsFailingNode verifies a node whose playback fails is dropped
+// from the call, which goes on for the others and ends in error only when that
+// leaves a single participant.
+func TestIntercomDropsFailingNode(t *testing.T) {
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 30})
+	broken := node.NewPhysicalNode("X", "local")
+	t.Cleanup(broken.Close)
+	rig.brain.RegisterNode("X", &brain.NodeHandle{Node: broken, Audio: &failingNode{}, Config: config.NodeConfig{NodeID: "X", Type: "local"}})
+
+	if err := rig.engine.Connect([]string{"A", "B", "X"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	left := rig.waitForEvent(t, "intercom_left", "X")
+	if left.Status != "error" || left.Message == "" || !slices.Equal(left.NodeIDs, []string{"A", "B"}) {
+		t.Fatalf("unexpected left event: %+v", left)
+	}
+	rig.waitForState(t, "A", node.StateIntercom)
+	rig.engine.Stop("A")
+	rig.waitForEvent(t, "intercom_ended", "")
+	rig.waitForState(t, "A", node.StateIdle)
+
+	rig.events = &eventCollector{}
+	rig.engine.emit = rig.events.emit
+	if err := rig.engine.Connect([]string{"A", "X"}, 0); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	ended := rig.waitForEvent(t, "intercom_ended", "")
+	if ended.Reason != "error" || ended.Status != "error" || ended.Message == "" {
+		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+}
+
+// fakeCanceller is a test EchoCanceller that can transform the near-end so
+// tests can prove the AEC actually sits in the stream.
 type fakeCanceller struct {
-	mu        sync.Mutex
-	captures  int
 	transform func([]int16) []int16
 }
 
 func (f *fakeCanceller) Playback(_ []int16) {}
 func (f *fakeCanceller) Capture(near []int16) []int16 {
-	f.mu.Lock()
-	f.captures++
-	f.mu.Unlock()
 	if f.transform != nil {
 		return f.transform(near)
 	}
@@ -352,20 +592,20 @@ func TestIntercomAECDisabledBypasses(t *testing.T) {
 		return &fakeCanceller{}, nil
 	}
 
-	if err := rig.engine.Start([]string{"A", "B"}, 250*time.Millisecond); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 250*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
-	waitForState(t, rig.nodeB, node.StateIntercom, time.Second)
+	rig.waitForState(t, "B", node.StateIntercom)
 
 	micA := []float32{0.25, -0.25, 0.5}
 	rig.brain.ForwardRawAudio("A", micA)
-	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	rig.waitForEvent(t, "intercom_ended", "")
 
 	if built != 0 {
 		t.Fatalf("AEC factory was invoked %d times while disabled", built)
 	}
-	if !stubPlayedContains(rig.stubB, audio.FloatToPCM16(micA)) {
-		t.Fatalf("disabled AEC did not bridge audio verbatim; played=%v", flatten(rig.stubB))
+	if !contains(rig.played("B"), audio.FloatToPCM16(micA)) {
+		t.Fatalf("disabled AEC did not bridge audio verbatim; played=%v", rig.played("B"))
 	}
 }
 
@@ -380,126 +620,99 @@ func TestIntercomAECEnabledEngaged(t *testing.T) {
 	// Transform zeroes the near-end so we can detect the AEC output in playback.
 	rig.engine.newAEC = func(_, _, _ int) (EchoCanceller, error) {
 		built++
-		return &fakeCanceller{transform: func(s []int16) []int16 {
-			out := make([]int16, len(s))
-			return out
-		}}, nil
+		return &fakeCanceller{transform: func(s []int16) []int16 { return make([]int16, len(s)) }}, nil
 	}
 
-	if err := rig.engine.Start([]string{"A", "B"}, 250*time.Millisecond); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B"}, 250*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
-	waitForState(t, rig.nodeB, node.StateIntercom, time.Second)
+	rig.waitForState(t, "B", node.StateIntercom)
 
 	rig.brain.ForwardRawAudio("A", []float32{0.4, 0.4, 0.4})
-	waitForEvent(t, rig.events, "intercom_ended", 2*time.Second)
+	rig.waitForEvent(t, "intercom_ended", "")
 
 	if built != 2 {
 		t.Fatalf("expected an AEC per node (2), built %d", built)
 	}
 	// The AEC zeroed A's mic, so B must have played only zeros (or nothing).
-	for _, v := range flatten(rig.stubB) {
-		if v != 0 {
-			t.Fatalf("expected AEC-processed (zeroed) audio on B, got %v", flatten(rig.stubB))
-		}
+	if slices.ContainsFunc(rig.played("B"), func(v int16) bool { return v != 0 }) {
+		t.Fatalf("expected AEC-processed (zeroed) audio on B, got %v", rig.played("B"))
 	}
 }
 
 // TestIntercomThreeNodeMixMinus verifies N-way mix-minus: with three nodes and
 // only A talking, both B and C hear A while A (the only talker) hears silence.
 func TestIntercomThreeNodeMixMinus(t *testing.T) {
-	b := brain.New(nil)
-	stubs := map[string]*audionode.Stub{"A": {}, "B": {}, "C": {}}
-	pnodes := map[string]*node.PhysicalNode{}
-	for _, id := range []string{"A", "B", "C"} {
-		p := node.NewPhysicalNode(id, "local")
-		pnodes[id] = p
-		b.RegisterNode(id, &brain.NodeHandle{Node: p, Audio: stubs[id], Config: config.NodeConfig{NodeID: id, Type: "local"}})
-	}
+	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 5})
 
-	ec := &eventCollector{}
-	eng := NewEngine(b, config.IntercomConfig{DefaultTimeoutSeconds: 5}, ec.emit, nil)
-
-	if err := eng.Start([]string{"A", "B", "C"}, 300*time.Millisecond); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := rig.engine.Connect([]string{"A", "B", "C"}, 300*time.Millisecond); err != nil {
+		t.Fatalf("Connect failed: %v", err)
 	}
 	for _, id := range []string{"A", "B", "C"} {
-		waitForState(t, pnodes[id], node.StateIntercom, time.Second)
+		rig.waitForState(t, id, node.StateIntercom)
 	}
 
 	micA := []float32{0.2, -0.3, 0.4, -0.5, 0.6}
-	b.ForwardRawAudio("A", micA)
+	rig.brain.ForwardRawAudio("A", micA)
 
-	ended := waitForEvent(t, ec, "intercom_ended", 2*time.Second)
+	ended := rig.waitForEvent(t, "intercom_ended", "")
 	if len(ended.NodeIDs) != 3 {
 		t.Fatalf("expected 3 participants in event, got %v", ended.NodeIDs)
 	}
 
 	want := audio.FloatToPCM16(micA)
-	if !stubPlayedContains(stubs["B"], want) {
-		t.Fatalf("node B did not hear A: %v", flatten(stubs["B"]))
+	if !contains(rig.played("B"), want) {
+		t.Fatalf("node B did not hear A: %v", rig.played("B"))
 	}
-	if !stubPlayedContains(stubs["C"], want) {
-		t.Fatalf("node C did not hear A: %v", flatten(stubs["C"]))
+	if !contains(rig.played("C"), want) {
+		t.Fatalf("node C did not hear A: %v", rig.played("C"))
 	}
-	if n := nonZeroCount(flatten(stubs["A"])); n != 0 {
-		t.Fatalf("node A (sole talker) heard %d non-silent samples", n)
-	}
-}
-
-func TestClampAddInt16(t *testing.T) {
-	cases := []struct{ a, b, want int16 }{
-		{100, 200, 300},
-		{-100, -200, -300},
-		{30000, 30000, 32767},    // positive saturation
-		{-30000, -30000, -32768}, // negative saturation
-		{0, 0, 0},
-	}
-	for _, c := range cases {
-		if got := clampAddInt16(c.a, c.b); got != c.want {
-			t.Fatalf("clampAddInt16(%d,%d)=%d, want %d", c.a, c.b, got, c.want)
-		}
+	if slices.ContainsFunc(rig.played("A"), func(v int16) bool { return v != 0 }) {
+		t.Fatal("node A (sole talker) heard itself")
 	}
 }
 
-// nonZeroCount returns how many samples are non-silent.
-func nonZeroCount(samples []int16) int {
-	n := 0
-	for _, v := range samples {
-		if v != 0 {
-			n++
-		}
+// TestMixerClampsAndSkips verifies the mix saturates instead of wrapping, that a
+// listener never gets itself or the talker it skips, and that a clip reaches
+// everyone once.
+func TestMixerClampsAndSkips(t *testing.T) {
+	m := newMixer(1000) // 20-sample frames
+	loud := func(v int16) *bridge {
+		b := newBridgeBuffer(1000, 1000)
+		b.push(slices.Repeat([]int16{v}, 20))
+		return b
 	}
-	return n
-}
+	m.addTalker("a", loud(30000))
+	m.addTalker("b", loud(30000))
+	m.addTalker("c", loud(-100))
+	outs := map[string]*bridge{}
+	for id, skip := range map[string]string{"a": "", "c": "", "page": "c"} {
+		outs[id] = newBridgeBuffer(1000, 1000)
+		m.addListener(id, outs[id], skip)
+	}
+	m.play([]int16{7, 7, 7})
+	m.tick()
+	m.tick()
 
-// flatten concatenates all recorded stub playbacks into one slice.
-func flatten(s *audionode.Stub) []int16 {
-	var out []int16
-	for _, buf := range s.Played {
-		out = append(out, buf...)
-	}
-	return out
-}
-
-// stubPlayedContains reports whether want appears as a contiguous subsequence of
-// the stub's flattened playback.
-func stubPlayedContains(s *audionode.Stub, want []int16) bool {
-	got := flatten(s)
-	if len(want) == 0 {
-		return true
-	}
-	for i := 0; i+len(want) <= len(got); i++ {
-		match := true
-		for j := range want {
-			if got[i+j] != want[j] {
-				match = false
-				break
-			}
+	first := func(id string) []int16 {
+		got, err := outs[id].ReadPCM16(context.Background(), 20)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if match {
-			return true
-		}
+		return got
 	}
-	return false
+	// a hears b + c + clip; c hears a + b (saturated); the page hears a + b only.
+	if got := first("a"); got[0] != 30000-100+7 || got[3] != 30000-100 {
+		t.Fatalf("listener a got %v", got[:4])
+	}
+	if got := first("c"); got[0] != 32767 {
+		t.Fatalf("listener c got %d, want saturation", got[0])
+	}
+	if got := first("page"); got[5] != 32767 {
+		t.Fatalf("the page got %d, want a+b without the skipped talker", got[5])
+	}
+	// Second tick: the talkers ran dry and the clip is over.
+	if got := first("a"); slices.ContainsFunc(got, func(v int16) bool { return v != 0 }) {
+		t.Fatalf("second frame is not silent: %v", got)
+	}
 }

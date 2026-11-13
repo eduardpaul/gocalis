@@ -46,19 +46,19 @@ func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, sp
 		AskEngine:     ask.NewEngine(brain, asr, speaker, speakerIDCfg),
 		AudioBaseDir:  ".",
 	}
-	// The intercom engine reports lifecycle events (started/ended) asynchronously;
-	// translate them onto the shared event bus.
+	// The intercom engine reports the life of its calls asynchronously;
+	// translate its events onto the shared event bus.
 	e.IntercomEngine = intercom.NewEngine(brain, intercomCfg, func(ev intercom.Event) {
 		e.Publisher.Publish(Response{
-			Event:           ev.Event,
-			NodeID:          ev.NodeID,
-			NodeIDs:         ev.NodeIDs,
-			RemoteIDs:       ev.RemoteIDs,
-			PeerNodeID:      ev.PeerNodeID,
-			Status:          ev.Status,
-			Reason:          ev.Reason,
-			Message:         ev.Message,
-			DurationSeconds: ev.DurationSeconds,
+			Event:            ev.Event,
+			NodeIDs:          ev.NodeIDs,
+			RemoteIDs:        ev.RemoteIDs,
+			ParticipantID:    ev.ParticipantID,
+			Status:           ev.Status,
+			Reason:           ev.Reason,
+			Message:          ev.Message,
+			DurationSeconds:  ev.DurationSeconds,
+			RemainingSeconds: ev.RemainingSeconds,
 		})
 	}, intercom.NewSpeexEchoCanceller)
 	return e
@@ -117,7 +117,9 @@ func (e *Executor) Execute(ctx context.Context, req Request) {
 	case "play":
 		e.executePlay(ctx, req)
 	case "intercom":
-		e.executeIntercom(ctx, req)
+		e.executeIntercom(req)
+	case "intercom_leave":
+		e.executeIntercomLeave(req)
 	case "intercom_stop":
 		e.executeIntercomStop(req)
 	default:
@@ -281,38 +283,29 @@ func (e *Executor) executeAsk(ctx context.Context, req Request) {
 	e.Publisher.Publish(resp)
 }
 
-// executeIntercom starts a live N-node intercom bridge. Participants come from
-// 'node_ids' (two or more); for convenience a two-node call may instead pass
-// 'node_id' + 'peer_node_id'. The call runs in the background (bounded by the
-// configured/overridden timeout) and reports its end via an "intercom_ended"
-// event; the started event is emitted by the engine.
-func (e *Executor) executeIntercom(_ context.Context, req Request) {
-	nodes := req.NodeIDs
-	if len(nodes) == 0 {
-		if req.NodeID != "" {
-			nodes = append(nodes, req.NodeID)
-		}
-		if req.PeerNodeID != "" {
-			nodes = append(nodes, req.PeerNodeID)
-		}
-	}
-	if len(nodes) < 2 {
-		e.publishError(req.NodeID, "intercom requires at least two nodes ('node_ids', or 'node_id'+'peer_node_id')")
-		return
-	}
+// executeIntercom puts the nodes in 'node_ids' (two or more) in a call
+// together: it starts one, or brings the nodes that are not in a call into the
+// one the others are in. The call runs in the background and the engine
+// announces what happens to it ("intercom_started", "intercom_joined", ...).
+func (e *Executor) executeIntercom(req Request) {
 	duration := time.Duration(req.DurationSeconds * float64(time.Second))
-	log.Printf("[Executor] Intercom among [%s] (duration=%v)\n", strings.Join(nodes, ", "), duration)
-	if err := e.IntercomEngine.Start(nodes, duration); err != nil {
-		e.publishError(nodes[0], err.Error())
+	log.Printf("[Executor] Intercom among [%s] (duration=%v)\n", strings.Join(req.NodeIDs, ", "), duration)
+	if err := e.IntercomEngine.Connect(req.NodeIDs, duration); err != nil {
+		e.publishError(req.NodeIDs[0], err.Error())
 	}
 }
 
-// executeIntercomStop ends the intercom call that node_id participates in.
-func (e *Executor) executeIntercomStop(req Request) {
-	if req.NodeID == "" {
-		e.publishError("", "intercom_stop requires 'node_id'")
-		return
+// executeIntercomLeave takes node_id out of the call it is in; the call goes on
+// for the others unless fewer than two remain.
+func (e *Executor) executeIntercomLeave(req Request) {
+	log.Printf("[Executor] Intercom leave requested for '%s'\n", req.NodeID)
+	if !e.IntercomEngine.Leave(req.NodeID) {
+		e.publishError(req.NodeID, "no active intercom call for node")
 	}
+}
+
+// executeIntercomStop ends the whole intercom call that node_id is in.
+func (e *Executor) executeIntercomStop(req Request) {
 	log.Printf("[Executor] Intercom stop requested for '%s'\n", req.NodeID)
 	if !e.IntercomEngine.Stop(req.NodeID) {
 		e.publishError(req.NodeID, "no active intercom call for node")
@@ -367,10 +360,6 @@ func (e *Executor) AskConfig(req Request) ask.Config {
 	return cfg
 }
 
-// maxIntercomNodes bounds the participants of one intercom call; each one costs
-// a mixer input/output pair and a playback goroutine.
-const maxIntercomNodes = 16
-
 func (r Request) Validate() error {
 	if len(r.Text) > ai.MaxTextBytes {
 		return fmt.Errorf("text exceeds %d bytes", ai.MaxTextBytes)
@@ -400,23 +389,23 @@ func (r Request) Validate() error {
 	case "ask":
 		return r.AskConfig().Validate()
 	case "intercom":
-		if len(r.NodeIDs) > maxIntercomNodes {
-			return fmt.Errorf("intercom supports at most %d nodes", maxIntercomNodes)
+		if len(r.NodeIDs) < 2 {
+			return fmt.Errorf("intercom requires at least two node_ids")
+		}
+		if len(r.NodeIDs) > intercom.MaxParticipants {
+			return fmt.Errorf("intercom supports at most %d participants", intercom.MaxParticipants)
 		}
 		for _, id := range r.NodeIDs {
-			if len(id) > 256 {
-				return fmt.Errorf("request identifier or path is too long")
+			if id == "" || len(id) > 256 {
+				return fmt.Errorf("intercom node_ids must be non-empty identifiers")
 			}
-		}
-		if len(r.PeerNodeID) > 256 {
-			return fmt.Errorf("request identifier or path is too long")
 		}
 		if r.DurationSeconds < 0 {
 			return fmt.Errorf("duration_seconds must not be negative")
 		}
-	case "intercom_stop":
+	case "intercom_leave", "intercom_stop":
 		if r.NodeID == "" {
-			return fmt.Errorf("intercom_stop requires node_id")
+			return fmt.Errorf("%s requires node_id", r.Action)
 		}
 	default:
 		return fmt.Errorf("unknown action: %s", r.Action)
