@@ -88,8 +88,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/reload-speakers", s.control(s.handleReloadSpeakers))
 	mux.HandleFunc("/api/events", s.handleEvents)
 
-	// Intercom page: the browser plays the node from go2rtc and streams its
-	// microphone to gocalis, which puts it on the node's one output path.
+	// Intercom page: the browser joins the call of a node. It plays the node
+	// from go2rtc and exchanges the rest of the call's audio with gocalis.
 	mux.HandleFunc("/intercom", s.handleIntercomPage)
 	mux.HandleFunc("/api/intercom/config", s.withCORS(httpsec.RequireToken(s.authToken, s.handleIntercomConfig)))
 	mux.HandleFunc("/api/intercom/ws", s.handleIntercomWS)
