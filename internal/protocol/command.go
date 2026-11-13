@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 	"gocalis/internal/intercom"
+	"gocalis/internal/plugin"
 	"gocalis/internal/taskgroup"
 )
 
@@ -28,6 +30,8 @@ type Executor struct {
 	Publisher      EventPublisher
 	AskEngine      *ask.Engine
 	IntercomEngine *intercom.Engine
+	// Plugins is set by StartPlugins; nil when no plugin is configured.
+	Plugins *plugin.Manager
 
 	// AudioBaseDir constrains where transport-supplied audio_file paths may point.
 	// It defaults to the process working directory. Requests referencing paths
@@ -62,6 +66,34 @@ func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, sp
 		})
 	}, intercom.NewSpeexEchoCanceller)
 	return e
+}
+
+// StartPlugins builds the configured plugins and runs them until ctx ends. They
+// work with this executor's intercom engine and report on its event bus.
+func (e *Executor) StartPlugins(ctx context.Context, cfgs []config.PluginConfig) error {
+	if len(cfgs) == 0 {
+		return nil
+	}
+	manager, err := plugin.Start(ctx, cfgs, plugin.Services{
+		Intercom: e.IntercomEngine,
+		HasNode:  func(nodeID string) bool { return e.Brain.GetNodeHandle(nodeID) != nil },
+		Publish: func(pluginID string, ev plugin.Event) {
+			e.Publisher.Publish(Response{
+				Event:   ev.Name,
+				Plugin:  pluginID,
+				NodeID:  ev.NodeID,
+				Status:  ev.Status,
+				Reason:  ev.Reason,
+				Message: ev.Message,
+				Data:    ev.Data,
+			})
+		},
+	})
+	if err != nil {
+		return err
+	}
+	e.Plugins = manager
+	return nil
 }
 
 // resolveAudioFile validates a transport-supplied audio file path and returns a
@@ -122,6 +154,8 @@ func (e *Executor) Execute(ctx context.Context, req Request) {
 		e.executeIntercomLeave(req)
 	case "intercom_stop":
 		e.executeIntercomStop(req)
+	case "plugin":
+		e.executePlugin(ctx, req)
 	default:
 		e.publishError(req.NodeID, fmt.Sprintf("unknown action: %s", req.Action))
 	}
@@ -313,6 +347,27 @@ func (e *Executor) executeIntercomStop(req Request) {
 	}
 }
 
+// executePlugin hands the command to the plugin. The plugin reports what comes
+// of it with its own events; a command it refuses is answered with an "error"
+// event that carries the plugin's id.
+func (e *Executor) executePlugin(ctx context.Context, req Request) {
+	log.Printf("[Executor] Plugin '%s' command '%s' (node: %s)\n", req.Plugin, req.Command, req.NodeID)
+	err := fmt.Errorf("no plugin '%s'", req.Plugin)
+	if e.Plugins != nil {
+		err = e.Plugins.Command(ctx, req.Plugin, plugin.Command{Name: req.Command, NodeID: req.NodeID, Args: req.Args})
+	}
+	if err != nil {
+		log.Printf("[Executor] Plugin '%s' refused '%s': %v\n", req.Plugin, req.Command, err)
+		e.Publisher.Publish(Response{
+			Event:   "error",
+			Plugin:  req.Plugin,
+			NodeID:  req.NodeID,
+			Status:  "error",
+			Message: err.Error(),
+		})
+	}
+}
+
 func (e *Executor) publishError(nodeID string, message string) {
 	log.Printf("[Executor] Error (node: %s): %s\n", nodeID, message)
 	e.Publisher.Publish(Response{
@@ -427,6 +482,19 @@ func (r Request) Validate() error {
 	case "intercom_leave", "intercom_stop":
 		if r.NodeID == "" {
 			return fmt.Errorf("%s requires node_id", r.Action)
+		}
+	case "plugin":
+		if r.Plugin == "" || r.Command == "" {
+			return fmt.Errorf("plugin requires plugin and command")
+		}
+		if len(r.Plugin) > 64 || len(r.Command) > 64 {
+			return fmt.Errorf("plugin or command name is too long")
+		}
+		if len(r.Args) > 64<<10 {
+			return fmt.Errorf("args exceed 64 KiB")
+		}
+		if args := bytes.TrimSpace(r.Args); len(args) > 0 && args[0] != '{' {
+			return fmt.Errorf("args must be a JSON object")
 		}
 	default:
 		return fmt.Errorf("unknown action: %s", r.Action)

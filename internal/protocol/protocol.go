@@ -2,11 +2,14 @@
 // abstraction used by all transport adapters (WebSocket, MQTT, etc.).
 package protocol
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+)
 
 // Request defines the structure of incoming commands from any transport.
 type Request struct {
-	Action    string `json:"action"` // "tts", "asr", "speaker_id", "ask", "play", "intercom", "intercom_leave", "intercom_stop"
+	Action    string `json:"action"` // "tts", "asr", "speaker_id", "ask", "play", "intercom", "intercom_leave", "intercom_stop", "plugin"
 	NodeID    string `json:"node_id"`
 	Text      string `json:"text,omitempty"`       // For TTS
 	AudioFile string `json:"audio_file,omitempty"` // For ASR and Speaker ID
@@ -45,6 +48,14 @@ type Request struct {
 	// is in.
 	NodeIDs         []string `json:"node_ids,omitempty"`
 	DurationSeconds float64  `json:"duration_seconds,omitempty"`
+
+	// Plugin fields. action == "plugin" sends Command to the plugin whose id
+	// (from the configuration) is Plugin. NodeID is the node the command is
+	// about, when it is about one; Args is a JSON object with the command's
+	// own parameters. The commands and their args belong to each plugin type.
+	Plugin  string          `json:"plugin,omitempty"`
+	Command string          `json:"command,omitempty"`
+	Args    json.RawMessage `json:"args,omitempty"`
 }
 
 // Response defines the structure of outgoing events and command responses.
@@ -85,6 +96,12 @@ type Response struct {
 	Reason           string   `json:"reason,omitempty"`
 	DurationSeconds  float64  `json:"duration_seconds,omitempty"`
 	RemainingSeconds float64  `json:"remaining_seconds,omitempty"`
+
+	// Plugin is the id of the plugin an event comes from: one of its own
+	// events, whose name and Data belong to the plugin type, or the "error"
+	// that answers a command it refused.
+	Plugin string         `json:"plugin,omitempty"`
+	Data   map[string]any `json:"data,omitempty"`
 }
 
 // EventPublisher is the common interface for broadcasting events to transports.

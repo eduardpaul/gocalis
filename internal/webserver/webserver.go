@@ -23,6 +23,7 @@ import (
 	"gocalis/internal/audio"
 	"gocalis/internal/brain"
 	"gocalis/internal/httpsec"
+	"gocalis/internal/plugin"
 	"gocalis/internal/protocol"
 	"gocalis/internal/taskgroup"
 	"gocalis/internal/wshub"
@@ -87,6 +88,7 @@ func (s *Server) Start() error {
 	// without embedding credentials; control endpoints require the auth token.
 	mux.HandleFunc("/api/status", s.withCORS(s.handleStatus))
 	mux.HandleFunc("/api/nodes", s.withCORS(s.handleNodes))
+	mux.HandleFunc("/api/plugins", s.withCORS(httpsec.RequireToken(s.authToken, s.handlePlugins)))
 	mux.HandleFunc("/api/execute", s.withCORS(httpsec.RequireToken(s.authToken, s.handleExecute)))
 	mux.HandleFunc("/api/synthesize", s.control(s.handleSynthesize))
 	mux.HandleFunc("/api/ask", s.control(s.handleAsk))
@@ -192,6 +194,20 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, s.brain.ListNodes())
+}
+
+// handlePlugins lists the configured plugins and whether each can take
+// commands right now.
+func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	plugins := []plugin.Info{}
+	if s.executor != nil && s.executor.Plugins != nil {
+		plugins = s.executor.Plugins.List()
+	}
+	s.writeJSON(w, plugins)
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {

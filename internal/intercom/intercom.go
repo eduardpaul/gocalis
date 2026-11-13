@@ -31,7 +31,7 @@ import (
 	"gocalis/internal/config"
 )
 
-// MaxParticipants bounds one call (nodes plus pages); each participant costs a
+// MaxParticipants bounds one call (nodes plus remotes); each participant costs a
 // mixer input/output pair and a playback goroutine.
 const MaxParticipants = 16
 
@@ -64,8 +64,9 @@ type EchoCanceller interface {
 // RemoteSampleRate is the PCM16 rate of a Remote's audio, in both directions.
 const RemoteSampleRate = bridgeRate
 
-// Remote is a participant outside gocalis: an intercom web page. Its transport
-// pushes the page's microphone with Push and sends the page what Read returns.
+// Remote is a participant outside gocalis: an intercom web page, or a call a
+// plugin brings in (a Telegram voice chat). Its transport pushes the far side's
+// microphone with Push and sends the far side what Read returns.
 type Remote struct {
 	ID string
 
@@ -99,7 +100,7 @@ type Event struct {
 	Event            string   // "intercom_started" | "intercom_joined" | "intercom_left" | "intercom_ended"
 	ParticipantID    string   // who joined or left (a node id or a remote id)
 	NodeIDs          []string // nodes in the call after the event, in join order
-	RemoteIDs        []string // pages in the call after the event, in join order
+	RemoteIDs        []string // remotes in the call after the event, in join order
 	Status           string   // "success" | "error"
 	Reason           string   // on "intercom_ended": "timeout" | "stopped" | "left" | "shutdown" | "error"
 	Message          string   // error detail, when Status == "error"
@@ -262,14 +263,15 @@ func (e *Engine) Connect(nodes []string, duration time.Duration) error {
 	return nil
 }
 
-// NewRemote creates a remote participant (an intercom page) with an id unique
-// within this engine, ready to be passed to ConnectRemote. notify, when not nil,
-// receives every event of the call the remote is in, in order; it must not
-// block.
-func (e *Engine) NewRemote(notify func(Event)) *Remote {
+// NewRemote creates a remote participant, ready to be passed to ConnectRemote.
+// kind says what it is ("web" for an intercom page, a plugin's name for a call
+// it brings in) and starts its id, which is unique within this engine. notify,
+// when not nil, receives every event of the call the remote is in, in order; it
+// must not block.
+func (e *Engine) NewRemote(kind string, notify func(Event)) *Remote {
 	e.mu.Lock()
 	e.remoteSeq++
-	id := fmt.Sprintf("web-%d", e.remoteSeq)
+	id := fmt.Sprintf("%s-%d", kind, e.remoteSeq)
 	e.mu.Unlock()
 	mic := newBridgeBuffer(bridgeRate, bridgeRate*remoteMaxMs/1000)
 	mic.prime = bridgeRate * remotePrimeMs / 1000
@@ -282,7 +284,7 @@ func (e *Engine) NewRemote(notify func(Event)) *Remote {
 	}
 }
 
-// ConnectRemote puts the page in a call with the node: it joins the call the
+// ConnectRemote puts the remote in a call with the node: it joins the call the
 // node is in ("intercom_joined"), or starts one with it ("intercom_started").
 // playsNode tells that the page plays that node by itself (from its go2rtc
 // viewer), so gocalis sends it the rest of the call only. duration is as in

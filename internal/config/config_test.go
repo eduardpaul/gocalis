@@ -114,3 +114,61 @@ func TestICEConfigurationPresence(t *testing.T) {
 		}
 	}
 }
+
+func TestPluginsAreListedWithTheirOwnSettings(t *testing.T) {
+	cfg, err := loadText(t, minimalConfig+`plugins:
+  - id: door
+    type: example
+    settings:
+      greeting: hola
+      times: 2
+  - id: bare
+    type: example
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Plugins) != 2 || cfg.Plugins[0].ID != "door" || cfg.Plugins[0].Type != "example" {
+		t.Fatalf("unexpected plugins: %+v", cfg.Plugins)
+	}
+
+	type settings struct {
+		Greeting string `yaml:"greeting"`
+		Times    int    `yaml:"times"`
+	}
+	var got settings
+	if err := cfg.Plugins[0].DecodeSettings(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Greeting != "hola" || got.Times != 2 {
+		t.Fatalf("unexpected settings: %+v", got)
+	}
+
+	// A key the plugin does not know is refused, like anywhere else in the file.
+	var narrow struct {
+		Greeting string `yaml:"greeting"`
+	}
+	if err := cfg.Plugins[0].DecodeSettings(&narrow); err == nil || !strings.Contains(err.Error(), "times") {
+		t.Fatalf("expected the unknown key to be refused, got %v", err)
+	}
+
+	// No settings leaves the defaults alone.
+	untouched := settings{Greeting: "default"}
+	if err := cfg.Plugins[1].DecodeSettings(&untouched); err != nil || untouched.Greeting != "default" {
+		t.Fatalf("expected defaults to stay, got %+v, %v", untouched, err)
+	}
+}
+
+func TestRejectInvalidPlugins(t *testing.T) {
+	for name, plugins := range map[string]string{
+		"no id":         "plugins:\n  - type: example\n",
+		"no type":       "plugins:\n  - id: door\n",
+		"id twice":      "plugins:\n  - id: door\n    type: example\n  - id: door\n    type: example\n",
+		"id with slash": "plugins:\n  - id: a/b\n    type: example\n",
+		"unknown key":   "plugins:\n  - id: door\n    type: example\n    colour: red\n",
+	} {
+		if _, err := loadText(t, minimalConfig+plugins); err == nil {
+			t.Errorf("%s: expected the configuration to be refused", name)
+		}
+	}
+}

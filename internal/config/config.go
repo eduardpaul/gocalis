@@ -20,7 +20,36 @@ type Config struct {
 	MQTT             MQTTConfig     `yaml:"mqtt"`
 	Security         SecurityConfig `yaml:"security"`
 	Intercom         IntercomConfig `yaml:"intercom"`
+	Plugins          []PluginConfig `yaml:"plugins"`
 	Nodes            []NodeConfig   `yaml:"nodes"`
+}
+
+// PluginConfig switches one plugin on. ID is how API requests address it; Type
+// selects the plugin code compiled into this build; Settings belong to that
+// type, which reads them with DecodeSettings.
+type PluginConfig struct {
+	ID       string    `yaml:"id"`
+	Type     string    `yaml:"type"`
+	Settings yaml.Node `yaml:"settings"`
+}
+
+// DecodeSettings reads the plugin's settings into its own struct. Like the
+// rest of the configuration, a key the struct does not have is an error.
+// Without settings the struct is left as it is.
+func (p PluginConfig) DecodeSettings(into any) error {
+	if p.Settings.Kind == 0 {
+		return nil
+	}
+	raw, err := yaml.Marshal(&p.Settings)
+	if err != nil {
+		return err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(into); err != nil {
+		return fmt.Errorf("settings: %w", err)
+	}
+	return nil
 }
 
 // IntercomConfig holds settings for intercom calls: conferences that nodes and
@@ -464,6 +493,20 @@ func (c *Config) normalizeAndValidate() error {
 			if len(text) > 4000 {
 				return fmt.Errorf("node %s: wake response exceeds 4000 bytes", n.NodeID)
 			}
+		}
+	}
+	pluginIDs := make(map[string]bool)
+	for i := range c.Plugins {
+		p := &c.Plugins[i]
+		if p.ID == "" || len(p.ID) > 64 || strings.ContainsAny(p.ID, " \t/#+") {
+			return fmt.Errorf("plugin %d: id is required, without spaces or any of / # +", i)
+		}
+		if pluginIDs[p.ID] {
+			return fmt.Errorf("plugin %s: id is used twice", p.ID)
+		}
+		pluginIDs[p.ID] = true
+		if p.Type == "" {
+			return fmt.Errorf("plugin %s: type is required", p.ID)
 		}
 	}
 	return nil

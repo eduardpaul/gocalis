@@ -21,6 +21,7 @@ import (
 	"gocalis/internal/brain"
 	"gocalis/internal/config"
 	"gocalis/internal/mqtt"
+	"gocalis/internal/plugin"
 	"gocalis/internal/protocol"
 	"gocalis/internal/runtime"
 	"gocalis/internal/server"
@@ -44,6 +45,7 @@ func main() {
 	text := flag.String("text", "Prueba de audio del timbre.", "Text for speech playback diagnostic modes")
 	wsAddr := flag.String("ws-addr", ":9090", "WebSocket server listen address")
 	httpAddr := flag.String("http-addr", ":8080", "Dashboard HTTP server listen address")
+	pluginSetup := flag.String("plugin-setup", "", "Run the interactive setup (login) of the plugin with this id, then exit")
 	flag.Parse()
 
 	log.Printf("=== Starting Gocalis Speech Agent Proxy (Mode: %s, Config: %s) ===\n", *channel, *configPath)
@@ -52,6 +54,11 @@ func main() {
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	if *pluginSetup != "" {
+		runPluginSetup(cfg, *pluginSetup)
+		return
 	}
 
 	if err := cfg.ValidateModelFiles(*channel, *nodeID); err != nil {
@@ -205,6 +212,12 @@ func main() {
 		}
 		defer stopWatcher()
 
+		// Plugins work with the intercom engine and the event bus, so they
+		// start once the transports are listening.
+		if err := executor.StartPlugins(ctx, cfg.Plugins); err != nil {
+			log.Fatalf("Failed to start plugins: %v", err)
+		}
+
 		// Spawn a runtime goroutine for each configured physical node. The
 		// WaitGroup lets shutdown wait for every runtime to release its models and
 		// transport before the deferred engine Close() calls free model memory.
@@ -244,6 +257,9 @@ func main() {
 			log.Printf("[WebServer] shutdown: %v", err)
 		}
 		executor.Tasks.Close()
+		if executor.Plugins != nil {
+			executor.Plugins.Wait()
+		}
 		stopWatcher()
 		nodeWG.Wait()
 		if mqttClient != nil {
@@ -257,6 +273,33 @@ func main() {
 	default:
 		log.Fatalf("Unknown channel mode: %s. Supported modes: webrtc, demo, wake-file, asr-file, rtc-record, rtc-say, rtc-loopback", *channel)
 	}
+}
+
+// runPluginSetup runs the one-time step a plugin needs with a person at the
+// terminal (a login) and exits. Nothing else of gocalis is started, so it can
+// run next to a live instance: `docker exec -it gocalis gocalis -config
+// /app/config.yaml -plugin-setup <id>`.
+func runPluginSetup(cfg *config.Config, id string) {
+	for _, pluginCfg := range cfg.Plugins {
+		if pluginCfg.ID != id {
+			continue
+		}
+		p, err := plugin.New(pluginCfg, plugin.Host{})
+		if err != nil {
+			log.Fatalf("plugin-setup: %v", err)
+		}
+		setup, ok := p.(plugin.Setup)
+		if !ok {
+			log.Fatalf("plugin-setup: plugin '%s' (%s) needs no setup", id, pluginCfg.Type)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := setup.Setup(ctx, os.Stdin, os.Stdout); err != nil {
+			log.Fatalf("plugin-setup: %v", err)
+		}
+		return
+	}
+	log.Fatalf("plugin-setup: no plugin '%s' in the configuration", id)
 }
 
 func findNodeConfig(cfg *config.Config, nodeID string) *config.NodeConfig {

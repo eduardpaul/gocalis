@@ -1,7 +1,11 @@
 package protocol
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"gocalis/internal/audionode"
@@ -9,6 +13,7 @@ import (
 	"gocalis/internal/config"
 	"gocalis/internal/intercom"
 	"gocalis/internal/node"
+	"gocalis/internal/plugin"
 )
 
 func TestResolveAudioFile(t *testing.T) {
@@ -72,6 +77,11 @@ func TestValidateIntercomActions(t *testing.T) {
 		{"tts unknown call mode", Request{Action: "tts", NodeID: "a", Text: "hi", CallMode: "everyone"}, true},
 		{"ask in call", Request{Action: "ask", NodeID: "a", CallMode: "node"}, false},
 		{"ask in call for all", Request{Action: "ask", NodeID: "a", CallMode: "all"}, true},
+		{"plugin command", Request{Action: "plugin", Plugin: "tg", Command: "call", NodeID: "a", Args: []byte(`{"ring_seconds":30}`)}, false},
+		{"plugin command without args", Request{Action: "plugin", Plugin: "tg", Command: "hangup"}, false},
+		{"plugin without command", Request{Action: "plugin", Plugin: "tg"}, true},
+		{"plugin without plugin", Request{Action: "plugin", Command: "call"}, true},
+		{"plugin args not an object", Request{Action: "plugin", Plugin: "tg", Command: "call", Args: []byte(`[1]`)}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,4 +120,90 @@ func TestExecutorAskConfigCaptureDelay(t *testing.T) {
 			}
 		})
 	}
+}
+
+// recorder collects what the executor publishes.
+type recorder struct {
+	mu     sync.Mutex
+	events []Response
+}
+
+func (r *recorder) Publish(ev Response) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, ev)
+}
+
+func (r *recorder) last(t *testing.T) Response {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.events) == 0 {
+		t.Fatal("nothing was published")
+	}
+	return r.events[len(r.events)-1]
+}
+
+// knock is a plugin type for the test: "knock" reports on the node it names,
+// if gocalis has it.
+type knock struct{ host plugin.Host }
+
+func init() {
+	plugin.Register("knock", func(_ config.PluginConfig, host plugin.Host) (plugin.Plugin, error) {
+		return &knock{host: host}, nil
+	})
+}
+
+func (k *knock) Run(ctx context.Context) error { <-ctx.Done(); return nil }
+func (k *knock) Status() plugin.Status         { return plugin.Status{Ready: true} }
+func (k *knock) Command(_ context.Context, cmd plugin.Command) error {
+	if cmd.Name != "knock" {
+		return fmt.Errorf("unknown command: %s", cmd.Name)
+	}
+	if !k.host.HasNode(cmd.NodeID) {
+		return fmt.Errorf("node '%s' not registered", cmd.NodeID)
+	}
+	var args struct {
+		Times int `json:"times"`
+	}
+	if err := cmd.Decode(&args); err != nil {
+		return err
+	}
+	k.host.Emit(plugin.Event{Name: "knock_heard", NodeID: cmd.NodeID, Status: "success", Data: map[string]any{"times": args.Times}})
+	return nil
+}
+
+// A "plugin" request reaches the plugin it names; the plugin's events go out
+// marked with its id, and so does the error for a command it refuses.
+func TestExecutorRunsPluginCommands(t *testing.T) {
+	b := brain.New(nil)
+	b.RegisterNode("door", &brain.NodeHandle{Node: node.NewPhysicalNode("door", "rtc_stream"), Audio: &audionode.Stub{}, Config: config.NodeConfig{NodeID: "door"}})
+	out := &recorder{}
+	e := &Executor{Brain: b, Publisher: out}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Without plugins the request is refused.
+	e.Execute(ctx, Request{Action: "plugin", Plugin: "bell", Command: "knock", NodeID: "door"})
+	if ev := out.last(t); ev.Event != "error" || ev.Plugin != "bell" {
+		t.Fatalf("expected an error for the unknown plugin, got %+v", ev)
+	}
+
+	if err := e.StartPlugins(ctx, []config.PluginConfig{{ID: "bell", Type: "knock"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.Execute(ctx, Request{Action: "plugin", Plugin: "bell", Command: "knock", NodeID: "door", Args: []byte(`{"times":2}`)})
+	if ev := out.last(t); ev.Event != "knock_heard" || ev.Plugin != "bell" || ev.NodeID != "door" || ev.Status != "success" || ev.Data["times"] != 2 {
+		t.Fatalf("unexpected plugin event: %+v", ev)
+	}
+
+	e.Execute(ctx, Request{Action: "plugin", Plugin: "bell", Command: "knock", NodeID: "garden"})
+	if ev := out.last(t); ev.Event != "error" || ev.Plugin != "bell" || ev.NodeID != "garden" || !strings.Contains(ev.Message, "not registered") {
+		t.Fatalf("expected the refusal as an error event, got %+v", ev)
+	}
+
+	cancel()
+	e.Plugins.Wait()
 }
