@@ -8,11 +8,13 @@ import (
 	"gocalis/internal/audionode"
 )
 
-// bridge is a live PCM16 audio conduit between two intercom nodes. One node's
-// mic pushes samples in; the peer node's StreamOut pulls them out via the
-// audionode.PCM16Source interface. It is a drop-oldest buffer: if the consumer
-// falls behind the producer, the oldest samples are discarded so end-to-end
-// latency stays bounded instead of growing without limit.
+// bridge is a live PCM16 audio conduit of an intercom call: a participant's
+// microphone on its way into the mix, or a participant's mix on its way out. A
+// producer pushes samples in; a consumer pulls them out, either as a blocking
+// audionode.PCM16Source (a node's StreamOut, a page's socket) or one fixed frame
+// at a time (the mixer). It is a drop-oldest buffer: if the consumer falls
+// behind the producer, the oldest samples are discarded so end-to-end latency
+// stays bounded instead of growing without limit.
 type bridge struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -96,7 +98,7 @@ func (b *bridge) ReadPCM16(ctx context.Context, chunkSize int) ([]int16, error) 
 	return out, nil
 }
 
-// close wakes any blocked reader so PlayStream unwinds and returns io.EOF.
+// close ends the stream: a reader gets what is still buffered, then io.EOF.
 func (b *bridge) close() {
 	b.mu.Lock()
 	b.closed = true

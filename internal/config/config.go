@@ -23,26 +23,27 @@ type Config struct {
 	Nodes            []NodeConfig   `yaml:"nodes"`
 }
 
-// IntercomConfig holds settings for intercom calls: between nodes, and from the
-// intercom web page (/intercom) to a node.
+// IntercomConfig holds settings for intercom calls: conferences that nodes and
+// intercom web pages (/intercom) join and leave.
 type IntercomConfig struct {
-	// DefaultTimeoutSeconds is the default automatic end time for an intercom
-	// call when the request does not override it. A call always ends by this
-	// deadline unless stopped earlier. Defaults to 60s when unset (<=0).
+	// DefaultTimeoutSeconds is how long a call lasts after the last join when
+	// the request does not say. A call always ends by its deadline unless it
+	// ends earlier. Defaults to 60s when unset (<=0).
 	DefaultTimeoutSeconds float64 `yaml:"default_timeout_seconds"`
 
 	// EchoCancellation controls the software acoustic echo canceller applied to
-	// each node's mic before it is forwarded to the peer, so a device without
-	// hardware echo cancellation does not feed its own speaker output (the peer's
-	// voice) back into the call.
+	// each node's mic before it is mixed into the call, so a device without
+	// hardware echo cancellation does not feed its own speaker output (the
+	// others' voices) back into the call.
 	EchoCancellation IntercomAECConfig `yaml:"echo_cancellation"`
 
 	// Viewers maps a node id to the go2rtc page the intercom web page embeds to
 	// show and play that node's camera and microphone, e.g.
 	// "https://go2rtc.example/stream.html?src=doorbell_tv&mode=webrtc". The page
 	// is a plain go2rtc viewer (go2rtc fans the stream out); gocalis does not
-	// relay the doorbell's audio or video. It must be reachable from the
-	// browser (over HTTPS when the intercom page is). Optional.
+	// relay that node's audio or video to the page, only the rest of the call.
+	// It must be reachable from the browser (over HTTPS when the intercom page
+	// is). Optional: a node without a viewer is heard through gocalis.
 	Viewers map[string]string `yaml:"viewers"`
 }
 

@@ -273,19 +273,42 @@ Shutdown cancels commands, closes event connections, joins command/wake/capture/
 
 ### Intercom
 
-An intercom call carries live voice through Gocalis's nodes. It is started either
-between nodes (`{"action": "intercom", "node_ids": ["living_room", "front_door"], "duration_seconds": 120}`,
-ended with `{"action": "intercom_stop", "node_id": "front_door"}`; events
-`intercom_started` / `intercom_ended`) or from the intercom page.
+An intercom call is a conference carried through Gocalis's nodes: participants
+join and leave it while it runs, and each one hears all the others. A
+participant is a node, or an intercom page (a browser). A bell chime tells the
+call that someone joined (rising) or left (falling), and that the call is over.
+
+| Request | Effect |
+| --- | --- |
+| `{"action": "intercom", "node_ids": ["living_room", "front_door"], "duration_seconds": 120}` | Puts the nodes in a call together. When none is in a call, a new one starts; when some already are in one, the others join it. |
+| `{"action": "intercom_leave", "node_id": "living_room"}` | Takes one node out of its call. The call goes on for the others. |
+| `{"action": "intercom_stop", "node_id": "front_door"}` | Ends the whole call the node is in. |
+
+A call ends when fewer than two participants remain (`reason: "left"`), on its
+deadline (`"timeout"`), or when it is stopped (`"stopped"`). The deadline is
+`duration_seconds` (default `intercom.default_timeout_seconds`) after the last
+join: every join pushes it back.
+
+Events: `intercom_started`, `intercom_joined`, `intercom_left` and
+`intercom_ended`. All carry `node_ids` and `remote_ids` (intercom pages, e.g.
+`web-1`): who is in the call after the event. Joined and left add
+`participant_id` (who), ended adds `reason` and `duration_seconds`, the others
+`remaining_seconds`. A node whose playback fails is dropped from the call
+(`intercom_left` with `status: "error"`); the call ends in error only if that
+leaves a single participant.
 
 **Intercom page.** `GET /intercom` serves a standalone page meant to sit behind
 a signing-in reverse proxy (it asks for the API token like the dashboard, or
-takes `?token=`; `?node=front_door` preselects the node). It shows and plays the
-doorbell through a plain go2rtc viewer in an iframe (`intercom.viewers`, e.g.
-`stream.html?src=doorbell_tv&mode=webrtc`): go2rtc fans the stream out and
-Gocalis relays no audio or video to the browser. The browser microphone goes
-only to Gocalis, over `GET /api/intercom/ws?node_id=...` (16 kHz mono PCM16
-binary frames; JSON status messages back).
+takes `?token=`; `?node=front_door` preselects the node). "Hablar" joins the
+call the node is in, or starts one with it, so several browsers can talk to the
+doorbell, and to each other, at once; "Colgar" leaves, and the call goes on for
+the others. The page shows and plays the node through a plain go2rtc viewer in
+an iframe (`intercom.viewers`, e.g. `stream.html?src=doorbell_tv&mode=webrtc`):
+go2rtc fans that stream out and Gocalis does not relay it. Everything else
+travels over `GET /api/intercom/ws?node_id=...`: the browser microphone goes up
+as 16 kHz mono PCM16 binary frames, and the rest of the call (the other pages
+and nodes, the chimes) comes down in the same format, next to the call's events
+as JSON. A node without a viewer is heard through that same downlink.
 
 **One source of doorbell audio.** Every call plays through the node's normal
 output: for the doorbell, the single WHIP producer on `talkback_in` and the one
@@ -297,17 +320,17 @@ longer lists it.
 
 **Priority.** A call takes its nodes over: the TTS, play or ask in progress is
 cut off (an ask ends with status `error`, `"interrupted by an intercom call"`,
-without running ASR). While the call lasts, every TTS/play/ask for those nodes,
+without running ASR). Until the node leaves the call, every TTS/play/ask for it,
 including `gocalis-say` and the HTTP API, fails at once with
 `"node is in an intercom call"` rather than being queued (a stale reply played
-after the call would be worse). A broadcast to `all` skips them. One call per
-node: a second page or call for a busy node is refused.
+after the call would be worse). A broadcast to `all` skips it. A node is in one
+call at a time.
 
 **No self-hearing.** While a node is in a call its microphone reaches only the
-intercom bridge (and only when another node listens; for a page call nobody in
-Gocalis does), never wake word detection, VAD, ASR or the assistant. That holds
-for the node's `auto_ask_capture_delay_seconds` after the call too, while the
-device plays out its buffered tail.
+call's mix, never wake word detection, VAD, ASR or the assistant, and the mix a
+participant gets leaves its own microphone out. That holds for the node's
+`auto_ask_capture_delay_seconds` after the call too, while the device plays out
+its buffered tail.
 
 ### Local multi-device audio simulator
 

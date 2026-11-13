@@ -10,7 +10,7 @@ const TABS = [
   { id: 'say', label: 'Say', hint: 'Speak text on a node' },
   { id: 'tts', label: 'TTS', hint: 'Render text to a WAV file (no playback)' },
   { id: 'ask', label: 'Ask', hint: 'Speak a prompt, listen, and transcribe the reply' },
-  { id: 'intercom', label: 'Intercom', hint: 'Bridge two nodes into a live two-way call' },
+  { id: 'intercom', label: 'Intercom', hint: 'Put nodes in a live call together' },
   { id: 'asr', label: 'ASR', hint: 'Transcribe an audio file' },
   { id: 'speaker_id', label: 'Speaker ID', hint: 'Identify the speaker in an audio file' },
 ]
@@ -38,7 +38,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
   const activeMeta = TABS.find((t) => t.id === activeTab)
 
   // selectTab switches tabs, seeding the intercom participant set with the first
-  // two available nodes (a call needs at least two).
+  // two available nodes (connecting takes at least two).
   const selectTab = (id) => {
     if (id === 'intercom' && intercomNodes.length < 2) {
       setIntercomNodes(singleNodeOptions.slice(0, 2).map((o) => o.value))
@@ -75,7 +75,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
         })
       } else if (activeTab === 'intercom') {
         if (intercomNodes.length < 2) {
-          throw new Error('Select at least two nodes to bridge')
+          throw new Error('Select at least two nodes to connect')
         }
         result = await onExecute('intercom', {
           node_ids: intercomNodes,
@@ -109,18 +109,19 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     }
   }
 
-  // handleIntercomStop ends the active call that the selected nodes participate
-  // in (stopping any one participant ends the whole call).
-  const handleIntercomStop = async () => {
+  // handleIntercomExit takes the first selected node out of its call
+  // ('intercom_leave': the call goes on for the others) or ends that call for
+  // everyone ('intercom_stop').
+  const handleIntercomExit = async (action) => {
     const a = intercomNodes[0]
     if (!a) {
-      setLastResult({ status: 'error', error_message: 'Select a participating node to stop' })
+      setLastResult({ status: 'error', error_message: 'Select a node that is in the call' })
       return
     }
     setLoading(true)
     setLastResult(null)
     try {
-      const result = await onExecute('intercom_stop', { node_id: a })
+      const result = await onExecute(action, { node_id: a })
       setLastResult(result)
     } catch (err) {
       setLastResult({ status: 'error', error_message: err.message })
@@ -245,7 +246,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
         {activeTab === 'intercom' && (
           <>
             <label>
-              Participants <span className="hint">(select two or more nodes to bridge)</span>
+              Participants <span className="hint">(select two or more nodes to connect)</span>
               <div className="intercom-participants">
                 {singleNodeOptions.length === 0 && <span className="hint">No nodes available</span>}
                 {singleNodeOptions.map((opt) => (
@@ -261,7 +262,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
               </div>
             </label>
             <label>
-              Auto-end after (seconds) <span className="hint">(0 = server default)</span>
+              Lasts at least (seconds) <span className="hint">(from now; 0 = server default)</span>
               <input
                 type="number"
                 value={intercomDuration}
@@ -271,10 +272,12 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
               />
             </label>
             <p className="hint">
-              While a call is live it is the only audio on its participants: whatever they were
-              saying is cut off, and any Say/Ask targeting them fails until the call ends. Each node
-              hears all the others (mix-minus). The call auto-ends after the timeout, or use Stop
-              below. To talk to the doorbell from a phone, use the intercom page (/intercom).
+              Connecting starts a call, or brings the selected nodes into the call one of them is
+              already in. While a node is in a call, the call is its only audio: whatever it was
+              saying is cut off, and any Say/Ask targeting it fails until it leaves. Each
+              participant hears all the others, and a chime marks every join and leave. Leave takes
+              the first selected node out of its call; Stop ends that call for everyone. To join a
+              call from a browser or a phone, use the intercom page (/intercom).
             </p>
           </>
         )}
@@ -322,12 +325,17 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
 
         <div className="command-actions">
           <button type="submit" className="btn" disabled={loading}>
-            {loading ? 'Sending...' : activeTab === 'intercom' ? 'Start Intercom' : `Run ${activeMeta?.label ?? activeTab}`}
+            {loading ? 'Sending...' : activeTab === 'intercom' ? 'Connect' : `Run ${activeMeta?.label ?? activeTab}`}
           </button>
           {activeTab === 'intercom' ? (
-            <button type="button" className="btn btn-secondary" onClick={handleIntercomStop} disabled={loading}>
-              Stop Intercom
-            </button>
+            <>
+              <button type="button" className="btn btn-secondary" onClick={() => handleIntercomExit('intercom_leave')} disabled={loading}>
+                Leave
+              </button>
+              <button type="button" className="btn btn-secondary" onClick={() => handleIntercomExit('intercom_stop')} disabled={loading}>
+                Stop
+              </button>
+            </>
           ) : (
             <button type="button" className="btn btn-secondary" onClick={handleReload} disabled={loading}>
               Reload Speakers

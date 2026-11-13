@@ -10,8 +10,8 @@
             duration: { value: 0, validate: RED.validators.number() }
         },
         inputs: 1,
-        outputs: 2,
-        outputLabels: ["started / stopping", "call ended"],
+        outputs: 3,
+        outputLabels: ["request sent", "someone joined / left", "call ended"],
         icon: "font-awesome/fa-phone",
         label: function() {
             return this.name || "Gocalis Intercom";
@@ -48,52 +48,60 @@
 </script>
 
 <script type="text/html" data-help-name="gocalis-intercom">
-    <p>Opens a live two-way (or N-way) audio intercom bridge between two or more
-    Gocalis nodes. A call takes every participant over: a <b>say</b>/<b>play</b>
-    or <b>ask</b> already running on it is cut off (an ask ends with
-    <code>"interrupted by an intercom call"</code>), and while the call lasts any
-    <b>say</b>/<b>ask</b>/<b>play</b> targeting a participant fails at once with
+    <p>Runs live intercom calls between Gocalis nodes. A call is a conference:
+    nodes (and intercom pages) join and leave it while it runs, each one hears
+    all the others, and a chime tells the call that someone joined or left. It
+    ends when fewer than two participants remain, on its time limit, or when it
+    is stopped.</p>
+    <p>A node in a call is taken over: a <b>say</b>/<b>play</b> or <b>ask</b>
+    already running on it is cut off (an ask ends with
+    <code>"interrupted by an intercom call"</code>), and until it leaves the call
+    any <b>say</b>/<b>ask</b>/<b>play</b> targeting it fails at once with
     <code>"node is in an intercom call"</code> (it is not queued). A broadcast to
-    <code>all</code> skips nodes in a call. Wake word detection is off on the
-    participants for the whole call.</p>
-    <p>The intercom web page (<code>/intercom</code> on the Gocalis dashboard)
-    opens calls of its own to a single node; this node reports them too (output
-    2, with <code>remote_ids</code>) and can end them with a stop.</p>
+    <code>all</code> skips nodes in a call.</p>
 
-    <h3>Starting a call</h3>
-    <p>Send any message to start a call between the configured
-    <b>Participants</b>. The participant list can be overridden per-message.</p>
+    <h3>Connecting</h3>
+    <p>Send any message to put the <b>Participants</b> in a call together. When
+    none of them is in a call, a new one starts. When some already are in one,
+    the others join it (naming a node that is in a call is how you add nodes to
+    that call). Nodes of two different calls cannot be connected.</p>
     <dl class="message-properties">
         <dt class="optional">node_ids <span class="property-type">array | string</span></dt>
-        <dd>Participants for this call (two or more). Overrides the configured
-        list. A comma-separated string (<code>"kitchen, bedroom"</code>) is also
+        <dd>Participants (two or more). Overrides the configured list. A
+        comma-separated string (<code>"kitchen, bedroom"</code>) is also
         accepted.</dd>
-        <dt class="optional">node_id + peer_node_id <span class="property-type">string</span></dt>
-        <dd>Convenience form for a two-node call.</dd>
         <dt class="optional">duration_seconds <span class="property-type">number</span></dt>
-        <dd>Overrides the call timeout for this call. <code>0</code> uses the
-        server default (<code>intercom.default_timeout_seconds</code>).</dd>
+        <dd>How long the call lasts from now at least; every join pushes the
+        limit back. <code>0</code> uses the server default
+        (<code>intercom.default_timeout_seconds</code>).</dd>
     </dl>
 
-    <h3>Stopping a call</h3>
-    <p>Send a message with <code>msg.payload = "stop"</code> (or
-    <code>msg.action = "intercom_stop"</code>, or <code>msg.stop = true</code>) to
-    end the call. Set <code>msg.node_id</code> to any participant of the call to
-    end; otherwise the first configured participant is used.</p>
+    <h3>Leaving and stopping</h3>
+    <p>Send <code>msg.payload = "leave"</code> (or <code>msg.action =
+    "leave"</code>) to take one node out of its call: the call goes on for the
+    others, unless fewer than two remain. Send <code>"stop"</code> to end the
+    whole call for everyone. Both act on <code>msg.node_id</code>, or on the
+    first configured participant when it is not set.</p>
 
     <h3>Outputs</h3>
     <ol class="node-ports">
-        <li>Started / stopping — emits once the call is accepted by the engine (or
-        when a stop has been sent). <code>msg.payload</code> carries the engine
-        response.</li>
-        <li>Call ended — emits when the call ends for any reason.
-        <code>msg.payload.reason</code> is one of <code>timeout</code>,
-        <code>stopped</code>, <code>shutdown</code>, or <code>error</code>, and
-        <code>msg.payload.duration_seconds</code> is the call length;
+        <li>Request sent: emits once the engine has the nodes in a call
+        (<code>msg.payload</code> is the <code>intercom_started</code> or
+        <code>intercom_joined</code> event, <code>msg.node_ids</code> who is in
+        the call), or when a leave or stop has been sent.</li>
+        <li>Someone joined / left: emits for every <code>intercom_joined</code>
+        and <code>intercom_left</code> of a matching call.
+        <code>msg.event</code> tells which, <code>msg.participant_id</code> who,
+        and <code>msg.node_ids</code> / <code>msg.remote_ids</code> who is in the
+        call now (<code>remote_ids</code> are intercom pages).</li>
+        <li>Call ended: emits when a matching call ends for any reason.
+        <code>msg.reason</code> is one of <code>timeout</code>,
+        <code>stopped</code>, <code>left</code> (the others left),
+        <code>shutdown</code>, or <code>error</code>;
+        <code>msg.duration_seconds</code> is how long it lasted and
         <code>msg.payload.status</code> is <code>success</code> or
-        <code>error</code> (with <code>msg.payload.message</code>), and
-        <code>msg.payload.remote_ids</code> lists intercom page microphones that
-        took part. This fires for matching calls even when they were started or
-        stopped elsewhere (web UI, intercom page, timeout, another flow).</li>
+        <code>error</code> (with <code>msg.payload.message</code>).</li>
     </ol>
+    <p>Outputs 2 and 3 also fire for matching calls that were started or changed
+    elsewhere (the intercom page, the dashboard, a timeout, another flow).</p>
 </script>

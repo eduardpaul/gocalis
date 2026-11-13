@@ -12,8 +12,8 @@ import (
 // SetRawAudioTap installs a continuous-microphone sink for a node. While set,
 // every mic chunk delivered to ForwardRawAudio for that node is handed to fn
 // (raw float32, model rate, NOT VAD-gated). The intercom engine uses this to
-// stream one node's live mic to the peer node's speaker. Installing a tap does
-// not affect the wake/VAD/session paths.
+// mix the node's live mic into its call. Installing a tap does not affect the
+// wake/VAD/session paths.
 func (b *Brain) SetRawAudioTap(nodeID string, fn func(samples []float32)) {
 	b.rawTapsMu.Lock()
 	defer b.rawTapsMu.Unlock()

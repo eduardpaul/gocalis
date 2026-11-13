@@ -60,14 +60,17 @@ A real-time listener node that triggers when the background wakeword detection l
     * `msg.node_id`: Originating physical node ID.
     * `msg.speaker`: Verified speaker name.
 
-### 5. `gocalis intercom` (Live Audio Bridge)
-Opens a live two-way (or N-way) audio intercom bridge between two or more nodes. A call takes its participants over: a `say`/`play`/`ask` already running on one is cut off (an ask ends with `"interrupted by an intercom call"`), and while the call lasts every `say`/`ask`/`play` targeting a participant fails at once with `"node is in an intercom call"` instead of being queued (a broadcast to `all` skips those nodes). Wake word detection is off on participants during the call. Calls opened from the intercom web page (`/intercom`) are reported here too.
-* **Participants**: The node IDs to bridge, e.g. `kitchen, bedroom`. Overridable per message via `msg.node_ids` (array or comma-separated string), or `msg.node_id` + `msg.peer_node_id` for a two-node call.
-* **Timeout (s)**: Call time limit; `0` uses the server default (`intercom.default_timeout_seconds`). Overridable via `msg.duration_seconds`.
-* **Stopping**: Send `msg.payload = "stop"` (or `msg.action = "intercom_stop"`, or `msg.stop = true`) to end the call. Target a specific participant with `msg.node_id`.
+### 5. `gocalis intercom` (Live Calls)
+Runs live intercom calls between nodes. A call is a conference: nodes (and intercom pages, `/intercom`) join and leave it while it runs, each one hears all the others, and a chime tells the call that someone joined or left. It ends when fewer than two participants remain, on its time limit, or when it is stopped. A node in a call is taken over: a `say`/`play`/`ask` already running on it is cut off (an ask ends with `"interrupted by an intercom call"`), and until it leaves the call every `say`/`ask`/`play` targeting it fails at once with `"node is in an intercom call"` instead of being queued (a broadcast to `all` skips it).
+* **Participants**: The node IDs to connect, e.g. `kitchen, bedroom`. Overridable per message via `msg.node_ids` (array or comma-separated string).
+* **Connecting**: Any message puts the participants in a call together. When none is in a call a new one starts; when some already are in one, the others join it.
+* **Timeout (s)**: How long the call lasts from now at least (every join pushes the limit back); `0` uses the server default (`intercom.default_timeout_seconds`). Overridable via `msg.duration_seconds`.
+* **Leaving / stopping**: Send `msg.payload = "leave"` to take one node out of its call (the call goes on for the others), or `"stop"` to end the call for everyone. Both act on `msg.node_id`, or the first configured participant.
 * **Outputs**:
-  * **Output 1 (Started / Stopping)**: Emits once the engine accepts the call (or when a stop is sent).
-  * **Output 2 (Call Ended)**: Emits when the call ends for any reason. `msg.payload.reason` is `timeout`, `stopped`, `shutdown`, or `error`; `msg.payload.duration_seconds` is the call length; `msg.payload.remote_ids` lists intercom page microphones that took part. Also fires for matching calls started/stopped elsewhere (web UI, intercom page, timeout).
+  * **Output 1 (Request sent)**: Emits once the engine has the nodes in a call (`msg.node_ids` lists who is in it), or when a leave or stop has been sent.
+  * **Output 2 (Someone joined / left)**: Emits for every `intercom_joined` / `intercom_left`. `msg.event` tells which, `msg.participant_id` who, and `msg.node_ids` / `msg.remote_ids` who is in the call now (`remote_ids` are intercom pages).
+  * **Output 3 (Call ended)**: Emits when the call ends for any reason. `msg.reason` is `timeout`, `stopped`, `left`, `shutdown`, or `error`; `msg.duration_seconds` is how long it lasted.
+  * Outputs 2 and 3 also fire for matching calls started or changed elsewhere (intercom page, dashboard, timeout).
 
 ### 6. `gocalis stt` (Speech-to-Text on Files)
 A stateless file transcription node.

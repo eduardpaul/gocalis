@@ -44,54 +44,51 @@ module.exports = function(RED) {
             node.status({ fill: "grey", shape: "ring", text: "idle" });
         }
 
-        // Persistent listener: reflect intercom lifecycle events raised by the
-        // engine (including calls started/stopped elsewhere, e.g. the web UI or a
-        // configured timeout) onto this node's status and second output. A call is
-        // considered "ours" when any of its participants is one we are configured
-        // for; with no configured participants we reflect every call.
+        // Persistent listener: reflect what happens to calls (also the ones
+        // started, joined or ended elsewhere: the intercom page, the dashboard,
+        // a timeout) onto this node's status and its outputs 2 and 3. A call is
+        // "ours" when it involves a node we are configured for; with no
+        // configured participants we reflect every call.
         const eventHandler = (message) => {
-            if (message.event !== "intercom_started" && message.event !== "intercom_ended") {
+            const kind = message.event;
+            if (kind !== "intercom_started" && kind !== "intercom_joined" &&
+                kind !== "intercom_left" && kind !== "intercom_ended") {
                 return;
             }
 
-            const participants = message.node_ids || [];
-            // Intercom page microphones talking in the call (e.g. "web-1").
+            const nodes = message.node_ids || [];
+            // Intercom pages in the call (e.g. "web-1").
             const remotes = message.remote_ids || [];
             const configured = configuredIds(null);
             const relevant = configured.length === 0 ||
-                participants.some((p) => configured.indexOf(p) !== -1);
+                configured.indexOf(message.participant_id) !== -1 ||
+                nodes.some((p) => configured.indexOf(p) !== -1);
             if (!relevant) {
                 return;
             }
 
-            const who = participants.concat(remotes.length ? ["intercom page"] : []).join(" ↔ ") || "call";
-            if (message.event === "intercom_started") {
-                node.status({ fill: "green", shape: "dot", text: `in call: ${who}` });
+            const out = {
+                topic: "gocalis/intercom",
+                payload: message,
+                event: kind,
+                node_ids: nodes,
+                remote_ids: remotes
+            };
+
+            if (kind === "intercom_ended") {
+                const reason = message.reason || "ended";
+                node.status({ fill: message.status === "error" ? "red" : "grey", shape: "ring", text: `ended (${reason})` });
+                out.reason = reason;
+                out.duration_seconds = message.duration_seconds;
+                node.send([null, null, out]);
                 return;
             }
 
-            // intercom_ended
-            const reason = message.reason || "ended";
-            node.status({ fill: message.status === "error" ? "red" : "grey", shape: "ring", text: `ended (${reason})` });
-            node.send([null, {
-                topic: "gocalis/intercom",
-                payload: {
-                    event: "intercom_ended",
-                    node_ids: participants,
-                    remote_ids: remotes,
-                    node_id: message.node_id,
-                    peer_node_id: message.peer_node_id,
-                    status: message.status,
-                    message: message.message,
-                    reason: reason,
-                    duration_seconds: message.duration_seconds
-                },
-                node_id: message.node_id,
-                node_ids: participants,
-                remote_ids: remotes,
-                reason: reason,
-                duration_seconds: message.duration_seconds
-            }]);
+            node.status({ fill: "green", shape: "dot", text: `in call: ${nodes.concat(remotes).join(", ")}` });
+            if (kind !== "intercom_started") {
+                out.participant_id = message.participant_id;
+                node.send([null, out, null]);
+            }
         };
 
         if (node.server) {
@@ -108,77 +105,51 @@ module.exports = function(RED) {
                 return;
             }
 
-            // Determine the operation: start (default) or stop. A stop is requested
-            // via msg.action === "intercom_stop"/"stop", msg.stop truthy, or
-            // msg.payload === "stop".
-            const wantsStop = msg.action === "intercom_stop" ||
-                msg.action === "stop" ||
-                msg.stop === true ||
-                (typeof msg.payload === "string" && msg.payload.toLowerCase() === "stop");
+            // The operation: "connect" (default) puts the participants in a call
+            // together; "leave" takes one node out of its call; "stop" ends the
+            // whole call. It comes from msg.action, or from msg.payload when
+            // that is the string "leave" or "stop".
+            let action = "connect";
+            const asked = typeof msg.action === "string" ? msg.action
+                : (typeof msg.payload === "string" ? msg.payload : "");
+            if (/^(intercom_)?(leave|stop)$/i.test(asked)) {
+                action = asked.toLowerCase().replace("intercom_", "");
+            }
 
-            if (wantsStop) {
-                // A stop targets a single participant; the engine ends the whole
-                // call that node participates in.
-                let stopNode = "";
-                if (msg.node_id !== undefined) {
-                    stopNode = String(msg.node_id);
-                } else {
-                    let configured = [];
-                    try {
-                        configured = configuredIds(msg);
-                    } catch (err) {
-                        node.status({ fill: "red", shape: "ring", text: "error evaluating nodes" });
-                        done(`Failed to evaluate participant list: ${err.message}`);
-                        return;
-                    }
-                    if (configured.length > 0) {
-                        stopNode = configured[0];
-                    }
-                }
-                if (!stopNode) {
-                    node.status({ fill: "red", shape: "ring", text: "no node to stop" });
-                    done("intercom stop requires a node_id (via msg.node_id or the configured participants)");
+            let configured;
+            try {
+                configured = configuredIds(msg);
+            } catch (err) {
+                node.status({ fill: "red", shape: "ring", text: "error evaluating nodes" });
+                done(`Failed to evaluate participant list: ${err.message}`);
+                return;
+            }
+
+            if (action !== "connect") {
+                // Leave and stop name one node: the one that leaves, or any
+                // participant of the call to end.
+                const target = msg.node_id !== undefined ? String(msg.node_id) : (configured[0] || "");
+                if (!target) {
+                    node.status({ fill: "red", shape: "ring", text: `no node to ${action}` });
+                    done(`intercom ${action} requires a node (msg.node_id or the configured participants)`);
                     return;
                 }
-
-                node.status({ fill: "yellow", shape: "dot", text: `stopping ${stopNode}` });
-                const ok = node.server.sendWS({ action: "intercom_stop", node_id: stopNode });
-                if (!ok) {
+                if (!node.server.sendWS({ action: `intercom_${action}`, node_id: target })) {
                     node.status({ fill: "red", shape: "ring", text: "not connected" });
                     done("WebSocket not connected");
                     return;
                 }
-
-                msg.payload = { action: "intercom_stop", node_id: stopNode, status: "stopping" };
-                msg.status = "stopping";
-                send([msg, null]);
+                msg.payload = { action: `intercom_${action}`, node_id: target };
+                send([msg, null, null]);
                 done();
                 return;
             }
 
-            // Start: resolve the participant list. Priority: msg.node_ids array,
-            // then msg.node_id + msg.peer_node_id, then the configured list. A lone
-            // msg.node_id (e.g. carried over from an upstream wake trigger) does
-            // not override the configured participants.
-            let nodes = [];
-            if (msg.node_ids !== undefined) {
-                nodes = parseNodeIds(msg.node_ids);
-            } else if (msg.peer_node_id !== undefined) {
-                if (msg.node_id !== undefined) nodes.push(String(msg.node_id));
-                nodes.push(String(msg.peer_node_id));
-            } else if (node.nodeIds && String(node.nodeIds).trim() !== "") {
-                try {
-                    nodes = configuredIds(msg);
-                } catch (err) {
-                    node.status({ fill: "red", shape: "ring", text: "error evaluating nodes" });
-                    done(`Failed to evaluate participant list: ${err.message}`);
-                    return;
-                }
-            }
-
+            // Connect: msg.node_ids overrides the configured participants.
+            const nodes = msg.node_ids !== undefined ? parseNodeIds(msg.node_ids) : configured;
             if (nodes.length < 2) {
                 node.status({ fill: "yellow", shape: "ring", text: "need 2+ nodes" });
-                done("Intercom requires at least two participant node IDs (via configuration, msg.node_ids, or msg.node_id + msg.peer_node_id)");
+                done("Intercom requires at least two participant node IDs (configured, or in msg.node_ids)");
                 return;
             }
 
@@ -191,26 +162,29 @@ module.exports = function(RED) {
                 payload.duration_seconds = duration;
             }
 
-            node.status({ fill: "blue", shape: "dot", text: `calling ${nodes.join(" ↔ ")}` });
+            node.status({ fill: "blue", shape: "dot", text: `calling ${nodes.join(", ")}` });
 
             try {
+                // The request is answered by the event that shows all our nodes
+                // in one call (a new call, or the last of them joining a running
+                // one), or by the error raised for it.
                 const result = await node.server.request(payload, {
-                    expectEvents: ["intercom_started"],
-                    nodeId: nodes[0],
+                    match: (m) => (m.event === "error" && m.node_id === nodes[0]) ||
+                        ((m.event === "intercom_started" || m.event === "intercom_joined") &&
+                            nodes.every((n) => (m.node_ids || []).indexOf(n) !== -1)),
                     timeoutMs: 30000
                 });
 
-                if (result.event === "error" || result.status === "error") {
+                if (result.event === "error") {
                     node.status({ fill: "red", shape: "ring", text: result.message || "error" });
                     done(`Gocalis engine reported failure: ${result.message || "error"}`);
                     return;
                 }
 
                 msg.payload = result;
-                msg.status = "started";
-                msg.node_ids = result.node_ids || nodes;
-                node.status({ fill: "green", shape: "dot", text: `in call: ${nodes.join(" ↔ ")}` });
-                send([msg, null]);
+                msg.node_ids = result.node_ids;
+                msg.remote_ids = result.remote_ids || [];
+                send([msg, null, null]);
                 done();
             } catch (err) {
                 node.status({ fill: "red", shape: "ring", text: "request failed" });
