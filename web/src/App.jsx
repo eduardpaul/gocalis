@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 import StatusHeader from './components/StatusHeader'
 import NodeGrid from './components/NodeGrid'
@@ -19,6 +19,12 @@ function App() {
   const [status, setStatus] = useState(null)
   const [nodes, setNodes] = useState([])
   const [events, setEvents] = useState([])
+  // Parts of the page that wait for an event (the outcome of a Say) listen here.
+  const eventListeners = useRef(new Set())
+  const onEvent = useCallback((listener) => {
+    eventListeners.current.add(listener)
+    return () => eventListeners.current.delete(listener)
+  }, [])
 
   const addEvent = useCallback((event) => {
     setEvents((prev) => {
@@ -69,6 +75,7 @@ function App() {
         try {
           const event = JSON.parse(msg.data)
           addEvent(event)
+          eventListeners.current.forEach((listener) => listener(event))
           if (event.event === 'state_changed') {
             setNodes((prev) => prev.map((n) =>
               n.node_id === event.node_id ? { ...n, state: event.state } : n
@@ -157,7 +164,7 @@ function App() {
         </section>
 
         <section className="dashboard-section">
-          <CommandCenter nodes={nodes} onExecute={execute} onSynthesize={synthesize} onAsk={ask} onReloadSpeakers={reloadSpeakers} onLoadPlugins={loadPlugins} />
+          <CommandCenter nodes={nodes} onExecute={execute} onSynthesize={synthesize} onAsk={ask} onReloadSpeakers={reloadSpeakers} onLoadPlugins={loadPlugins} onEvent={onEvent} />
         </section>
       </main>
 

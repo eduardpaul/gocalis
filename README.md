@@ -373,7 +373,8 @@ a call does not put a node out of the assistant's reach.
   pages included. The option does nothing for a node that is not in a call, and
   a broadcast to `all` nodes with it reaches the ones in a call individually.
   An ask in a call has no barge-in and no voice challenge; its result carries
-  `in_call: true`.
+  `in_call: true`. The dashboard's Say and Ask send `"node"` unless another
+  choice is made there.
 - `kws.wake_in_call: true` on a node keeps its wake word armed during a call.
   Saying it starts the node's usual wake turn inside the call, as an ask with
   `call_mode: "node"`: the node is set aside, hears the listening chime, says

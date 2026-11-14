@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 // Tab definitions. `id` maps to a different backend call:
 //  - say        -> POST /api/execute {action:'tts'}  (plays TTS on a node)
@@ -17,12 +17,12 @@ const TABS = [
   { id: 'speaker_id', label: 'Speaker ID', hint: 'Identify the speaker in an audio file' },
 ]
 
-function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers, onLoadPlugins }) {
+function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers, onLoadPlugins, onEvent }) {
   const [activeTab, setActiveTab] = useState('say')
   const [nodeId, setNodeId] = useState('all')
   const [intercomNodes, setIntercomNodes] = useState([])
   const [intercomDuration, setIntercomDuration] = useState(60)
-  const [callMode, setCallMode] = useState('')
+  const [callMode, setCallMode] = useState('node')
   const [plugins, setPlugins] = useState([])
   const [pluginId, setPluginId] = useState('')
   const [pluginCommand, setPluginCommand] = useState('hangup')
@@ -36,6 +36,17 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
   const [vadTimeout, setVadTimeout] = useState(10)
   const [loading, setLoading] = useState(false)
   const [lastResult, setLastResult] = useState(null)
+  // The Say whose outcome has not come yet. The server only acknowledges a
+  // Say; whether it was spoken, or why not, comes as an event for its node.
+  const awaitedSay = useRef(null)
+
+  useEffect(() => onEvent((event) => {
+    const say = awaitedSay.current
+    if (!say || event.node_id !== say.nodeId) return
+    if (event.event !== 'tts_completed' && event.event !== 'error') return
+    awaitedSay.current = null
+    setLastResult(event)
+  }), [onEvent])
 
   const nodeOptions = [
     { value: 'all', label: 'All Nodes' },
@@ -55,6 +66,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
       refreshPlugins()
     }
     setActiveTab(id)
+    awaitedSay.current = null
     setLastResult(null)
   }
 
@@ -80,11 +92,17 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
     e.preventDefault()
     setLoading(true)
     setLastResult(null)
+    awaitedSay.current = null
 
     try {
       let result
       if (activeTab === 'say') {
-        result = await onExecute('tts', { node_id: nodeId, text, priority: Number(priority), call_mode: callMode || undefined })
+        const say = { nodeId }
+        awaitedSay.current = say
+        const accepted = await onExecute('tts', { node_id: nodeId, text, priority: Number(priority), call_mode: callMode || undefined })
+        // The outcome may have come before the acknowledgement: it stays.
+        if (awaitedSay.current !== say) return
+        result = accepted
       } else if (activeTab === 'tts') {
         result = await onSynthesize({ text, filename, priority: Number(priority) })
       } else if (activeTab === 'ask') {
@@ -94,7 +112,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
           require_speaker_id: requireSpeakerId,
           vad_timeout_seconds: Number(vadTimeout),
           priority: Number(priority),
-          call_mode: callMode === 'node' ? 'node' : undefined,
+          call_mode: callMode ? 'node' : undefined,
         })
       } else if (activeTab === 'intercom') {
         if (intercomNodes.length < 2) {
@@ -133,6 +151,7 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
       }
       setLastResult(result)
     } catch (err) {
+      awaitedSay.current = null
       setLastResult({ status: 'error', error_message: err.message })
     } finally {
       setLoading(false)
@@ -316,7 +335,8 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
             <p className="hint">
               Connecting starts a call, or brings the selected nodes into the call one of them is
               already in. While a node is in a call, the call is its only audio: whatever it was
-              saying is cut off, and any Say/Ask targeting it fails until it leaves. Each
+              saying is cut off, and a Say or Ask for it happens inside the call (or fails, as
+              chosen on those tabs). Each
               participant hears all the others, and a chime marks every join and leave. Leave takes
               the first selected node out of its call; Stop ends that call for everyone. To join a
               call from a browser or a phone, use the intercom page (/intercom).
@@ -418,10 +438,13 @@ function CommandCenter({ nodes, onExecute, onSynthesize, onAsk, onReloadSpeakers
         {(activeTab === 'say' || activeTab === 'ask') && (
           <label>
             If the node is in an intercom call <span className="hint">(the call owns its speaker)</span>
-            <select value={callMode} onChange={(e) => setCallMode(e.target.value)}>
-              <option value="">Fail</option>
+            <select
+              value={activeTab === 'ask' && callMode === 'all' ? 'node' : callMode}
+              onChange={(e) => setCallMode(e.target.value)}
+            >
               <option value="node">Inside the call, for the node alone</option>
               {activeTab === 'say' && <option value="all">Inside the call, for everyone</option>}
+              <option value="">Fail</option>
             </select>
           </label>
         )}
@@ -491,8 +514,10 @@ function ResultView({ tab, result }) {
     if (result.speaker) rows.push(['Speaker', result.speaker])
     if (result.error_message) rows.push(['Message', result.error_message])
   } else {
-    // say / asr / speaker_id (async accepted ack; full result appears in Event Log)
-    rows.push(['Status', result.status || result.event])
+    // say: the acknowledgement, then the node's outcome. asr / speaker_id: the
+    // acknowledgement only (the result appears in the Event Log).
+    const waiting = tab === 'say' && result.status === 'accepted'
+    rows.push(['Status', waiting ? 'accepted, waiting for the node…' : result.status || result.event])
     if (result.message) rows.push(['Message', result.message])
   }
 
