@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"strconv"
@@ -147,9 +148,26 @@ func newLink(heard sink) (*link, error) {
 		return fail(fmt.Errorf("set opus bitrate: %w", err))
 	}
 
+	// What the connection does is logged: when it fails, that is all there
+	// is to tell whether our checks went out, came back, or never started.
+	var gathered []string
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil {
+			gathered = append(gathered, fmt.Sprintf("%s %s:%d", c.Typ, c.Address, c.Port))
+			return
+		}
+		log.Printf("[Telegram media] SSRC %d: our candidates: %s\n", l.ssrc, strings.Join(gathered, ", "))
+	})
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("[Telegram media] SSRC %d: ICE %s\n", l.ssrc, state)
+	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("[Telegram media] SSRC %d: connection %s\n", l.ssrc, state)
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
+			if pair, err := l.sender.Transport().ICETransport().GetSelectedCandidatePair(); err == nil && pair != nil {
+				log.Printf("[Telegram media] SSRC %d: talking over %s\n", l.ssrc, pair)
+			}
 			l.upOnce.Do(func() { close(l.up) })
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			l.downOnce.Do(func() { close(l.down) })
@@ -210,6 +228,11 @@ func (l *link) connect(params string) error {
 	if err != nil {
 		return err
 	}
+	offered := make([]string, len(response.Transport.Candidates))
+	for i, c := range response.Transport.Candidates {
+		offered[i] = fmt.Sprintf("%s %s:%s", c.Protocol, c.IP, c.Port)
+	}
+	log.Printf("[Telegram media] SSRC %d: the media server offers %s\n", l.ssrc, strings.Join(offered, ", "))
 	if err := l.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
 		return fmt.Errorf("set remote description: %w", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"gocalis/internal/audionode"
@@ -68,6 +69,7 @@ var (
 	errAbandoned       = errors.New("whoever was calling gave up")
 	errShutdown        = errors.New("gocalis is shutting down")
 	errOffline         = errors.New("the connection to Telegram was lost")
+	errDropped         = errors.New("gocalis is no longer in the voice chat")
 )
 
 const (
@@ -80,6 +82,10 @@ const (
 	tailTime = 400 * time.Millisecond
 	// cleanupTimeout bounds leaving and closing the voice chat.
 	cleanupTimeout = 10 * time.Second
+	// rejoins is how many times a call leaves the voice chat and joins it
+	// again, with a new media connection, when that connection does not come
+	// up, is lost, or Telegram drops gocalis before anybody answered.
+	rejoins = 1
 )
 
 // call is one stay in the group's voice chat. gocalis opens the voice chat (or
@@ -221,34 +227,43 @@ func (c *call) work(st *stay) (answered bool, result outcome) {
 	}
 
 	mix := newMixdown()
-	conn, err := c.p.newMedia(mix)
-	if err != nil {
-		return false, failed("prepare the media connection: %w", err)
+	left := rejoins
+	// rejoin takes gocalis out of the voice chat and back in after trouble a
+	// fresh media connection can cure, while rejoins are left. It returns the
+	// outcome to end the call with when that is not possible.
+	rejoin := func(trouble error) (outcome, bool) {
+		for {
+			if c.ctx.Err() != nil {
+				return stopped(), false
+			}
+			if left == 0 {
+				return outcome{failure: trouble}, false
+			}
+			left--
+			log.Printf("[Plugin %s] %v; joining the voice chat of '%s' again\n", c.p.host.ID, trouble, st.vc.Chat)
+			c.stepOut(st)
+			err, curable := c.enter(st, mix)
+			switch {
+			case err == nil:
+				return outcome{}, true
+			case c.ctx.Err() != nil:
+				return stopped(), false
+			case !curable:
+				return outcome{failure: err}, false
+			}
+			trouble = err
+		}
 	}
-	st.conn = conn
-	payload, err := conn.joinPayload()
-	if err != nil {
-		return false, failed("prepare the media connection: %w", err)
-	}
-	params, err := c.api.join(c.ctx, st.vc, payload)
-	if err != nil {
+	if err, curable := c.enter(st, mix); err != nil {
 		if c.ctx.Err() != nil {
 			return false, stopped()
 		}
-		return false, failed("join the voice chat: %w", err)
-	}
-	st.joined = true
-	if err := conn.connect(params); err != nil {
-		return false, failed("connect to the voice chat: %w", err)
-	}
-	select {
-	case <-conn.connected():
-	case <-conn.lost():
-		return false, failed("the media connection to the voice chat failed")
-	case <-time.After(connectTimeout):
-		return false, failed("the media connection to the voice chat did not come up in %v", connectTimeout)
-	case <-c.ctx.Done():
-		return false, stopped()
+		if !curable {
+			return false, outcome{failure: err}
+		}
+		if out, ok := rejoin(err); !ok {
+			return false, out
+		}
 	}
 
 	log.Printf("[Plugin %s] Ringing: waiting in the voice chat of '%s' for somebody to come in (%v)\n", c.p.host.ID, st.vc.Chat, c.p.ringFor)
@@ -262,27 +277,41 @@ func (c *call) work(st *stay) (answered bool, result outcome) {
 		},
 	})
 
-	// Wait for somebody from the group.
-	watch := c.newWatch(st.vc, conn)
-	defer watch.stop()
+	// Wait for somebody from the group. The ring keeps its length when
+	// gocalis has to join again meanwhile.
+	watch := c.newWatch(st.vc, st.conn)
+	defer func() { watch.stop() }()
 	deadline := time.NewTimer(c.p.ringFor)
 	defer deadline.Stop()
 	var others []person
 	for len(others) == 0 {
+		var trouble error
 		select {
 		case seen := <-watch.seen:
 			if seen.err != nil {
-				return false, seen.outcome()
+				if !errors.Is(seen.err, errDropped) {
+					return false, seen.outcome()
+				}
+				trouble = seen.err
 			}
 			others = seen.others
 		case <-deadline.C:
 			return false, outcome{reason: "unanswered"}
-		case <-conn.lost():
-			return false, failed("the media connection to the voice chat was lost")
+		case <-st.conn.lost():
+			trouble = errors.New("the media connection to the voice chat was lost")
 		case <-c.ctx.Done():
 			return false, stopped()
 		}
+		if trouble == nil {
+			continue
+		}
+		watch.stop()
+		if out, ok := rejoin(trouble); !ok {
+			return false, out
+		}
+		watch = c.newWatch(st.vc, st.conn)
 	}
+	conn := st.conn
 
 	// Somebody is there: from here the node has a line to them.
 	mix.to(c.p.heard)
@@ -318,6 +347,57 @@ func (c *call) work(st *stay) (answered bool, result outcome) {
 			return true, stopped()
 		}
 	}
+}
+
+// enter joins the voice chat with a new media connection and waits for it to
+// come up. curable tells a failure is one that joining again can cure: the
+// connection did not come up in time, or was lost on the way.
+func (c *call) enter(st *stay, mix *mixdown) (err error, curable bool) {
+	conn, err := c.p.newMedia(mix)
+	if err != nil {
+		return fmt.Errorf("prepare the media connection: %w", err), false
+	}
+	st.conn = conn
+	payload, err := conn.joinPayload()
+	if err != nil {
+		return fmt.Errorf("prepare the media connection: %w", err), false
+	}
+	params, err := c.api.join(c.ctx, st.vc, payload)
+	if err != nil {
+		return fmt.Errorf("join the voice chat: %w", err), false
+	}
+	st.joined = true
+	if err := conn.connect(params); err != nil {
+		return fmt.Errorf("connect to the voice chat: %w", err), false
+	}
+	select {
+	case <-conn.connected():
+		return nil, false
+	case <-conn.lost():
+		return errors.New("the media connection to the voice chat failed"), true
+	case <-time.After(connectTimeout):
+		return fmt.Errorf("the media connection to the voice chat did not come up in %v", connectTimeout), true
+	case <-c.ctx.Done():
+		return context.Cause(c.ctx), false
+	}
+}
+
+// stepOut takes gocalis out of the voice chat, keeping it open, so that it
+// can join again.
+func (c *call) stepOut(st *stay) {
+	if st.conn == nil {
+		return
+	}
+	st.conn.close()
+	if st.joined {
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		if err := c.api.leave(ctx, st.vc, st.conn.source()); err != nil && !errors.Is(err, errVoiceChatClosed) {
+			log.Printf("[Plugin %s] Leaving the voice chat of '%s': %v\n", c.p.host.ID, st.vc.Chat, err)
+		}
+		cancel()
+		st.joined = false
+	}
+	st.conn = nil
 }
 
 // leave takes gocalis out of the voice chat and closes it if this call started
@@ -359,13 +439,15 @@ func (s sighting) outcome() outcome {
 // watch looks at who is in the voice chat, on a timer and whenever Telegram
 // reports a change, and delivers each look that differs from the one before.
 type watch struct {
-	seen chan sighting
-	quit chan struct{}
-	done chan struct{}
+	seen     chan sighting
+	quit     chan struct{}
+	quitOnce sync.Once
+	done     chan struct{}
 }
 
+// stop ends the watch and waits for it; stopping it again does nothing.
 func (w *watch) stop() {
-	close(w.quit)
+	w.quitOnce.Do(func() { close(w.quit) })
 	<-w.done
 }
 
@@ -404,7 +486,7 @@ func (c *call) newWatch(vc voiceChat, conn media) *watch {
 				// believed from a look that has us in it.
 				if !in {
 					if out++; out >= presenceFailures {
-						deliver(sighting{err: errors.New("gocalis is no longer in the voice chat")})
+						deliver(sighting{err: errDropped})
 						return
 					}
 					break
