@@ -66,7 +66,7 @@ func NewExecutor(ctx context.Context, brain *brain.Brain, asr ai.Transcriber, sp
 			DurationSeconds:  ev.DurationSeconds,
 			RemainingSeconds: ev.RemainingSeconds,
 		})
-	}, intercom.NewSpeexEchoCanceller)
+	}, intercom.NewWebRTCEchoCanceller)
 	return e
 }
 

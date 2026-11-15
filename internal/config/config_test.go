@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const minimalConfig = `models:
@@ -63,12 +64,25 @@ func TestRejectInvalidConfiguration(t *testing.T) {
 		"nan duration":            minimalConfig + "    kws:\n      auto_ask_timeout_seconds: .nan\n",
 		"thread count":            "global_num_threads: -1\n" + minimalConfig,
 		"multiple documents":      minimalConfig + "---\n{}\n",
+		"negative echo delay":     minimalConfig + "intercom:\n  echo_cancellation:\n    delay_ms:\n      room: -5\n",
+		"removed echo tail":       minimalConfig + "intercom:\n  echo_cancellation:\n    tail_ms: 250\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := loadText(t, text); err == nil {
 				t.Fatal("invalid config accepted")
 			}
 		})
+	}
+}
+
+func TestIntercomEchoDelayPerNode(t *testing.T) {
+	cfg, err := loadText(t, minimalConfig+"intercom:\n  echo_cancellation:\n    enabled: true\n    delay_ms:\n      room: 450\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aec := cfg.Intercom.EchoCancellation
+	if !aec.Enabled || aec.Delay("room") != 450*time.Millisecond || aec.Delay("other") != 0 || aec.NoiseSuppression {
+		t.Fatalf("echo cancellation = %+v", aec)
 	}
 }
 

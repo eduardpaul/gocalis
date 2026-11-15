@@ -116,9 +116,9 @@ type Engine struct {
 	emit  func(Event)
 
 	// newAEC builds a per-node echo canceller. When nil (or AEC disabled in
-	// config), mics are mixed verbatim. Injected so the cgo speex backend is
+	// config), mics are mixed verbatim. Injected so the cgo WebRTC backend is
 	// pluggable and tests can substitute a fake or none.
-	newAEC func(rate, frameSamples, tailSamples int) (EchoCanceller, error)
+	newAEC func(AECOptions) (EchoCanceller, error)
 
 	// joinChime and leaveChime are what a call plays when someone joins or
 	// leaves (PCM16 at bridgeRate).
@@ -184,7 +184,7 @@ type nodeMember struct {
 
 // NewEngine creates an intercom engine backed by the brain, emitting lifecycle
 // events through emit. newAEC may be nil to disable software echo cancellation.
-func NewEngine(b *brain.Brain, cfg config.IntercomConfig, emit func(Event), newAEC func(rate, frameSamples, tailSamples int) (EchoCanceller, error)) *Engine {
+func NewEngine(b *brain.Brain, cfg config.IntercomConfig, emit func(Event), newAEC func(AECOptions) (EchoCanceller, error)) *Engine {
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 	return &Engine{
 		brain:      b,
@@ -388,9 +388,12 @@ func (e *Engine) newCanceller(nodeID string) EchoCanceller {
 	if !e.cfg.EchoCancellation.Enabled || e.newAEC == nil {
 		return nil
 	}
-	frame := bridgeRate * e.cfg.EchoCancellation.GetFrameMs() / 1000
-	tail := bridgeRate * e.cfg.EchoCancellation.GetTailMs() / 1000
-	c, err := e.newAEC(bridgeRate, frame, tail)
+	c, err := e.newAEC(AECOptions{
+		Node:             nodeID,
+		SampleRate:       bridgeRate,
+		Delay:            e.cfg.EchoCancellation.Delay(nodeID),
+		NoiseSuppression: e.cfg.EchoCancellation.NoiseSuppression,
+	})
 	if err != nil {
 		log.Printf("[Intercom] no echo cancellation for '%s': %v\n", nodeID, err)
 		return nil

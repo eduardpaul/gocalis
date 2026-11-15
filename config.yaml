@@ -68,8 +68,22 @@ models:
 # intercom:
 #   # How long a call lasts after the last join when the request does not say.
 #   default_timeout_seconds: 60
+#   # WebRTC echo cancellation (AEC3) of each node's microphone, so a node
+#   # without hardware echo cancellation does not send the others their own
+#   # voice back. The node that answers a call (e.g. a Telegram plugin node)
+#   # gets none: its far end cancels its own echo.
 #   echo_cancellation:
 #     enabled: false
+#     # Per-node hint (ms) of the shortest time a node's echo takes to come
+#     # back: from gocalis sending the node audio to that audio reaching
+#     # gocalis again from the node's mic. The canceller finds the delay itself
+#     # from the hint up to about 500 ms past it; unlisted nodes get 0 (echo
+#     # within ~0.5 s). Set it ~100-150 ms below the delay the call log reports
+#     # ("echo delay estimate"). A HomeKit doorbell behind go2rtc needs one.
+#     delay_ms:
+#       front_door: 300
+#     # Also run WebRTC noise suppression on the cancelled mic.
+#     noise_suppression: false
 #   # go2rtc viewer the intercom page embeds for each node (a plain go2rtc
 #   # viewer: the page never talks to go2rtc). The page hears that node through
 #   # the viewer, and the rest of the call through gocalis. Must be reachable

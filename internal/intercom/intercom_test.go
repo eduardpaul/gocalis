@@ -788,7 +788,7 @@ func (f *fakeCanceller) Close() {}
 func TestIntercomAECDisabledBypasses(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{DefaultTimeoutSeconds: 5}) // Enabled=false
 	var built int
-	rig.engine.newAEC = func(_, _, _ int) (EchoCanceller, error) {
+	rig.engine.newAEC = func(AECOptions) (EchoCanceller, error) {
 		built++
 		return &fakeCanceller{}, nil
 	}
@@ -815,12 +815,20 @@ func TestIntercomAECDisabledBypasses(t *testing.T) {
 func TestIntercomAECEnabledEngaged(t *testing.T) {
 	rig := newTestRig(t, config.IntercomConfig{
 		DefaultTimeoutSeconds: 5,
-		EchoCancellation:      config.IntercomAECConfig{Enabled: true, TailMs: 100, FrameMs: 20},
+		EchoCancellation: config.IntercomAECConfig{
+			Enabled: true,
+			DelayMs: map[string]int{"A": 400},
+		},
 	})
 	var built int
+	delays := map[string]time.Duration{}
 	// Transform zeroes the near-end so we can detect the AEC output in playback.
-	rig.engine.newAEC = func(_, _, _ int) (EchoCanceller, error) {
+	rig.engine.newAEC = func(o AECOptions) (EchoCanceller, error) {
 		built++
+		delays[o.Node] = o.Delay
+		if o.SampleRate != bridgeRate {
+			t.Errorf("canceller for %s built at %d Hz", o.Node, o.SampleRate)
+		}
 		return &fakeCanceller{transform: func(s []int16) []int16 { return make([]int16, len(s)) }}, nil
 	}
 
@@ -834,6 +842,9 @@ func TestIntercomAECEnabledEngaged(t *testing.T) {
 
 	if built != 2 {
 		t.Fatalf("expected an AEC per node (2), built %d", built)
+	}
+	if delays["A"] != 400*time.Millisecond || delays["B"] != 0 {
+		t.Fatalf("delay hints not passed per node: %v", delays)
 	}
 	// The AEC zeroed A's mic, so B must have played only zeros (or nothing).
 	if slices.ContainsFunc(rig.played("B"), func(v int16) bool { return v != 0 }) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -76,17 +77,32 @@ type IntercomConfig struct {
 	Viewers map[string]string `yaml:"viewers"`
 }
 
-// IntercomAECConfig configures the per-node software echo canceller.
+// IntercomAECConfig configures the per-node software echo canceller (WebRTC
+// AEC3).
 type IntercomAECConfig struct {
 	// Enabled turns the software echo canceller on. When false, mics are bridged
 	// verbatim (safe only when the devices do hardware AEC or are acoustically
 	// isolated).
 	Enabled bool `yaml:"enabled"`
-	// TailMs is the adaptive-filter length in milliseconds: the echo-path delay
-	// budget (network + speaker + acoustic + mic). Defaults to 250ms when unset.
-	TailMs int `yaml:"tail_ms"`
-	// FrameMs is the processing frame size in milliseconds. Defaults to 20ms.
-	FrameMs int `yaml:"frame_ms"`
+	// DelayMs maps a node id to a hint, in milliseconds, of how long its echo
+	// takes at least to come back: from gocalis handing the node audio to play
+	// until the node's microphone audio carrying it reaches gocalis (network,
+	// transcoding, device buffers, speaker to mic). The canceller holds the
+	// reference back by that much and finds the rest of the delay itself,
+	// within about half a second past the hint. Unlisted nodes get 0, which
+	// suits a node whose echo returns within ~0.5 s.
+	DelayMs map[string]int `yaml:"delay_ms"`
+	// NoiseSuppression also runs WebRTC's noise suppressor on the cancelled
+	// mic. Off by default.
+	NoiseSuppression bool `yaml:"noise_suppression"`
+}
+
+// Delay returns the echo delay hint configured for a node (0 when unset).
+func (a IntercomAECConfig) Delay(nodeID string) time.Duration {
+	if ms := a.DelayMs[nodeID]; ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return 0
 }
 
 // GetDefaultTimeoutSeconds returns the configured default intercom timeout,
@@ -96,22 +112,6 @@ func (c IntercomConfig) GetDefaultTimeoutSeconds() float64 {
 		return c.DefaultTimeoutSeconds
 	}
 	return 60
-}
-
-// GetTailMs returns the configured AEC filter tail length, defaulting to 250ms.
-func (a IntercomAECConfig) GetTailMs() int {
-	if a.TailMs > 0 {
-		return a.TailMs
-	}
-	return 250
-}
-
-// GetFrameMs returns the configured AEC frame size, defaulting to 20ms.
-func (a IntercomAECConfig) GetFrameMs() int {
-	if a.FrameMs > 0 {
-		return a.FrameMs
-	}
-	return 20
 }
 
 // SecurityConfig holds transport hardening settings for the HTTP/WebSocket APIs.
@@ -426,6 +426,11 @@ func (c *Config) normalizeAndValidate() error {
 	for _, text := range append(append([]string{}, c.Models.TTS.CacheConfig.PreGenerate...), c.Models.SpeakerID.ChallengePrompts...) {
 		if len(text) > 4000 {
 			return fmt.Errorf("configured phrase exceeds 4000 bytes")
+		}
+	}
+	for node, ms := range c.Intercom.EchoCancellation.DelayMs {
+		if ms < 0 || ms > 5000 {
+			return fmt.Errorf("intercom.echo_cancellation.delay_ms.%s must be in [0,5000]", node)
 		}
 	}
 	if c.MQTT.QoS < 0 || c.MQTT.QoS > 2 {

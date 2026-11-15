@@ -252,6 +252,11 @@ docker compose up -d --build app
 docker compose logs -f app
 ```
 
+Building outside Docker needs the native development packages the image
+installs; the intercom's echo canceller links `webrtc-audio-processing-1` 1.x
+through pkg-config (Debian trixie: `libwebrtc-audio-processing-dev`; bookworm's
+0.3 has no AEC3).
+
 Compose mounts only configuration and models, so repository mounts cannot hide the embedded dashboard. It uses host networking for WebRTC and maps `/dev/snd` for local ALSA nodes. For a deployment using only WebRTC, remove the `devices` entry if the host has no sound devices. `privileged` mode is unnecessary.
 
 The default dashboard is at `http://localhost:8080`; the automation WebSocket is `ws://localhost:9090/ws`. Configure `security.auth_token` to require a bearer token for controls and both event sockets. Enter it in the dashboard's access-token field; it is stored for the current browser tab. The status endpoints remain public.
@@ -360,6 +365,25 @@ call's mix, never wake word detection, VAD, ASR or the assistant, and the mix a
 participant gets leaves its own microphone out. That holds for the node's
 `auto_ask_capture_delay_seconds` after the call too, while the device plays out
 its buffered tail.
+
+**Echo cancellation.** With `intercom.echo_cancellation.enabled`, each node's
+microphone goes through WebRTC's echo canceller (AEC3, from
+`webrtc-audio-processing-1`) before it is mixed, so a node without hardware echo
+cancellation does not send the others their own voice back. The reference is
+what Gocalis hands the node to play; AEC3 finds the echo's delay itself and its
+residual echo suppressor removes what a linear filter leaves (the doorbell's
+AAC-ELD leg is not linear). Its delay search reaches about half a second, so a
+node whose echo comes back later, like a HomeKit doorbell behind go2rtc, needs
+`intercom.echo_cancellation.delay_ms.<node>`: a hint of the shortest echo
+delay, which the canceller covers up to ~500 ms past. Every 10 s of a call, and
+when the node leaves, the log reports `echo delay estimate` and how much
+quieter the microphone came out (`mic level ... dB`): set the hint ~100-150 ms
+below the estimate. An estimate that equals the hint with the level barely
+lower means the echo was not found: it is earlier than the hint or more than
+~500 ms past it. To find an unknown delay, try a hint of 0 and then 500 ms;
+together they cover the first second. `noise_suppression: true` also runs WebRTC
+noise suppression. The node that answers a call (a node somebody has to answer)
+gets no canceller: its far end cancels its own echo.
 
 **The assistant in a call.** Both rules above have an opt-in exception, so that
 a call does not put a node out of the assistant's reach.
