@@ -224,7 +224,8 @@ func (t *talkbackSender) assertRoute(ctx context.Context) error {
 // ensureRoute makes sure the AAC-ELD bridge is live before speech is paced. go2rtc
 // tears down an idle ffmpeg bridge over time, but re-POSTing a live one would
 // restart it (see assertRoute), so the route is re-asserted only when go2rtc no
-// longer lists it, or when the listing cannot be read.
+// longer lists it attached to the doorbell's backchannel (see routeActive), or
+// when the listing cannot be read.
 func (t *talkbackSender) ensureRoute(ctx context.Context) error {
 	if active, err := t.routeActive(ctx); err == nil && active {
 		return nil
@@ -488,10 +489,14 @@ func webrtcInputURL(baseURL, stream string) (string, error) {
 	return u.String(), nil
 }
 
-// routeActive reports whether go2rtc currently lists the AAC-ELD bridge as a
-// producer of the HomeKit backchannel stream. go2rtc accepts a route POST even
-// when the bridge dies right after (e.g. while the HomeKit session is still
-// coming up after a restart), so the POST result alone proves nothing.
+// routeActive reports whether go2rtc lists the AAC-ELD bridge as a producer of
+// the HomeKit backchannel stream AND the doorbell's backchannel is attached to
+// it: some other producer (the HomeKit session) has a sender whose parent is one
+// of the bridge's receivers. go2rtc accepts a route POST even when the bridge
+// dies right after (e.g. while the HomeKit session is still coming up after a
+// restart), so the POST result alone proves nothing. And when the HomeKit
+// session reconnects, the old bridge stays listed but feeds nobody: its audio
+// goes nowhere until the route is posted again.
 func (t *talkbackSender) routeActive(ctx context.Context) (bool, error) {
 	u, err := url.Parse(t.apiBaseURL)
 	if err != nil {
@@ -513,7 +518,13 @@ func (t *talkbackSender) routeActive(ctx context.Context) (bool, error) {
 	}
 	var stream struct {
 		Producers []struct {
-			URL string `json:"url"`
+			URL       string `json:"url"`
+			Receivers []struct {
+				ID uint32 `json:"id"`
+			} `json:"receivers"`
+			Senders []struct {
+				Parent uint32 `json:"parent"`
+			} `json:"senders"`
 		} `json:"producers"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&stream); err != nil {
@@ -523,12 +534,23 @@ func (t *talkbackSender) routeActive(ctx context.Context) (bool, error) {
 	// input, e.g. rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld;
 	// a bridge declared in go2rtc.yaml is listed with the ffmpeg: url itself.
 	source := "ffmpeg:" + t.inStream + "#audio=eld"
+	bridgeTracks := map[uint32]bool{}
 	for _, p := range stream.Producers {
-		if p.URL == source {
-			return true, nil
-		}
+		isBridge := p.URL == source
 		if pu, err := url.Parse(p.URL); err == nil && pu.Query().Get("source") == source {
-			return true, nil
+			isBridge = true
+		}
+		if isBridge {
+			for _, r := range p.Receivers {
+				bridgeTracks[r.ID] = true
+			}
+		}
+	}
+	for _, p := range stream.Producers {
+		for _, s := range p.Senders {
+			if bridgeTracks[s.Parent] {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
