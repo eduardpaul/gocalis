@@ -953,7 +953,9 @@ func (b *routeBackoff) done(err error, now time.Time) time.Duration {
 }
 
 // ensureTalkbackRoute re-asserts the AAC-ELD bridge when go2rtc no longer lists
-// it (it dies silently if posted while the HomeKit session is still starting).
+// it attached to the doorbell's backchannel (it dies silently if posted while
+// the HomeKit session is still starting, and is left behind feeding nobody when
+// that session reconnects; see routeActive).
 // It returns an error only when a re-assert was attempted and failed.
 func (c *Client) ensureTalkbackRoute(lifetime context.Context) error {
 	c.tbMu.Lock()

@@ -27,9 +27,13 @@ func TestTalkbackRouteActive(t *testing.T) {
 		want   bool
 		err    bool
 	}{
-		{"route added via dst (real go2rtc shape)", `{"producers":[{"url":"homekit://x"},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld"}]}`, 200, true, false},
-		{"route declared in yaml", `{"producers":[{"url":"homekit://x"},{"url":"ffmpeg:talkback_in#audio=eld"}]}`, 200, true, false},
-		{"other ffmpeg bridge", `{"producers":[{"url":"rtsp://127.0.0.1:8554/other_in?audio&source=ffmpeg:other_in%23audio%3Deld"}]}`, 200, false, false},
+		{"route added via dst (real go2rtc shape)", `{"producers":[{"url":"homekit://x","receivers":[{"id":2232},{"id":2233}],"senders":[{"id":6945,"parent":6944}]},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld","receivers":[{"id":6944}]}]}`, 200, true, false},
+		{"route declared in yaml", `{"producers":[{"url":"homekit://x","receivers":[{"id":2232},{"id":2233}],"senders":[{"id":6945,"parent":6944}]},{"url":"ffmpeg:talkback_in#audio=eld","receivers":[{"id":6944}]}]}`, 200, true, false},
+		// The HomeKit session reconnected: the old bridge is still listed but
+		// the doorbell's backchannel is no longer attached to it.
+		{"route left behind by a HomeKit reconnect", `{"producers":[{"url":"homekit://x","receivers":[{"id":2232},{"id":2233}]},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld","receivers":[{"id":6944}]}]}`, 200, false, false},
+		{"backchannel fed by something else", `{"producers":[{"url":"homekit://x","senders":[{"id":7001,"parent":7000}]},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld","receivers":[{"id":6944}]}]}`, 200, false, false},
+		{"other ffmpeg bridge", `{"producers":[{"url":"homekit://x","senders":[{"id":6945,"parent":6944}]},{"url":"rtsp://127.0.0.1:8554/other_in?audio&source=ffmpeg:other_in%23audio%3Deld","receivers":[{"id":6944}]}]}`, 200, false, false},
 		{"only the camera", `{"producers":[{"url":"homekit://x"}]}`, 200, false, false},
 		{"no producers", `{"producers":null}`, 200, false, false},
 		{"api error", ``, 500, false, true},
@@ -45,7 +49,8 @@ func TestTalkbackRouteActive(t *testing.T) {
 
 // TestTalkbackEnsureRoute checks that a live bridge is left alone: go2rtc's
 // Stream.Play stops and restarts the bridge on every POST, so the route is only
-// re-posted when go2rtc does not list it (or the listing fails).
+// re-posted when go2rtc does not list it attached to the doorbell's backchannel
+// (or the listing fails).
 func TestTalkbackEnsureRoute(t *testing.T) {
 	listing := ""
 	listStatus := http.StatusOK
@@ -72,7 +77,8 @@ func TestTalkbackEnsureRoute(t *testing.T) {
 		status    int
 		wantPosts int
 	}{
-		{"bridge live", `{"producers":[{"url":"homekit://x"},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld"}]}`, 200, 0},
+		{"bridge live", `{"producers":[{"url":"homekit://x","receivers":[{"id":2232},{"id":2233}],"senders":[{"id":6945,"parent":6944}]},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld","receivers":[{"id":6944}]}]}`, 200, 0},
+		{"bridge left behind by a HomeKit reconnect", `{"producers":[{"url":"homekit://x","receivers":[{"id":2232},{"id":2233}]},{"url":"rtsp://127.0.0.1:8554/talkback_in?audio&source=ffmpeg:talkback_in%23audio%3Deld","receivers":[{"id":6944}]}]}`, 200, 1},
 		{"bridge missing", `{"producers":[{"url":"homekit://x"}]}`, 200, 1},
 		{"listing failed", ``, 500, 1},
 	}
