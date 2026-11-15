@@ -5,9 +5,11 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM golang:1.26.5-bookworm AS go-base
+# Trixie: the intercom echo canceller needs webrtc-audio-processing 1.x (AEC3);
+# bookworm only has 0.3.
+FROM golang:1.26.5-trixie AS go-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    alsa-utils libopus-dev libopusfile-dev libspeexdsp-dev pkg-config bzip2 \
+    alsa-utils libopus-dev libopusfile-dev libwebrtc-audio-processing-dev pkg-config bzip2 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
@@ -35,9 +37,9 @@ RUN mkdir -p /out/lib && \
 FROM builder AS test
 CMD ["go", "test", "-race", "-timeout=2m", "./..."]
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    alsa-utils ca-certificates libopus0 libopusfile0 libspeexdsp1 libgomp1 \
+    alsa-utils ca-certificates libopus0 libopusfile0 libwebrtc-audio-processing-1-3 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /out/gocalis /usr/local/bin/gocalis
