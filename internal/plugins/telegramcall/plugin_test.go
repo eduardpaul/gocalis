@@ -115,13 +115,23 @@ type fakeMedia struct {
 	up     chan struct{}
 	down   chan struct{}
 	closed bool
+	fails  bool // the connection is lost instead of coming up
 }
 
 func (m *fakeMedia) joinPayload() (string, error) { return "payload", nil }
-func (m *fakeMedia) connect(string) error         { close(m.up); return nil }
-func (m *fakeMedia) connected() <-chan struct{}   { return m.up }
-func (m *fakeMedia) lost() <-chan struct{}        { return m.down }
-func (m *fakeMedia) source() uint32               { return 42 }
+
+func (m *fakeMedia) connect(string) error {
+	if m.fails {
+		close(m.down)
+	} else {
+		close(m.up)
+	}
+	return nil
+}
+
+func (m *fakeMedia) connected() <-chan struct{} { return m.up }
+func (m *fakeMedia) lost() <-chan struct{}      { return m.down }
+func (m *fakeMedia) source() uint32             { return 42 }
 
 func (m *fakeMedia) send(pcm []int16) error {
 	m.mu.Lock()
@@ -208,6 +218,7 @@ type rig struct {
 	intercom []intercom.Event
 	states   []string // the states the telegram node went through
 	media    []*fakeMedia
+	failing  int // how many of the next media connections fail to come up
 }
 
 // Publish records the node's state changes.
@@ -272,6 +283,10 @@ func newRig(t *testing.T) *rig {
 	p.newMedia = func(heard sink) (media, error) {
 		m := &fakeMedia{heard: heard, up: make(chan struct{}), down: make(chan struct{})}
 		r.mu.Lock()
+		if r.failing > 0 {
+			r.failing--
+			m.fails = true
+		}
 		r.media = append(r.media, m)
 		r.mu.Unlock()
 		return m, nil
@@ -353,6 +368,12 @@ func (r *rig) conn() *fakeMedia {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.media[len(r.media)-1]
+}
+
+func (r *rig) connections() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.media)
 }
 
 func (r *rig) voiceChats() int {
@@ -671,6 +692,92 @@ func TestGivingUpStopsTheRinging(t *testing.T) {
 	}
 	if ended := r.event("call_ended"); ended.Reason != "cancelled" {
 		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+}
+
+// joins counts how often gocalis joined the voice chat.
+func (f *fakeTelegram) joins() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, entry := range f.log {
+		if strings.HasPrefix(entry, "joined:") {
+			n++
+		}
+	}
+	return n
+}
+
+// A media connection that does not come up is cured by joining again.
+func TestAFailedMediaConnectionJoinsAgain(t *testing.T) {
+	r := newRig(t)
+	r.failing = 1
+	if err := r.engine.Connect([]string{"door", "telegram"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	r.event("call_ringing")
+	if r.telegram.joins() != 2 || !r.telegram.did("left") || r.connections() != 2 {
+		t.Fatalf("gocalis did not leave and join again: %v, %d connections", r.telegram.log, r.connections())
+	}
+	r.telegram.set(func() { r.telegram.others = []person{ana} })
+	r.until("the door to be in the call", func() bool { return r.doorNode.GetState() == node.StateIntercom })
+	if _, ended := r.find("call_ended"); ended {
+		t.Fatal("the call ended")
+	}
+}
+
+// Dropped from the voice chat while it rings, gocalis joins again and the
+// call goes on.
+func TestDroppedWhileRingingJoinsAgain(t *testing.T) {
+	r := newRig(t)
+	if err := r.engine.Connect([]string{"door", "telegram"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	r.event("call_ringing")
+	r.telegram.set(func() { r.telegram.in = false })
+	r.until("gocalis to join again", func() bool { return r.telegram.joins() == 2 })
+	r.telegram.set(func() { r.telegram.others = []person{ana} })
+	r.until("the door to be in the call", func() bool { return r.doorNode.GetState() == node.StateIntercom })
+	if _, ended := r.find("call_ended"); ended {
+		t.Fatal("the call ended")
+	}
+	if r.connections() != 2 {
+		t.Fatalf("%d media connections, want a new one for the second join", r.connections())
+	}
+}
+
+// A media connection lost while it rings is replaced too.
+func TestLostWhileRingingJoinsAgain(t *testing.T) {
+	r := newRig(t)
+	if err := r.engine.Connect([]string{"door", "telegram"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	r.event("call_ringing")
+	close(r.conn().down)
+	r.until("gocalis to join again", func() bool { return r.telegram.joins() == 2 })
+	r.telegram.set(func() { r.telegram.others = []person{ana} })
+	r.until("the door to be in the call", func() bool { return r.doorNode.GetState() == node.StateIntercom })
+}
+
+// Joining again is tried once: a second failure ends the call.
+func TestJoiningAgainIsTriedOnce(t *testing.T) {
+	r := newRig(t)
+	r.failing = 2
+	if err := r.engine.Connect([]string{"door", "telegram"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	ended := r.event("call_ended")
+	if ended.Status != "error" || !strings.Contains(ended.Message, "media connection") {
+		t.Fatalf("unexpected ended event: %+v", ended)
+	}
+	if r.telegram.joins() != 2 {
+		t.Fatalf("joined %d times, want 2: %v", r.telegram.joins(), r.telegram.log)
+	}
+	if _, rang := r.find("call_ringing"); rang {
+		t.Fatal("rang without a media connection")
+	}
+	if !r.telegram.did("ended") {
+		t.Fatalf("the voice chat gocalis opened was not closed: %v", r.telegram.log)
 	}
 }
 
